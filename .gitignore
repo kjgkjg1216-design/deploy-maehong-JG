@@ -1,0 +1,38 @@
+# 환경변수 (API 키 보호)
+.env
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# 데이터 파일 (매번 수집되므로 제외)
+data/*.csv
+
+# 엑셀 원본 파일
+*.xlsx
+*.xlsx.bak
+
+# 로그
+app_log.txt
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
