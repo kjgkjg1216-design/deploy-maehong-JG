@@ -4265,6 +4265,37 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   </div>
 </header>
 
+<!-- 로그인 오버레이 (비로그인 시 전체 화면 가림) -->
+<div id="login-overlay" style="
+  position:fixed; top:0; left:0; width:100%; height:100%; z-index:9999;
+  background:rgba(248,250,252,0.97); display:flex; align-items:center; justify-content:center;
+  flex-direction:column; gap:20px;
+">
+  <div style="
+    background:white; border-radius:20px; padding:48px 40px; text-align:center;
+    box-shadow:0 8px 40px rgba(0,0,0,0.1); max-width:420px; width:90%;
+  ">
+    <div style="font-size:56px; margin-bottom:16px;">M</div>
+    <h1 style="font-size:22px; color:#1e293b; margin-bottom:6px; font-weight:700;">매홍 L&F 통합 재고 관리</h1>
+    <p style="color:#64748b; font-size:13px; line-height:1.7; margin-bottom:28px;">
+      재고 / 발주 / 생산 / BOM / 매출 통합 조회 챗봇<br>
+      Google 계정으로 로그인하여 시작하세요
+    </p>
+    <button onclick="googleLogin()" style="
+      display:inline-flex; align-items:center; gap:10px;
+      padding:14px 32px; border-radius:12px; font-size:15px; font-weight:600;
+      cursor:pointer; border:1px solid #e2e8f0; background:white; color:#1e293b;
+      box-shadow:0 2px 8px rgba(0,0,0,0.08); transition:all 0.2s;
+    " onmouseover="this.style.boxShadow='0 4px 16px rgba(0,0,0,0.15)'" onmouseout="this.style.boxShadow='0 2px 8px rgba(0,0,0,0.08)'">
+      <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" width="20" height="20">
+      Google 계정으로 로그인
+    </button>
+    <p style="margin-top:20px; font-size:11px; color:#94a3b8;">
+      로그인하면 대화 기록이 저장되고, 다른 사람에게 공유할 수 있습니다.
+    </p>
+  </div>
+</div>
+
 <!-- Dashboard + Chat -->
 <div class="main-container">
 
@@ -4689,7 +4720,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     currentUser = user;
     const input = document.getElementById('user-input');
     const sendBtn = document.getElementById('send-btn');
+    const overlay = document.getElementById('login-overlay');
     if (user) {
+      // 로그인 성공 → 오버레이 숨기기
+      overlay.style.display = 'none';
       document.getElementById('login-btn').style.display = 'none';
       document.getElementById('user-name').style.display = 'inline';
       document.getElementById('user-name').textContent = user.displayName || user.email;
@@ -4700,6 +4734,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
       sendBtn.disabled = false;
       loadHistory();
     } else {
+      // 비로그인 → 오버레이 표시
+      overlay.style.display = 'flex';
       document.getElementById('login-btn').style.display = 'inline';
       document.getElementById('user-name').style.display = 'none';
       document.getElementById('logout-btn').style.display = 'none';
