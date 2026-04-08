@@ -4257,9 +4257,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   <a href="/vendor/정성" class="admin-link">정성</a>
   <a href="/vendor/청통본가" class="admin-link">청통본가</a>
   <a href="/jasa" class="admin-link">자사</a>
-  <!-- 로그인/사용자 정보 -->
+  <!-- 사용자 정보 + 로그아웃 -->
   <div id="auth-area" style="margin-left:auto;display:flex;align-items:center;gap:8px;">
-    <button id="login-btn" onclick="googleLogin()" class="admin-link" style="background:#4285f4;color:white;border-color:#4285f4;cursor:pointer">Google 로그인</button>
     <span id="user-name" style="font-size:12px;color:#64748b;display:none"></span>
     <button id="logout-btn" onclick="googleLogout()" style="display:none;font-size:11px;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:8px;padding:3px 10px;cursor:pointer;color:#64748b">로그아웃</button>
   </div>
@@ -4291,6 +4290,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
       Google 계정으로 로그인
     </button>
     <script>
+      // 브라우저 탭 닫으면 로그인 해제 (매 접속마다 로그인 필요)
+      firebase.auth().setPersistence(firebase.auth.Auth.Persistence.SESSION);
+
       document.getElementById('overlay-login-btn').addEventListener('click', function() {
         var provider = new firebase.auth.GoogleAuthProvider();
         firebase.auth().signInWithPopup(provider).then(function() {
@@ -4738,9 +4740,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     const sendBtn = document.getElementById('send-btn');
     const overlay = document.getElementById('login-overlay');
     if (user) {
-      // 로그인 성공 → 오버레이 숨기기
+      // 로그인 성공 → 오버레이 숨기기, 챗봇 활성화
       overlay.style.display = 'none';
-      document.getElementById('login-btn').style.display = 'none';
       document.getElementById('user-name').style.display = 'inline';
       document.getElementById('user-name').textContent = user.displayName || user.email;
       document.getElementById('logout-btn').style.display = 'inline';
@@ -4750,9 +4751,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
       sendBtn.disabled = false;
       loadHistory();
     } else {
-      // 비로그인 → 오버레이 표시
+      // 비로그인 → 오버레이 표시, 챗봇 잠금
       overlay.style.display = 'flex';
-      document.getElementById('login-btn').style.display = 'inline';
       document.getElementById('user-name').style.display = 'none';
       document.getElementById('logout-btn').style.display = 'none';
       document.getElementById('share-btn').style.display = 'none';
