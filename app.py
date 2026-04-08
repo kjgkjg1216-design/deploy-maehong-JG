@@ -4290,16 +4290,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
       Google 계정으로 로그인
     </button>
     <script>
-      // 페이지 로드 시 기존 로그인 강제 해제 → 매번 로그인 필요
-      firebase.auth().signOut().then(function() {
-        document.getElementById('login-overlay').style.display = 'flex';
-      });
-
       document.getElementById('overlay-login-btn').addEventListener('click', function() {
         var provider = new firebase.auth.GoogleAuthProvider();
-        firebase.auth().signInWithPopup(provider).then(function() {
-          document.getElementById('login-overlay').style.display = 'none';
-        }).catch(function(e) { alert('로그인 실패: ' + e.message); });
+        firebase.auth().signInWithPopup(provider).catch(function(e) { alert('로그인 실패: ' + e.message); });
       });
     </script>
     <p style="margin-top:20px; font-size:11px; color:#94a3b8;">
@@ -4501,7 +4494,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
     // 로그인 체크
     if (!currentUser) {
-      addMessage('bot', '⚠️ **로그인이 필요합니다.**\n\n페이지를 새로고침하고 Google 로그인을 해주세요.');
+      addMessage('bot', '로그인이 필요합니다. 페이지를 새로고침하고 Google 로그인을 해주세요.');
       return;
     }
 
@@ -4887,6 +4880,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
   // Init
   loadDataInfo();
+
+  // 페이지 로드 시 기존 로그인 강제 해제 → 매번 로그인 필요
+  // onAuthStateChanged 등록 후 실행해야 currentUser가 정상 작동
+  firebase.auth().signOut();
 </script>
 
 </body>
