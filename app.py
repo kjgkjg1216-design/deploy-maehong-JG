@@ -4353,13 +4353,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     <div class="input-area">
       <!-- 유사어 추천 패널 -->
       <div id="suggest-panel" style="display:none"></div>
-      <textarea
+      <input type="text"
         id="user-input"
-        rows="1"
         placeholder="질문을 입력하세요... (재고, 발주, 생산, BOM, 매출 등)"
         onkeydown="handleKeydown(event)"
-        oninput="autoResize(this); debounceSuggest(this.value)"
-      ></textarea>
+        oninput="debounceSuggest(this.value)"
+        autocomplete="off"
+      />
       <button id="send-btn" onclick="sendMessage()">➤</button>
     </div>
   </div>
@@ -4417,7 +4417,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   function handleKeydown(e) {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      sendMessage();
+      e.stopPropagation();
+      if (typeof sendMessage === 'function') sendMessage();
+      return false;
     }
   }
 
