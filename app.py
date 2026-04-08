@@ -4290,8 +4290,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
       Google 계정으로 로그인
     </button>
     <script>
-      // 브라우저 탭 닫으면 로그인 해제 (매 접속마다 로그인 필요)
-      firebase.auth().setPersistence(firebase.auth.Auth.Persistence.SESSION);
+      // 페이지 로드 시 기존 로그인 강제 해제 → 매번 로그인 필요
+      firebase.auth().signOut();
 
       document.getElementById('overlay-login-btn').addEventListener('click', function() {
         var provider = new firebase.auth.GoogleAuthProvider();
