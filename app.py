@@ -8,13 +8,29 @@ import glob
 import httpx
 import pandas as pd
 from flask import Flask, request, jsonify, render_template_string
+from flask_cors import CORS
 from openai import OpenAI
+import firebase_admin
+from firebase_admin import credentials, firestore as fs_admin, auth as fb_auth
 from dotenv import load_dotenv
 
 # .env 로드
 load_dotenv('C:/Users/jgkim/maehong-JG/.env')
 
 app = Flask(__name__)
+CORS(app)
+
+# Firebase Admin SDK 초기화
+if not firebase_admin._apps:
+    _fb_key = os.path.join(os.path.dirname(__file__), 'maehong-scm-firebase-adminsdk-fbsvc-8cae1845b3.json')
+    if os.path.exists(_fb_key):
+        _cred = credentials.Certificate(_fb_key)
+        firebase_admin.initialize_app(_cred)
+        print("[Firebase] 서비스 계정 키로 초기화 완료")
+    else:
+        firebase_admin.initialize_app()
+        print("[Firebase] 기본 인증으로 초기화")
+FIRESTORE_DB = fs_admin.client()
 
 # 프록시/타임아웃 설정 - 연결 오류 방지
 _http_client = httpx.Client(
@@ -3372,6 +3388,56 @@ UPLOAD_FILES = {
 }
 
 
+@app.route('/shared/<share_id>')
+def shared_page(share_id):
+    """공유된 대화 페이지"""
+    return render_template_string('''<!DOCTYPE html>
+<html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>공유된 대화 - 매홍 L&F</title>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+body{font-family:'Noto Sans KR',sans-serif;background:#f8fafc;margin:0;padding:20px}
+.container{max-width:800px;margin:0 auto;background:white;border-radius:16px;box-shadow:0 2px 12px rgba(0,0,0,0.08);overflow:hidden}
+.header{padding:16px 24px;border-bottom:1px solid #e5e7eb;background:#f8fafc}
+.header h2{font-size:16px;color:#1e293b;margin-bottom:4px}
+.header p{font-size:12px;color:#94a3b8}
+.messages{padding:16px 24px}
+.msg{margin-bottom:14px;padding:10px 14px;border-radius:12px;font-size:14px;line-height:1.6}
+.msg.user{background:#e0e7ff;margin-left:20%;text-align:right;color:#1e293b}
+.msg.bot{background:#f1f5f9;margin-right:10%;color:#1e293b}
+.msg.bot table{border-collapse:collapse;width:100%;font-size:12px;margin:8px 0}
+.msg.bot th{background:#334155;color:white;padding:6px 10px;text-align:left}
+.msg.bot td{padding:5px 10px;border-bottom:1px solid #e5e7eb}
+a.back{display:inline-block;margin:16px 24px;color:#6366f1;text-decoration:none;font-size:13px}
+</style></head><body>
+<div class="container">
+  <div class="header"><h2 id="title">로딩 중...</h2><p id="info"></p></div>
+  <div class="messages" id="msgs"></div>
+  <a class="back" href="/">← 챗봇으로 이동</a>
+</div>
+<script>
+firebase.initializeApp({apiKey:"AIzaSyBZ1FfTibE-KBkTbZJnTNEqz-pxsgew03k",authDomain:"maehong-scm.firebaseapp.com",projectId:"maehong-scm"});
+const db=firebase.firestore();
+const shareId="''' + share_id + '''";
+db.collection("shared").doc(shareId).get().then(doc=>{
+  if(!doc.exists){document.getElementById("title").textContent="공유 링크를 찾을 수 없습니다";return}
+  const d=doc.data(),chat=d.chatData||{};
+  document.getElementById("title").textContent=chat.title||"공유된 대화";
+  document.getElementById("info").textContent="공유: "+(d.sharedByName||"")+" | "+new Date(d.sharedAt?.toDate()).toLocaleDateString("ko-KR");
+  const container=document.getElementById("msgs");
+  (chat.messages||[]).forEach(m=>{
+    const div=document.createElement("div");
+    div.className="msg "+(m.role==="user"?"user":"bot");
+    div.innerHTML=m.role==="user"?m.content:marked.parse(m.content);
+    container.appendChild(div);
+  });
+});
+</script></body></html>''')
+
+
 @app.route('/upload')
 def upload_page():
     return render_template_string(UPLOAD_TEMPLATE)
@@ -3686,6 +3752,22 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>매홍 L&F - 재고 조회 챗봇</title>
+  <!-- Firebase SDK -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
+  <script>
+    firebase.initializeApp({
+      apiKey: "AIzaSyBZ1FfTibE-KBkTbZJnTNEqz-pxsgew03k",
+      authDomain: "maehong-scm.firebaseapp.com",
+      projectId: "maehong-scm",
+      storageBucket: "maehong-scm.firebasestorage.app",
+      messagingSenderId: "776997651051",
+      appId: "1:776997651051:web:8734392ca2e791b5fb272e"
+    });
+    const fbAuth = firebase.auth();
+    const fbDb = firebase.firestore();
+  </script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
@@ -4175,6 +4257,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   <a href="/vendor/정성" class="admin-link">정성</a>
   <a href="/vendor/청통본가" class="admin-link">청통본가</a>
   <a href="/jasa" class="admin-link">자사</a>
+  <!-- 로그인/사용자 정보 -->
+  <div id="auth-area" style="margin-left:auto;display:flex;align-items:center;gap:8px;">
+    <button id="login-btn" onclick="googleLogin()" class="admin-link" style="background:#4285f4;color:white;border-color:#4285f4;cursor:pointer">Google 로그인</button>
+    <span id="user-name" style="font-size:12px;color:#64748b;display:none"></span>
+    <button id="logout-btn" onclick="googleLogout()" style="display:none;font-size:11px;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:8px;padding:3px 10px;cursor:pointer;color:#64748b">로그아웃</button>
+  </div>
 </header>
 
 <!-- Dashboard + Chat -->
@@ -4183,8 +4271,16 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   <!-- Left: Dashboard -->
   <!-- Chat -->
   <div class="chat-wrapper">
-    <div class="chat-header-bar">
+    <div class="chat-header-bar" style="display:flex;align-items:center;gap:8px;">
       <span>AI 채팅</span>
+      <button id="new-chat-btn" onclick="newChat()" style="margin-left:8px;font-size:11px;background:#e0e7ff;border:1px solid #c7d2fe;border-radius:6px;padding:2px 8px;cursor:pointer;color:#4338ca">+ 새 대화</button>
+      <button id="share-btn" onclick="shareChat()" style="font-size:11px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:2px 8px;cursor:pointer;color:#166534;display:none">공유</button>
+      <button id="history-btn" onclick="toggleHistory()" style="margin-left:auto;font-size:11px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:2px 8px;cursor:pointer;color:#64748b">대화 기록</button>
+    </div>
+    <!-- 히스토리 패널 -->
+    <div id="history-panel" style="display:none;max-height:200px;overflow-y:auto;background:#f8fafc;border-bottom:1px solid #e5e7eb;padding:8px 12px;">
+      <div style="font-size:11px;color:#94a3b8;margin-bottom:6px;font-weight:600">이전 대화</div>
+      <div id="history-list" style="font-size:12px"></div>
     </div>
     <div id="chat-box">
       <div class="message-row">
@@ -4568,6 +4664,176 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
       loading.style.display = 'none';
       cols.innerHTML = '<p style="color:#dc2626">조회 실패: ' + e.message + '</p>';
     }
+  }
+
+  // ── Firebase Auth + Firestore ──
+  let currentUser = null;
+  let currentChatId = null;
+
+  function googleLogin() {
+    const provider = new firebase.auth.GoogleAuthProvider();
+    fbAuth.signInWithPopup(provider).catch(e => alert('로그인 실패: ' + e.message));
+  }
+
+  function googleLogout() {
+    fbAuth.signOut();
+  }
+
+  fbAuth.onAuthStateChanged(user => {
+    currentUser = user;
+    if (user) {
+      document.getElementById('login-btn').style.display = 'none';
+      document.getElementById('user-name').style.display = 'inline';
+      document.getElementById('user-name').textContent = user.displayName || user.email;
+      document.getElementById('logout-btn').style.display = 'inline';
+      document.getElementById('share-btn').style.display = 'inline';
+      loadHistory();
+    } else {
+      document.getElementById('login-btn').style.display = 'inline';
+      document.getElementById('user-name').style.display = 'none';
+      document.getElementById('logout-btn').style.display = 'none';
+      document.getElementById('share-btn').style.display = 'none';
+      currentChatId = null;
+    }
+  });
+
+  // 새 대화
+  function newChat() {
+    chatHistory = [];
+    document.getElementById('chat-box').innerHTML = '';
+    currentChatId = null;
+    if (currentUser) {
+      fbDb.collection('chats').add({
+        userId: currentUser.uid,
+        userName: currentUser.displayName || '',
+        title: '새 대화',
+        messages: [],
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      }).then(ref => {
+        currentChatId = ref.id;
+      });
+    }
+  }
+
+  // 대화 저장 (메시지 추가 시)
+  function saveMessage(role, content) {
+    if (!currentUser || !currentChatId) return;
+    const chatRef = fbDb.collection('chats').doc(currentChatId);
+    chatRef.update({
+      messages: firebase.firestore.FieldValue.arrayUnion({
+        role: role,
+        content: content,
+        timestamp: new Date().toISOString(),
+      }),
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+    });
+    // 첫 메시지면 제목 업데이트
+    if (role === 'user' && chatHistory.length <= 1) {
+      chatRef.update({ title: content.substring(0, 30) });
+    }
+  }
+
+  // 기존 sendMessage를 확장 — 대화 자동저장
+  const _origSendFn = sendMessage;
+  sendMessage = async function() {
+    // 로그인 상태에서 chatId 없으면 자동 생성
+    if (currentUser && !currentChatId) {
+      const ref = await fbDb.collection('chats').add({
+        userId: currentUser.uid,
+        userName: currentUser.displayName || '',
+        title: '새 대화',
+        messages: [],
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      });
+      currentChatId = ref.id;
+    }
+
+    const input = document.getElementById('user-input');
+    const msg = input.value.trim();
+
+    await _origSendFn();
+
+    // 저장
+    if (msg) saveMessage('user', msg);
+    // 봇 응답은 약간 딜레이 후 저장 (응답 도착 대기)
+    setTimeout(() => {
+      if (chatHistory.length > 0) {
+        const last = chatHistory[chatHistory.length - 1];
+        if (last.role === 'assistant') {
+          saveMessage('assistant', last.content);
+        }
+      }
+    }, 2000);
+  };
+
+  // 대화 기록 로드
+  async function loadHistory() {
+    if (!currentUser) return;
+    const snap = await fbDb.collection('chats')
+      .where('userId', '==', currentUser.uid)
+      .orderBy('createdAt', 'desc')
+      .limit(20)
+      .get();
+    const list = document.getElementById('history-list');
+    list.innerHTML = '';
+    snap.forEach(doc => {
+      const d = doc.data();
+      const div = document.createElement('div');
+      div.style.cssText = 'padding:4px 8px;margin-bottom:3px;background:white;border:1px solid #e5e7eb;border-radius:6px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+      div.textContent = d.title || '새 대화';
+      div.onclick = () => loadChat(doc.id);
+      div.onmouseenter = () => div.style.background = '#e0e7ff';
+      div.onmouseleave = () => div.style.background = 'white';
+      list.appendChild(div);
+    });
+    if (snap.empty) {
+      list.innerHTML = '<div style="color:#94a3b8;font-size:11px">아직 대화 기록이 없습니다</div>';
+    }
+  }
+
+  // 이전 대화 불러오기
+  async function loadChat(chatId) {
+    const doc = await fbDb.collection('chats').doc(chatId).get();
+    if (!doc.exists) return;
+    const d = doc.data();
+    currentChatId = chatId;
+    chatHistory = [];
+    document.getElementById('chat-box').innerHTML = '';
+    (d.messages || []).forEach(m => {
+      addMessage(m.role === 'assistant' ? 'bot' : 'user', m.content);
+      chatHistory.push({ role: m.role, content: m.content });
+    });
+    document.getElementById('history-panel').style.display = 'none';
+  }
+
+  function toggleHistory() {
+    const panel = document.getElementById('history-panel');
+    if (panel.style.display === 'none') {
+      panel.style.display = 'block';
+      loadHistory();
+    } else {
+      panel.style.display = 'none';
+    }
+  }
+
+  // 대화 공유
+  async function shareChat() {
+    if (!currentUser || !currentChatId) {
+      alert('저장된 대화가 없습니다. 먼저 질문을 해주세요.');
+      return;
+    }
+    const doc = await fbDb.collection('chats').doc(currentChatId).get();
+    if (!doc.exists) return;
+    const ref = await fbDb.collection('shared').add({
+      chatData: doc.data(),
+      sharedBy: currentUser.uid,
+      sharedByName: currentUser.displayName || '',
+      sharedAt: firebase.firestore.FieldValue.serverTimestamp(),
+    });
+    const shareUrl = window.location.origin + '/shared/' + ref.id;
+    // 클립보드 복사
+    await navigator.clipboard.writeText(shareUrl).catch(() => {});
+    alert('공유 링크가 복사되었습니다!\\n' + shareUrl);
   }
 
   // Init
@@ -5236,10 +5502,144 @@ async function doUpload(e, fileType, id) {
 </html>'''
 
 
+# ────────────────────────────────────────────
+# Firebase API 엔드포인트 (히스토리, 공유)
+# ────────────────────────────────────────────
+def _verify_firebase_token(req):
+    """Authorization 헤더에서 Firebase ID 토큰 검증 → uid 반환"""
+    auth_header = req.headers.get('Authorization', '')
+    if not auth_header.startswith('Bearer '):
+        return None
+    token = auth_header.split('Bearer ')[1]
+    try:
+        decoded = fb_auth.verify_id_token(token)
+        return decoded
+    except Exception:
+        return None
+
+
+@app.route('/api/chats', methods=['GET'])
+def list_chats():
+    """로그인 사용자의 대화 목록 조회"""
+    user = _verify_firebase_token(request)
+    if not user:
+        return jsonify({'error': '로그인 필요'}), 401
+    uid = user['uid']
+    chats_ref = FIRESTORE_DB.collection('chats')
+    docs = chats_ref.where('userId', '==', uid).order_by('createdAt', direction=fs_admin.Query.DESCENDING).limit(50).stream()
+    result = []
+    for doc in docs:
+        d = doc.to_dict()
+        result.append({
+            'id': doc.id,
+            'title': d.get('title', ''),
+            'createdAt': str(d.get('createdAt', '')),
+            'messageCount': len(d.get('messages', [])),
+        })
+    return jsonify(result)
+
+
+@app.route('/api/chats', methods=['POST'])
+def create_chat():
+    """새 대화 생성"""
+    user = _verify_firebase_token(request)
+    if not user:
+        return jsonify({'error': '로그인 필요'}), 401
+    data = request.json or {}
+    chat_ref = FIRESTORE_DB.collection('chats').document()
+    chat_data = {
+        'userId': user['uid'],
+        'userName': user.get('name', ''),
+        'title': data.get('title', '새 대화'),
+        'messages': [],
+        'createdAt': fs_admin.SERVER_TIMESTAMP,
+        'updatedAt': fs_admin.SERVER_TIMESTAMP,
+    }
+    chat_ref.set(chat_data)
+    return jsonify({'id': chat_ref.id})
+
+
+@app.route('/api/chats/<chat_id>', methods=['GET'])
+def get_chat(chat_id):
+    """대화 상세 조회"""
+    user = _verify_firebase_token(request)
+    if not user:
+        return jsonify({'error': '로그인 필요'}), 401
+    doc = FIRESTORE_DB.collection('chats').document(chat_id).get()
+    if not doc.exists:
+        return jsonify({'error': '대화를 찾을 수 없습니다'}), 404
+    d = doc.to_dict()
+    if d.get('userId') != user['uid']:
+        return jsonify({'error': '권한 없음'}), 403
+    return jsonify({'id': doc.id, **d, 'createdAt': str(d.get('createdAt', '')), 'updatedAt': str(d.get('updatedAt', ''))})
+
+
+@app.route('/api/chats/<chat_id>/messages', methods=['POST'])
+def add_message(chat_id):
+    """대화에 메시지 추가"""
+    user = _verify_firebase_token(request)
+    if not user:
+        return jsonify({'error': '로그인 필요'}), 401
+    data = request.json or {}
+    doc_ref = FIRESTORE_DB.collection('chats').document(chat_id)
+    doc = doc_ref.get()
+    if not doc.exists or doc.to_dict().get('userId') != user['uid']:
+        return jsonify({'error': '권한 없음'}), 403
+    messages = doc.to_dict().get('messages', [])
+    messages.append({
+        'role': data.get('role', 'user'),
+        'content': data.get('content', ''),
+        'timestamp': __import__('datetime').datetime.now().isoformat(),
+    })
+    # 첫 메시지면 제목 업데이트
+    update = {'messages': messages, 'updatedAt': fs_admin.SERVER_TIMESTAMP}
+    if len(messages) == 1:
+        update['title'] = data.get('content', '')[:30]
+    doc_ref.update(update)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/chats/<chat_id>/share', methods=['POST'])
+def share_chat(chat_id):
+    """대화 공유 링크 생성"""
+    user = _verify_firebase_token(request)
+    if not user:
+        return jsonify({'error': '로그인 필요'}), 401
+    doc = FIRESTORE_DB.collection('chats').document(chat_id).get()
+    if not doc.exists or doc.to_dict().get('userId') != user['uid']:
+        return jsonify({'error': '권한 없음'}), 403
+    share_ref = FIRESTORE_DB.collection('shared').document()
+    share_ref.set({
+        'chatId': chat_id,
+        'chatData': doc.to_dict(),
+        'sharedBy': user['uid'],
+        'sharedByName': user.get('name', ''),
+        'sharedAt': fs_admin.SERVER_TIMESTAMP,
+    })
+    return jsonify({'shareId': share_ref.id})
+
+
+@app.route('/api/shared/<share_id>', methods=['GET'])
+def get_shared(share_id):
+    """공유된 대화 조회 (로그인 불필요)"""
+    doc = FIRESTORE_DB.collection('shared').document(share_id).get()
+    if not doc.exists:
+        return jsonify({'error': '공유 링크를 찾을 수 없습니다'}), 404
+    d = doc.to_dict()
+    chat = d.get('chatData', {})
+    return jsonify({
+        'title': chat.get('title', ''),
+        'messages': chat.get('messages', []),
+        'sharedBy': d.get('sharedByName', ''),
+        'sharedAt': str(d.get('sharedAt', '')),
+    })
+
+
 if __name__ == '__main__':
     print("\n" + "="*60)
-    print("  완제품 재고 챗봇 서버 시작")
+    print("  매홍 L&F 통합 재고 관리 챗봇")
     print("  http://localhost:5000 에서 접속하세요")
     print("  http://localhost:5000/upload 에서 파일 업로드")
+    print("  Firebase Auth + Firestore 연동")
     print("="*60 + "\n")
     app.run(debug=False, port=5000, host='0.0.0.0')

@@ -2,6 +2,9 @@
 .env
 !.env.example
 
+# Firebase 서비스 계정 키 (절대 업로드 금지)
+*-firebase-adminsdk-*.json
+
 # Python
 __pycache__/
 *.pyc
