@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>매홍 L&F 통합 재고 관리</title>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet">
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Noto Sans KR', sans-serif; background: #f8fafc; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+    .container { max-width: 500px; width: 90%; text-align: center; }
+    .logo { font-size: 48px; margin-bottom: 16px; }
+    h1 { font-size: 24px; color: #1e293b; margin-bottom: 8px; }
+    p { color: #64748b; font-size: 14px; margin-bottom: 32px; line-height: 1.6; }
+    .btn { display: inline-flex; align-items: center; gap: 10px; padding: 12px 28px; border-radius: 12px; font-size: 15px; font-weight: 600; cursor: pointer; border: none; transition: all 0.2s; text-decoration: none; }
+    .btn-google { background: white; color: #1e293b; border: 1px solid #e2e8f0; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+    .btn-google:hover { box-shadow: 0 4px 16px rgba(0,0,0,0.12); transform: translateY(-1px); }
+    .btn-google img { width: 20px; height: 20px; }
+    .btn-direct { background: #6366f1; color: white; margin-top: 12px; font-size: 13px; padding: 10px 24px; }
+    .btn-direct:hover { background: #4f46e5; }
+    .links { margin-top: 40px; display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+    .links a { color: #6366f1; text-decoration: none; font-size: 13px; padding: 6px 14px; border: 1px solid #e0e7ff; border-radius: 8px; }
+    .links a:hover { background: #eef2ff; }
+    .user-area { margin-top: 24px; padding: 16px; background: white; border-radius: 12px; border: 1px solid #e2e8f0; display: none; }
+    .user-area .name { font-size: 16px; font-weight: 600; color: #1e293b; }
+    .user-area .email { font-size: 12px; color: #94a3b8; margin-top: 4px; }
+    .user-area .actions { margin-top: 16px; display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+    .user-area .actions a { display: inline-block; padding: 8px 18px; border-radius: 8px; font-size: 13px; font-weight: 500; text-decoration: none; }
+    .logout-btn { font-size: 12px; color: #94a3b8; cursor: pointer; border: none; background: none; margin-top: 12px; }
+    .logout-btn:hover { color: #ef4444; }
+    .history { margin-top: 20px; text-align: left; max-height: 300px; overflow-y: auto; }
+    .history-item { padding: 10px 14px; background: white; border: 1px solid #e5e7eb; border-radius: 8px; margin-bottom: 6px; cursor: pointer; font-size: 13px; color: #374151; }
+    .history-item:hover { background: #eef2ff; border-color: #c7d2fe; }
+    .history-item .date { font-size: 10px; color: #94a3b8; margin-top: 2px; }
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <!-- 로그인 전 -->
+  <div id="login-area">
+    <div class="logo">M</div>
+    <h1>매홍 L&F 통합 재고 관리</h1>
+    <p>재고 / 발주 / 생산 / BOM / 매출 통합 조회 챗봇<br>Google 계정으로 로그인하여 시작하세요</p>
+    <button class="btn btn-google" onclick="googleLogin()">
+      <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" alt="G">
+      Google 계정으로 로그인
+    </button>
+    <br>
+    <a class="btn btn-direct" href="https://fashionable-failingly-tammie.ngrok-free.dev" target="_blank">
+      로그인 없이 바로 사용 →
+    </a>
+  </div>
+
+  <!-- 로그인 후 -->
+  <div id="user-area" class="user-area">
+    <div class="name" id="user-name"></div>
+    <div class="email" id="user-email"></div>
+    <div class="actions">
+      <a href="https://fashionable-failingly-tammie.ngrok-free.dev" target="_blank" style="background:#6366f1;color:white">챗봇 열기</a>
+      <a href="https://fashionable-failingly-tammie.ngrok-free.dev/admin" target="_blank" style="background:#0891b2;color:white">관리자</a>
+      <a href="https://fashionable-failingly-tammie.ngrok-free.dev/upload" target="_blank" style="background:#059669;color:white">파일 업로드</a>
+    </div>
+    <button class="logout-btn" onclick="googleLogout()">로그아웃</button>
+
+    <div class="history" id="history-area">
+      <div style="font-size:12px;font-weight:600;color:#64748b;margin-bottom:8px">최근 대화 기록</div>
+      <div id="history-list"></div>
+    </div>
+  </div>
+
+  <div class="links">
+    <a href="https://fashionable-failingly-tammie.ngrok-free.dev/vendor/데이웰즈">데이웰즈</a>
+    <a href="https://fashionable-failingly-tammie.ngrok-free.dev/vendor/더고은">더고은</a>
+    <a href="https://fashionable-failingly-tammie.ngrok-free.dev/vendor/정성">정성</a>
+    <a href="https://fashionable-failingly-tammie.ngrok-free.dev/vendor/청통본가">청통본가</a>
+    <a href="https://fashionable-failingly-tammie.ngrok-free.dev/jasa">자사</a>
+  </div>
+</div>
+
+<script>
+  firebase.initializeApp({
+    apiKey: "AIzaSyBZ1FfTibE-KBkTbZJnTNEqz-pxsgew03k",
+    authDomain: "maehong-scm.firebaseapp.com",
+    projectId: "maehong-scm",
+    storageBucket: "maehong-scm.firebasestorage.app",
+    messagingSenderId: "776997651051",
+    appId: "1:776997651051:web:8734392ca2e791b5fb272e"
+  });
+
+  const auth = firebase.auth();
+  const db = firebase.firestore();
+
+  function googleLogin() {
+    auth.signInWithPopup(new firebase.auth.GoogleAuthProvider())
+      .catch(e => alert('로그인 실패: ' + e.message));
+  }
+
+  function googleLogout() {
+    auth.signOut();
+  }
+
+  auth.onAuthStateChanged(user => {
+    if (user) {
+      document.getElementById('login-area').style.display = 'none';
+      document.getElementById('user-area').style.display = 'block';
+      document.getElementById('user-name').textContent = user.displayName || '사용자';
+      document.getElementById('user-email').textContent = user.email;
+      loadHistory(user.uid);
+    } else {
+      document.getElementById('login-area').style.display = 'block';
+      document.getElementById('user-area').style.display = 'none';
+    }
+  });
+
+  async function loadHistory(uid) {
+    const list = document.getElementById('history-list');
+    list.innerHTML = '<div style="color:#94a3b8;font-size:12px">로딩 중...</div>';
+    try {
+      const snap = await db.collection('chats')
+        .where('userId', '==', uid)
+        .orderBy('createdAt', 'desc')
+        .limit(10)
+        .get();
+      list.innerHTML = '';
+      if (snap.empty) {
+        list.innerHTML = '<div style="color:#94a3b8;font-size:12px">아직 대화 기록이 없습니다</div>';
+        return;
+      }
+      snap.forEach(doc => {
+        const d = doc.data();
+        const div = document.createElement('div');
+        div.className = 'history-item';
+        const msgCount = (d.messages || []).length;
+        div.innerHTML = '<div>' + (d.title || '새 대화') + '</div>'
+          + '<div class="date">' + msgCount + '개 메시지</div>';
+        div.onclick = () => window.open('https://fashionable-failingly-tammie.ngrok-free.dev', '_blank');
+        list.appendChild(div);
+      });
+    } catch(e) {
+      list.innerHTML = '<div style="color:#ef4444;font-size:12px">로드 실패: ' + e.message + '</div>';
+    }
+  }
+</script>
+
+</body>
+</html>
