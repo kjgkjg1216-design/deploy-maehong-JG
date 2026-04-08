@@ -4291,21 +4291,15 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     </button>
     <script>
       // 페이지 로드 시 기존 로그인 강제 해제 → 매번 로그인 필요
-      firebase.auth().signOut();
+      firebase.auth().signOut().then(function() {
+        document.getElementById('login-overlay').style.display = 'flex';
+      });
 
       document.getElementById('overlay-login-btn').addEventListener('click', function() {
         var provider = new firebase.auth.GoogleAuthProvider();
         firebase.auth().signInWithPopup(provider).then(function() {
           document.getElementById('login-overlay').style.display = 'none';
         }).catch(function(e) { alert('로그인 실패: ' + e.message); });
-      });
-      // 페이지 로드 시 이미 로그인된 상태면 즉시 오버레이 숨기기
-      firebase.auth().onAuthStateChanged(function(user) {
-        if (user) {
-          document.getElementById('login-overlay').style.display = 'none';
-        } else {
-          document.getElementById('login-overlay').style.display = 'flex';
-        }
       });
     </script>
     <p style="margin-top:20px; font-size:11px; color:#94a3b8;">
@@ -4507,13 +4501,27 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
     // 로그인 체크
     if (!currentUser) {
-      addMessage('bot', '⚠️ **로그인이 필요합니다.**\n\n우측 상단의 **Google 로그인** 버튼을 클릭해 주세요.\n로그인하면 대화 기록이 저장되고, 다른 사람에게 공유할 수 있습니다.');
+      addMessage('bot', '⚠️ **로그인이 필요합니다.**\n\n페이지를 새로고침하고 Google 로그인을 해주세요.');
       return;
     }
 
     const input = document.getElementById('user-input');
     const message = input.value.trim();
     if (!message) return;
+
+    // Firestore: chatId 없으면 자동 생성
+    if (currentUser && !currentChatId) {
+      try {
+        const ref = await fbDb.collection('chats').add({
+          userId: currentUser.uid,
+          userName: currentUser.displayName || '',
+          title: message.substring(0, 30),
+          messages: [],
+          createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        });
+        currentChatId = ref.id;
+      } catch(e) { console.log('chat create error', e); }
+    }
 
     input.value = '';
     input.style.height = 'auto';
@@ -4523,6 +4531,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     // Add user message
     addMessage('user', message);
     chatHistory.push({ role: 'user', content: message });
+    // Firestore에 사용자 메시지 저장
+    saveMessage('user', message);
 
     // Show typing
     showTyping();
@@ -4550,6 +4560,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
       } else {
         addMessage('bot', data.message);
         chatHistory.push({ role: 'assistant', content: data.message });
+        // Firestore에 봇 응답 저장
+        saveMessage('assistant', data.message);
       }
     } catch(e) {
       removeTyping();
@@ -4801,38 +4813,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     }
   }
 
-  // 기존 sendMessage를 확장 — 대화 자동저장
-  const _origSendFn = sendMessage;
-  sendMessage = async function() {
-    // 로그인 상태에서 chatId 없으면 자동 생성
-    if (currentUser && !currentChatId) {
-      const ref = await fbDb.collection('chats').add({
-        userId: currentUser.uid,
-        userName: currentUser.displayName || '',
-        title: '새 대화',
-        messages: [],
-        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-      });
-      currentChatId = ref.id;
-    }
-
-    const input = document.getElementById('user-input');
-    const msg = input.value.trim();
-
-    await _origSendFn();
-
-    // 저장
-    if (msg) saveMessage('user', msg);
-    // 봇 응답은 약간 딜레이 후 저장 (응답 도착 대기)
-    setTimeout(() => {
-      if (chatHistory.length > 0) {
-        const last = chatHistory[chatHistory.length - 1];
-        if (last.role === 'assistant') {
-          saveMessage('assistant', last.content);
-        }
-      }
-    }, 2000);
-  };
+  // (대화 저장은 sendMessage 내부에서 직접 처리)
 
   // 대화 기록 로드
   async function loadHistory() {
