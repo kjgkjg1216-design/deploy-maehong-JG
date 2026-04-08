@@ -4454,6 +4454,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   async function sendMessage() {
     if (isLoading) return;
 
+    // 로그인 체크
+    if (!currentUser) {
+      addMessage('bot', '⚠️ **로그인이 필요합니다.**\n\n우측 상단의 **Google 로그인** 버튼을 클릭해 주세요.\n로그인하면 대화 기록이 저장되고, 다른 사람에게 공유할 수 있습니다.');
+      return;
+    }
+
     const input = document.getElementById('user-input');
     const message = input.value.trim();
     if (!message) return;
@@ -4681,18 +4687,26 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
   fbAuth.onAuthStateChanged(user => {
     currentUser = user;
+    const input = document.getElementById('user-input');
+    const sendBtn = document.getElementById('send-btn');
     if (user) {
       document.getElementById('login-btn').style.display = 'none';
       document.getElementById('user-name').style.display = 'inline';
       document.getElementById('user-name').textContent = user.displayName || user.email;
       document.getElementById('logout-btn').style.display = 'inline';
       document.getElementById('share-btn').style.display = 'inline';
+      input.disabled = false;
+      input.placeholder = '질문을 입력하세요... (재고, 발주, 생산, BOM, 매출 등)';
+      sendBtn.disabled = false;
       loadHistory();
     } else {
       document.getElementById('login-btn').style.display = 'inline';
       document.getElementById('user-name').style.display = 'none';
       document.getElementById('logout-btn').style.display = 'none';
       document.getElementById('share-btn').style.display = 'none';
+      input.disabled = true;
+      input.placeholder = '🔒 Google 로그인 후 사용 가능합니다';
+      sendBtn.disabled = true;
       currentChatId = null;
     }
   });
