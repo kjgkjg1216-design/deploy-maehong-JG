@@ -4281,7 +4281,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
       재고 / 발주 / 생산 / BOM / 매출 통합 조회 챗봇<br>
       Google 계정으로 로그인하여 시작하세요
     </p>
-    <button onclick="googleLogin()" style="
+    <button id="overlay-login-btn" style="
       display:inline-flex; align-items:center; gap:10px;
       padding:14px 32px; border-radius:12px; font-size:15px; font-weight:600;
       cursor:pointer; border:1px solid #e2e8f0; background:white; color:#1e293b;
@@ -4290,6 +4290,22 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
       <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" width="20" height="20">
       Google 계정으로 로그인
     </button>
+    <script>
+      document.getElementById('overlay-login-btn').addEventListener('click', function() {
+        var provider = new firebase.auth.GoogleAuthProvider();
+        firebase.auth().signInWithPopup(provider).then(function() {
+          document.getElementById('login-overlay').style.display = 'none';
+        }).catch(function(e) { alert('로그인 실패: ' + e.message); });
+      });
+      // 페이지 로드 시 이미 로그인된 상태면 즉시 오버레이 숨기기
+      firebase.auth().onAuthStateChanged(function(user) {
+        if (user) {
+          document.getElementById('login-overlay').style.display = 'none';
+        } else {
+          document.getElementById('login-overlay').style.display = 'flex';
+        }
+      });
+    </script>
     <p style="margin-top:20px; font-size:11px; color:#94a3b8;">
       로그인하면 대화 기록이 저장되고, 다른 사람에게 공유할 수 있습니다.
     </p>
