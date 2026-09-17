@@ -59,7 +59,7 @@ try {
   foreach($line in $rootHashes){ if($line -match '^([0-9a-f]{32})\s+\S*/([^/]+\.csv)$'){ $rootMap[$Matches[2]] = $Matches[1] } }
   $rootUp = 0
   Get-ChildItem $DIR -File -Filter *.csv -ErrorAction SilentlyContinue |
-    Where-Object { ($_.Name -like '*판매수량*') -or ($_.Name -like '*공급가*') -or ($_.Name -eq 'SKU매핑_확정.csv') } |
+    Where-Object { ($_.Name -like '*판매수량*') -or ($_.Name -like '*공급가*') -or ($_.Name -eq 'SKU매핑_확정.csv') -or ($_.Name -eq '상품매입_업체조건.csv') } |
     ForEach-Object {
       $localHash = (Get-FileHash -Path $_.FullName -Algorithm MD5).Hash.ToLower()
       if (($null -eq $rootMap[$_.Name]) -or ($rootMap[$_.Name] -ne $localHash)) {

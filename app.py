@@ -6858,11 +6858,228 @@ def _calc_leadtimes():
     return out
 
 
+GOODS_RULES_PATH = f'{BASE_DIR}/상품매입_업체조건.csv'
+_GOODS_RULES_CACHE = {'mtime': None, 'rules': None}
+
+
+def _goods_vendor_key(name):
+    """거래처명 정규화 — ERP '농업회사법인(유)아리랑식품' ↔ 표 '아리랑식품' 매칭용 (법인 표기·공백·괄호 제거)."""
+    s = str(name or '')
+    s = re.sub(r'\(.*?\)', '', s)
+    for w in ('농업회사법인', '영농조합법인', '유한회사', '주식회사', '(주)', '(유)', '㈜', '법인', ' '):
+        s = s.replace(w, '')
+    return s.strip().lower()
+
+
+def _load_goods_rules():
+    """상품매입_업체조건.csv → {'by_code': {품번: rule}, 'by_vendor': {정규화거래처: {'lt_days', 'kind', 'rows'}}}.
+    rule = {거래처, 구분(사입|시방서), 품번, 품명, MOQ, MOQ단위, PLT당수량, lt_days(최대주×7), 비고}. 파일 mtime 캐시."""
+    try:
+        mt = os.path.getmtime(GOODS_RULES_PATH)
+    except OSError:
+        return {'by_code': {}, 'by_vendor': {}, 'aliases': {}}
+    if _GOODS_RULES_CACHE['mtime'] == mt and _GOODS_RULES_CACHE['rules'] is not None:
+        return _GOODS_RULES_CACHE['rules']
+    by_code, by_vendor, aliases = {}, {}, {}
+    try:
+        df = pd.read_csv(GOODS_RULES_PATH, dtype=str, encoding='utf-8-sig').fillna('')
+        for _, r in df.iterrows():
+            v = str(r.get('거래처', '')).strip()
+            if not v:
+                continue
+
+            def _f(x):
+                try:
+                    return float(str(x).replace(',', '').strip())
+                except ValueError:
+                    return 0.0
+            lt_max = _f(r.get('LT최대주', ''))
+            moq, moq_qty = _f(r.get('MOQ', '')), _f(r.get('MOQ수량', ''))
+            unit = str(r.get('MOQ단위', '')).strip()
+            if moq_qty <= 0 and moq > 0 and unit.upper() != 'PLT':
+                moq_qty = moq          # 봉/통/단상자 = ERP 판매단위와 동일
+            # PLT당 수량 = MOQ수량 ÷ MOQ(PLT) — 청구수량을 PLT 배수로 올릴 때 사용
+            plt_qty = _f(r.get('PLT당수량', '')) or ((moq_qty / moq) if (unit.upper() == 'PLT' and moq > 0 and moq_qty > 0) else 0.0)
+            rule = {'거래처': v, '구분': str(r.get('구분', '')).strip() or '사입', '품번': str(r.get('품번', '')).strip().upper(),
+                    '구품번': [x.strip().upper() for x in re.split(r'[,/;|\s]+', str(r.get('구품번', ''))) if x.strip()],
+                    '품명': str(r.get('품명', '')).strip(), 'MOQ': moq, 'MOQ단위': unit, 'MOQ수량': moq_qty,
+                    'PLT당수량': plt_qty, 'lt_days': int(round(lt_max * 7)) if lt_max > 0 else None,
+                    '비고': str(r.get('비고', '')).strip()}
+            k = _goods_vendor_key(v)
+            ve = by_vendor.setdefault(k, {'거래처': v, 'kind': rule['구분'], 'lt_days': None, 'rows': []})
+            ve['rows'].append(rule)
+            if rule['구분'] == '시방서':
+                ve['kind'] = '시방서'
+            if rule['lt_days'] and (ve['lt_days'] is None or rule['lt_days'] > ve['lt_days']):
+                ve['lt_days'] = rule['lt_days']     # 거래처 기본값 = 그 거래처 행들의 최대 L/T (보수적)
+            if rule['품번']:
+                by_code[rule['품번']] = rule
+                for old in rule['구품번']:
+                    aliases[old] = rule['품번']
+    except Exception as e:
+        print(f'[상품매입 조건] 읽기 실패: {e!r:.120}')
+    _GOODS_RULES_CACHE.update(mtime=mt, rules={'by_code': by_code, 'by_vendor': by_vendor, 'aliases': aliases})
+    return _GOODS_RULES_CACHE['rules']
+
+
+def _goods_aliases():
+    """구품번 → 신품번 (예: 곤약밥 I0019/I0020/I0021 유상사급 → I0159/I0160/I0161 상품매입, 2026-09-17).
+    재고·발주 이력이 구품번에 남아 있으므로 완제품 집계 시 신품번으로 합산한다."""
+    return _load_goods_rules().get('aliases', {})
+
+
+def _goods_canon(code):
+    c = (code or '').strip().upper()
+    return _goods_aliases().get(c, c)
+
+
+def _goods_rule_for(code, vendor):
+    """품번 규칙 우선, 없으면 거래처 규칙. 반환 (rule|None, vendor_entry|None)."""
+    rules = _load_goods_rules()
+    rule = rules['by_code'].get((code or '').upper())
+    vk = _goods_vendor_key(vendor)
+    ve = rules['by_vendor'].get(vk)
+    if ve is None and vk:
+        for k, e in rules['by_vendor'].items():     # 부분 일치 (ERP명이 더 길 때)
+            if k and (k in vk or vk in k):
+                ve = e
+                break
+    return rule, ve
+
+
+def _goods_reorder_items(lead=None):
+    """상품매입(I코드) 완제품 발주 타이밍 (2026-09-17, 사용자 "상품매입도 진행").
+    자재(A~D)와 달리 BOM 전개 없이 완제품 자체를 구매발주로 사입하므로
+    판매속도(완결 3개월 추세가중, SALES_DF I코드) vs 아마란스 완제품 현재고(+구매발주 미입고 120일) 로 소진일을 본다.
+    리드타임은 구매발주→입고 실측(_calc_leadtimes, I코드 48품번 표본 있음). 소진일 45일 미만만 반환."""
+    if SALES_DF is None or SALES_DF.empty or STOCK_DF is None or STOCK_DF.empty:
+        return []
+    yms = _complete_months(3)
+    if not yms:
+        return []
+    w = [0.5, 0.3, 0.2][:len(yms)]
+    sub = SALES_DF[(SALES_DF['ym'].astype(str).isin(yms)) & (SALES_DF['prefix'] == 'I')]
+    sales = {}
+    for _, r in sub.iterrows():
+        c = _goods_canon(r['code'])          # 구품번 판매 이력 → 신품번으로 합산
+        sales.setdefault(c, [0.0] * len(yms))[yms.index(str(r['ym']))] += float(r['ea'])
+    if not sales:
+        return []
+    stock, names = {}, {}
+    aliases = _goods_aliases()
+    merged_old = {}                          # 신품번 ← 합산된 구품번 목록 (표시용)
+    if '품번' in STOCK_DF.columns:
+        for _, r in STOCK_DF.iterrows():
+            raw = str(r.get('품번', '')).strip().upper()
+            c = aliases.get(raw, raw)
+            if c in sales:
+                stock[c] = stock.get(c, 0) + _num(r.get('현재고', 0))
+                if raw != c:
+                    merged_old.setdefault(c, set()).add(raw)
+                else:
+                    names[c] = str(r.get('품명', '')).strip()
+                names.setdefault(c, str(r.get('품명', '')).strip())
+    # 발주 원천 두 가지: BOM 없는 순수 사입 = 구매발주(ORDER_DF, 입고 실측 리드 있음) /
+    # BOM 있는 예외사급(I+BOM 17종) = 외주발주(WP_ORDER_DF, 입고일 없음 → 발주일→납기일 중앙값을 계획 리드로 사용)
+    incoming, last_vendor, last_order, last_src = {}, {}, {}, {}
+    wp_gaps = {}
+    cut = (datetime.now() - _timedelta(days=120)).strftime('%Y%m%d')
+    cut_lead = (datetime.now() - _timedelta(days=365)).strftime('%Y%m%d')
+    for src, df_ in (('po', ORDER_DF), ('wp', WP_ORDER_DF)):
+        if df_ is None or df_.empty or '품번' not in df_.columns or '발주일자' not in df_.columns:
+            continue
+        for _, r in df_.sort_values('발주일자').iterrows():
+            raw = str(r.get('품번', '')).strip().upper()
+            c = aliases.get(raw, raw)
+            if c not in sales:
+                continue
+            if raw != c:
+                merged_old.setdefault(c, set()).add(raw)
+            d = str(r.get('발주일자', '')).replace('-', '')[:8]
+            if not last_order.get(c) or d >= last_order[c]:
+                last_order[c] = d
+                last_vendor[c] = str(r.get('거래처명', '')).strip()
+                last_src[c] = src
+            names.setdefault(c, str(r.get('품명', '')).strip())
+            if d >= cut:
+                rem = _num(r.get('발주수량', 0)) - _num(r.get('입고수량', 0))
+                if rem > 0:
+                    incoming[c] = incoming.get(c, 0) + rem
+            if src == 'wp' and d >= cut_lead:
+                due = str(r.get('납기일자', '')).replace('-', '')[:8]
+                if len(due) == 8 and due.isdigit() and len(d) == 8:
+                    try:
+                        gap = (datetime.strptime(due, '%Y%m%d') - datetime.strptime(d, '%Y%m%d')).days
+                        if 0 <= gap <= 120:
+                            wp_gaps.setdefault(c, []).append(gap)
+                    except ValueError:
+                        pass
+    lead = dict(lead) if lead is not None else _calc_leadtimes()
+    for c, g in wp_gaps.items():
+        if c not in lead:            # 구매발주 실측이 없으면 외주발주 납기 기준(계획 리드)
+            g.sort()
+            lead[c] = {'days': g[len(g) // 2], 'n': len(g), 'src': '납기'}
+    out = []
+    for c, v in sales.items():
+        mean = sum(v) / len(v)
+        fc = sum(a * b for a, b in zip(v, w)) / (sum(w) or 1)     # 추세가중 월판매
+        if fc <= 0:
+            continue
+        daily = fc / 30
+        st, inc = stock.get(c, 0), incoming.get(c, 0)
+        days_left = st / daily
+        if st <= 0:
+            level, days_left = 'out', 0.0
+        elif days_left < 15:
+            level = 'critical'
+        elif days_left < 30:
+            level = 'warning'
+        elif days_left < 45:
+            level = 'low'
+        else:
+            continue
+        lt = lead.get(c)
+        # 상품매입은 ERP에 발주·입고를 같은 날 등록하는 경우가 많아 실측/납기 리드가 0~1일로 나옴 → 의미 없는 값이라 기본 리드로 대체
+        lead_note = ''
+        if lt and lt['days'] <= 1:
+            lead_note = f"발주·입고 동일자 등록 {lt['n']}회 → 실측 불가"
+            lt = None
+        # 업체 조건표(상품매입_업체조건.csv, 2026-09-17): 품번 규칙 > 거래처 규칙의 L/T 상한이 실측보다 우선.
+        # 시방서 업체(데이웰즈·조운정미·더고은)는 출고일을 시방서로 지정하므로 리드 미적용(src='spec').
+        rule, ve = _goods_rule_for(c, last_vendor.get(c, ''))
+        src = last_src.get(c, '')
+        vendor_note = ''
+        if merged_old.get(c):
+            vendor_note = '구품번 ' + '·'.join(sorted(merged_old[c])) + ' 합산'
+        if rule:
+            # 품번이 조건표에 있으면 조건표 거래처가 기준 (ERP 최근 발주처가 다르면 참고로 표기 — 예: I0097 표=청통본가, 최근 발주=조운정미)
+            ev = last_vendor.get(c, '')
+            if ev and _goods_vendor_key(ev) != _goods_vendor_key(rule['거래처']):
+                vendor_note = (vendor_note + ' · ' if vendor_note else '') + f'최근 발주처 {ev}'
+            last_vendor[c] = rule['거래처']
+            ve = _goods_rule_for(c, rule['거래처'])[1] or ve
+        if ve and ve.get('kind') == '시방서':
+            src, lt, lead_note = 'spec', None, '시방서 출고 업체 — 출고일은 시방서로 지정'
+        elif rule and rule.get('lt_days'):
+            lt, lead_note = {'days': rule['lt_days'], 'n': 0, 'src': '업체표'}, ''
+        elif ve and ve.get('lt_days'):
+            lt, lead_note = {'days': ve['lt_days'], 'n': 0, 'src': '업체표'}, ''
+        out.append({'code': c, 'name': names.get(c, ''), 'qty': int(st), 'incoming': int(inc), 'lead_note': lead_note,
+                    'rule': rule, 'vendor_note': vendor_note, 'vendor_rule': {'거래처': ve['거래처'], 'kind': ve['kind'], 'lt_days': ve['lt_days']} if ve else None,
+                    'monthly_avg': int(fc), 'trend': round(fc / mean, 2) if mean else 1.0,
+                    'days_left': round(days_left, 1), 'days_left_incoming': round((st + inc) / daily, 1),
+                    'level': level, 'lead': lt, 'vendor': last_vendor.get(c, ''), 'last_order': last_order.get(c, ''),
+                    'src': src, 'basis': 'sales'})
+    out.sort(key=lambda x: x['days_left'])
+    return out
+
+
 @app.route('/api/reorder_advice', methods=['GET'])
 @cached_api()
 def api_reorder_advice():
     """지금/곧 발주해야 할 품목 — 재고 소진일이 실측 리드타임 안으로 들어온 것.
-    소진일 ≤ 리드타임 → now(지금 발주) / ≤ 리드타임+7일 → soon(이번주 발주)."""
+    소진일 ≤ 리드타임 → now(지금 발주) / ≤ 리드타임+7일 → soon(이번주 발주).
+    scope: jasa(자사 자재) / outsource(외주 자재) / goods(상품매입 완제품, 2026-09-17)."""
     SAFETY = 7          # 발주 여유일
     DEFAULT_LEAD = 14   # 리드타임 표본 없을 때 가정값
     lead = _calc_leadtimes()
@@ -6888,6 +7105,26 @@ def api_reorder_advice():
                 'trend': ratio.get(a['code'], 1.0),
                 'forecast': int(a['monthly_avg'] * ratio.get(a['code'], 1.0)),
             })
+    # 상품매입 완제품: 이미 발주된 미입고분까지 합쳐도 리드+여유일을 못 넘길 때만 대상
+    for a in _goods_reorder_items(lead):
+        lt = a['lead']
+        base = lt['days'] if lt else DEFAULT_LEAD
+        if a['days_left_incoming'] > base + SAFETY:
+            continue
+        if a['days_left'] <= base:
+            urgency = 'now'
+        elif a['days_left'] <= base + SAFETY:
+            urgency = 'soon'
+        else:
+            continue
+        rows.append({
+            'code': a['code'], 'name': a['name'], 'scope': 'goods', 'src': a['src'],
+            'qty': a['qty'], 'incoming': a['incoming'], 'days_left': a['days_left'],
+            'lead_days': lt['days'] if lt else None, 'lead_n': lt['n'] if lt else 0,
+            'lead_src': (lt or {}).get('src', '실측') if lt else '', 'lead_note': a['lead_note'], 'vendor_note': a['vendor_note'],
+            'urgency': urgency, 'vendors': [a['vendor']] if a['vendor'] else [],
+            'trend': a['trend'], 'forecast': a['monthly_avg'],
+        })
     rows.sort(key=lambda x: (0 if x['urgency'] == 'now' else 1, x['days_left']))
     return jsonify({'items': rows[:40], 'total': len(rows),
                     'safety_days': SAFETY, 'default_lead': DEFAULT_LEAD})
@@ -6934,6 +7171,39 @@ def api_purchase_req_draft():
                 'qty': qty, 'due': due,
                 'vendor': last_vendor.get(a['code'], (a.get('vendors') or [''])[0] if a.get('vendors') else ''),
             })
+    # 상품매입 완제품(I코드): 제안수량 = (리드+7일)분 + 1개월 운영분 − 현재고 − 미입고
+    for a in _goods_reorder_items(lead):
+        lt = a['lead']
+        base = lt['days'] if lt else 14
+        if a['days_left_incoming'] > base + 7:
+            continue
+        monthly = a['monthly_avg']
+        need = monthly * ((base + 7) / 30.0 + 1.0) - a['qty'] - a['incoming']
+        if need <= 0:
+            need = monthly
+        qty = int(math.ceil(need / 10.0) * 10)
+        # 업체 조건표 MOQ/PLT 적용 (품번이 채워진 규칙만): 낱개 단위 MOQ는 그대로, PLT 단위는 PLT당수량이 있을 때 환산·PLT 배수 올림
+        moq_note = ''
+        rule = a.get('rule')
+        if rule and rule.get('MOQ'):
+            unit, moq, moq_qty, plt = rule.get('MOQ단위', ''), rule['MOQ'], rule.get('MOQ수량') or 0, rule.get('PLT당수량') or 0
+            if moq_qty > 0:
+                qty = int(max(qty, moq_qty))
+                if plt > 0:
+                    qty = int(math.ceil(qty / plt) * plt)      # PLT 배수 올림
+                moq_note = f'MOQ {int(moq):,}{unit}(={int(moq_qty):,}개)' + (f' · PLT {int(plt):,}개 단위' if plt > 0 else '')
+            else:
+                moq_note = f'MOQ {int(moq):,}{unit} (판매단위 수량 미입력 → 환산 못함)'
+            if rule.get('비고'):
+                moq_note += ' · ' + rule['비고']
+        due = (datetime.now() + timedelta(days=max(base, 3))).strftime('%Y-%m-%d')
+        rows.append({
+            'code': a['code'], 'name': a['name'], 'scope': 'goods', 'src': a['src'],
+            'stock': a['qty'], 'incoming': a['incoming'], 'monthly_avg': int(monthly),
+            'days_left': a['days_left'], 'lead_days': lt['days'] if lt else None,
+            'qty': qty, 'due': due, 'vendor': a['vendor'] or last_vendor.get(a['code'], ''),
+            'moq_note': moq_note + ((' · ' if moq_note else '') + a['vendor_note'] if a['vendor_note'] else ''),
+        })
     rows.sort(key=lambda x: x['days_left'])
     return jsonify({'items': rows, 'total': len(rows),
                     'req_dt': datetime.now().strftime('%Y-%m-%d'),
@@ -7070,6 +7340,19 @@ def _notify_snapshot():
             if a['days_left'] <= base and a['level'] != 'out':
                 now_items.append({'code': a['code'], 'name': a['name'], 'scope': scope,
                                   'days_left': a['days_left'], 'lead': base})
+    # 상품매입 완제품(I코드): 품절/지금발주 모두 알림 대상 (미입고분으로 충분하면 제외)
+    try:
+        for a in _goods_reorder_items(lead):
+            base = a['lead']['days'] if a['lead'] else 14
+            if a['days_left_incoming'] > base + 7:
+                continue
+            if a['level'] == 'out':
+                out.append({'code': a['code'], 'name': a['name'], 'scope': 'goods'})
+            elif a['days_left'] <= base:
+                now_items.append({'code': a['code'], 'name': a['name'], 'scope': 'goods',
+                                  'days_left': a['days_left'], 'lead': base})
+    except Exception as e:
+        print(f'[알림] 상품매입 스냅샷 오류: {e!r:.120}')
     with app.test_request_context('/api/data_health'):
         health = api_data_health().get_json()
     return {'out': out, 'now': now_items, 'health': health}
@@ -7086,7 +7369,7 @@ def _notify_check(force_daily=False):
 
         new_out = [x for x in snap['out'] if sc(x) not in set(st.get('out', []))]
         if new_out and st.get('out') is not None:     # 첫 실행은 기준선만 저장
-            body = '\n'.join(f"· {x['code']} {x['name']} ({'자사' if x['scope']=='jasa' else '외주'})" for x in new_out[:15])
+            body = '\n'.join(f"· {x['code']} {x['name']} ({ {'jasa': '자사', 'outsource': '외주', 'goods': '상품매입'}.get(x['scope'], x['scope']) })" for x in new_out[:15])
             made.append(_notify('error', 'out', f'🔴 신규 품절 {len(new_out)}건', body, st))
         st['out'] = [sc(x) for x in snap['out']]
 
@@ -7503,16 +7786,20 @@ def api_supply_plan():
     w = [0.5, 0.3, 0.2][:len(yms)]
     sub = SALES_DF[SALES_DF['ym'].astype(str).isin(yms)]
     sales = {}   # code → [by month]
+    _al = _goods_aliases()   # 구품번→신품번 (상품매입 전환 품목, 재고·계획·미입고를 신품번으로 합산)
     for _, r in sub.iterrows():
-        c = str(r['code']).strip().upper()
+        c = _al.get(str(r['code']).strip().upper(), str(r['code']).strip().upper())
         sales.setdefault(c, [0.0] * len(yms))[yms.index(str(r['ym']))] += float(r['ea'])
 
     stock, names = {}, {}
     if STOCK_DF is not None and not STOCK_DF.empty and '품번' in STOCK_DF.columns:
         for _, r in STOCK_DF.iterrows():
-            c = str(r.get('품번', '')).strip().upper()
+            raw = str(r.get('품번', '')).strip().upper()
+            c = _al.get(raw, raw)
             if c[:1] in ('G', 'H', 'I'):
                 stock[c] = stock.get(c, 0) + _num(r.get('현재고', 0))
+                if raw == c:
+                    names[c] = str(r.get('품명', '')).strip()
                 names.setdefault(c, str(r.get('품명', '')).strip())
     if BOM_DF is not None and not BOM_DF.empty:
         for _, r in BOM_DF.drop_duplicates('모품번').iterrows():
@@ -7539,7 +7826,7 @@ def api_supply_plan():
         for _, r in WO_DF.iterrows():
             if str(r.get('closeDt', '')).strip() not in ('', 'nan'):
                 continue
-            c = str(r.get('품번', '')).strip().upper()
+            c = _al.get(str(r.get('품번', '')).strip().upper(), str(r.get('품번', '')).strip().upper())
             rem = _num(r.get('지시수량', 0)) - _num(r.get('workQt', 0))
             if c[:1] in ('G', 'H', 'I') and rem > 0:
                 plan[c] = plan.get(c, 0) + rem
@@ -7549,7 +7836,7 @@ def api_supply_plan():
         for _, r in WP_ORDER_DF.iterrows():
             if str(r.get('발주일자', '')).replace('-', '')[:8] < cut:
                 continue
-            c = str(r.get('품번', '')).strip().upper()
+            c = _al.get(str(r.get('품번', '')).strip().upper(), str(r.get('품번', '')).strip().upper())
             rem = _num(r.get('발주수량', 0)) - _num(r.get('입고수량', 0))
             if c[:1] in ('G', 'H', 'I') and rem > 0:
                 incoming[c] = incoming.get(c, 0) + rem
@@ -11215,7 +11502,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   </div>
   <div class="chart-panel alert-span reorder-panel">
     <div class="chart-head">
-      <div><span class="chart-title">🕐 발주 타이밍</span><span class="chart-sub">소진일 vs 실측 리드타임 · 클릭=상세</span></div>
+      <div><span class="chart-title">🕐 발주 타이밍</span><span class="chart-sub">자재 + 상품매입 완제품 · 소진일 vs 실측 리드타임 · 클릭=상세</span></div>
       <div style="display:flex;align-items:center;gap:8px">
         <button onclick="openPrDraft()" style="padding:3px 9px;font-size:11px;font-weight:700;border:1px solid #e11d48;
           border-radius:6px;background:#fff;color:#e11d48;cursor:pointer;white-space:nowrap"
@@ -13413,14 +13700,16 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       list.innerHTML = items.map(a => {
         const now = a.urgency === 'now';
         const leadTxt = a.lead_days != null
-          ? '리드 ' + a.lead_days + '일(' + a.lead_n + '회 실측)'
-          : '리드 미상(기본 ' + (d.default_lead || 14) + '일)';
+          ? (a.lead_src === '업체표' ? '리드 ' + a.lead_days + '일(업체 L/T 상한)' : '리드 ' + a.lead_days + '일(' + a.lead_n + '회 ' + (a.lead_src === '납기' ? '납기계획' : '실측') + ')')
+          : (a.src === 'spec' ? '시방서 출고 · 기준 ' + (d.default_lead || 14) + '일' : '리드 미상(기본 ' + (d.default_lead || 14) + '일' + (a.lead_note ? ' · 동일자등록' : '') + ')');
         const vendorTxt = (a.vendors && a.vendors.length)
-          ? ' <span class="alert-vendor">· ' + escapeHtml(a.vendors.slice(0, 2).join(', ')) + '</span>' : '';
+          ? ' <span class="alert-vendor">· ' + escapeHtml(a.vendors.slice(0, 2).join(', ')) + (a.vendor_note ? ' (' + escapeHtml(a.vendor_note) + ')' : '') + '</span>' : '';
         return '<div class="alert-row" onclick="openItemModal(\\'' + a.code + '\\')">'
-          + '<span class="alert-badge ' + (now ? 'out' : 'warning') + '">' + (now ? '지금 발주' : '이번주') + '</span>'
+          + '<span class="alert-badge ' + (now ? 'out' : 'warning') + '">' + (a.src === 'spec' ? (now ? '시방서 발행' : '시방서 준비') : (now ? '지금 발주' : '이번주')) + '</span>'
           + '<div><div class="alert-name">' + escapeHtml(a.name) + vendorTxt + '</div>'
-          + '<div class="alert-code">' + escapeHtml(a.code) + ' · ' + (a.scope === 'jasa' ? '자사' : '외주') + ' · ' + leadTxt
+          + '<div class="alert-code">' + escapeHtml(a.code) + ' · ' + ({ jasa: '자사', outsource: '외주', goods: '상품매입' }[a.scope] || a.scope)
+          + (a.scope === 'goods' ? ({ po: '(구매발주)', wp: '(외주발주)', spec: '(시방서)' }[a.src] || '(발주이력 없음)') : '') + ' · ' + leadTxt
+          + (a.scope === 'goods' && a.incoming ? ' · <span style="color:#0891b2">미입고 ' + fmtInt(a.incoming) + '</span>' : '')
           + (a.trend >= 1.15 ? ' · <span style="color:#dc2626">▲추세 ' + Math.round((a.trend - 1) * 100) + '%</span>' : (a.trend <= 0.85 ? ' · <span style="color:#2563eb">▼추세 ' + Math.round((1 - a.trend) * 100) + '%</span>' : '')) + '</div></div>'
           + '<div class="alert-qty">재고 ' + fmtInt(a.qty) + '</div>'
           + '<div class="alert-days ' + (now ? 'out' : 'warning') + '">' + a.days_left.toFixed(1) + '일</div>'
@@ -13764,7 +14053,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         html += '<tr>'
           + '<td><input type="checkbox" class="pr-chk" checked data-i="' + i + '"></td>'
           + '<td style="font-weight:700">' + escapeHtml(it.code) + '</td>'
-          + '<td>' + escapeHtml(it.name) + (it.scope === 'outsource' ? ' <span style="font-size:10px;color:#b45309">외주</span>' : '') + '</td>'
+          + '<td>' + escapeHtml(it.name) + (it.scope === 'outsource' ? ' <span style="font-size:10px;color:#b45309">외주</span>' : (it.scope === 'goods' ? ' <span style="font-size:10px;color:#0f766e">상품매입' + ({ po: '·구매발주', wp: '·외주발주', spec: '·시방서' }[it.src] || '') + (it.incoming ? ' · 미입고 ' + fmtInt(it.incoming) : '') + (it.moq_note ? ' · ' + escapeHtml(it.moq_note) : '') + '</span>' : '')) + '</td>'
           + '<td class="num">' + fmtInt(it.stock) + '</td>'
           + '<td class="num">' + fmtInt(it.monthly_avg) + '</td>'
           + '<td class="num" style="color:' + (it.days_left < 7 ? '#dc2626' : '#ca8a04') + ';font-weight:700">' + it.days_left.toFixed(1) + '일</td>'
