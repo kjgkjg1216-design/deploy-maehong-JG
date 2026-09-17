@@ -27,9 +27,8 @@ echo [4/5] 자사 부자재 재고 데이터를 CSV로 변환중...
 python convert_jasa.py
 echo.
 
-REM ngrok 외부 접속 터널 시작 (고정 도메인)
-echo [5/5] 외부 접속 터널 시작중...
-start /B ngrok http 5000 --url fashionable-failingly-tammie.ngrok-free.dev
+REM ngrok 외부터널 제거됨(2026-06-29): 외부접속은 GCP VM만. 옛 ngrok 사이트 차단.
+echo [5/5] 외부 접속 터널 비활성화 (GCP VM 사용)...
 echo.
 
 REM Flask 서버 시작
@@ -37,8 +36,7 @@ echo ================================================
 echo   서버 시작 완료!
 echo.
 echo   사내: http://localhost:5000
-echo   외부: https://fashionable-failingly-tammie.ngrok-free.dev
-echo   관리자: https://fashionable-failingly-tammie.ngrok-free.dev/admin
+echo   외부: https://8.235.41.127.sslip.io  (GCP VM)
 echo.
 echo   종료하려면 Ctrl+C 를 누르세요
 echo ================================================

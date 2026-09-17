@@ -6,7 +6,9 @@ import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
 
-load_dotenv('C:/Users/jgkim/maehong-JG/.env')
+BASE_DIR = os.environ.get('APP_BASE_DIR', 'C:/Users/jgkim/maehong-JG')
+DATA_DIR = os.environ.get('DATA_DIR', BASE_DIR + '/data')
+load_dotenv(os.path.join(BASE_DIR, '.env'))
 
 API_KEY = os.getenv('MONDAY_API_KEy')
 URL = 'https://api.monday.com/v2'
@@ -54,33 +56,46 @@ def fetch_all_boards():
     return all_boards
 
 
+BOARDS_WITH_UPDATES = {'원/부자재 발주 요청', '외주 생산 요청'}  # 말풍선(updates) 수집 대상 보드
+
+
 def fetch_board_items(board_id, board_name):
-    """특정 보드의 아이템+컬럼값 수집"""
+    """특정 보드의 아이템+컬럼값 수집. 특정 보드는 말풍선(updates)도 수집."""
+    with_updates = board_name in BOARDS_WITH_UPDATES
     items = []
     cursor = None
     page_count = 0
 
+    # 말풍선 수집 시 complexity 고려해 페이지 크기 축소 + updates + replies 필드 추가
+    page_limit = 40 if with_updates else 100
+    upd_field = '''updates(limit: 8) {
+        text_body created_at creator { name }
+        replies { text_body created_at creator { name } }
+    }''' if with_updates else ''
+
     while True:
         if cursor:
             q = f'''{{
-                next_items_page(cursor: "{cursor}", limit: 100) {{
+                next_items_page(cursor: "{cursor}", limit: {page_limit}) {{
                     cursor
                     items {{
                         id name created_at updated_at
                         group {{ title }}
                         column_values {{ id column {{ title }} text value }}
+                        {upd_field}
                     }}
                 }}
             }}'''
         else:
             q = f'''{{
                 boards(ids: {board_id}) {{
-                    items_page(limit: 100) {{
+                    items_page(limit: {page_limit}) {{
                         cursor
                         items {{
                             id name created_at updated_at
                             group {{ title }}
                             column_values {{ id column {{ title }} text value }}
+                            {upd_field}
                         }}
                     }}
                 }}
@@ -115,6 +130,29 @@ def fetch_board_items(board_id, board_name):
                 val = cv.get('text', '')
                 if val:
                     row[col_name] = val
+            # 말풍선(updates+replies) — 최신순, 줄바꿈 구분. 대댓글은 '└' 들여쓰기
+            if with_updates:
+                ups = item.get('updates', []) or []
+                parts = []
+                for u in ups:
+                    body = (u.get('text_body') or '').strip()
+                    if not body:
+                        continue
+                    when = (u.get('created_at') or '')[:10]
+                    who = (u.get('creator') or {}).get('name', '')
+                    header = f"[{when} {who}]" if when else ''
+                    parts.append(f"{header} {body}".strip())
+                    # 대댓글 (replies) — 오래된 순서가 자연스러움
+                    for rep in (u.get('replies') or []):
+                        rbody = (rep.get('text_body') or '').strip()
+                        if not rbody:
+                            continue
+                        rwhen = (rep.get('created_at') or '')[:10]
+                        rwho = (rep.get('creator') or {}).get('name', '')
+                        rheader = f"[{rwhen} {rwho}]" if rwhen else ''
+                        parts.append(f"  └ {rheader} {rbody}".rstrip())
+                if parts:
+                    row['업데이트'] = '\n---\n'.join(parts)
             items.append(row)
 
         if not cursor or not batch:
@@ -126,7 +164,7 @@ def fetch_board_items(board_id, board_name):
 
 def main():
     today = datetime.now().strftime('%Y%m%d')
-    output_path = f'C:/Users/jgkim/maehong-JG/data/{today}_monday.csv'
+    output_path = f'{DATA_DIR}/{today}_monday.csv'
 
     print("=" * 60)
     print("  Monday.com 전체 데이터 수집")
@@ -156,23 +194,22 @@ def main():
             sys.stdout.buffer.write(f" ERROR: {str(e)[:50]}\n".encode('utf-8'))
         sys.stdout.buffer.flush()
 
-        # 200건마다 중간 저장
+        # 중간 저장은 .tmp로만 (직전 정상 파일 보호)
         if (i + 1) % 200 == 0 and all_items:
             tmp_df = pd.DataFrame(all_items)
-            tmp_df.to_csv(output_path, index=False, encoding='utf-8-sig')
-            sys.stdout.buffer.write(f"  [중간저장] {len(all_items)}건 저장됨\n".encode('utf-8'))
+            tmp_df.to_csv(output_path + '.tmp', index=False, encoding='utf-8-sig')
+            sys.stdout.buffer.write(f"  [중간저장(.tmp)] {len(all_items)}건\n".encode('utf-8'))
 
         time.sleep(0.2)
 
-    # 3) 최종 CSV 저장
+    # 3) 최종 CSV 저장 (원자적 + sanity check)
     if all_items:
         df = pd.DataFrame(all_items)
-        df.to_csv(output_path, index=False, encoding='utf-8-sig')
-        print(f"\n[저장 완료] {output_path}")
-        print(f"  총 {len(df)}건, {len(df.columns)}열")
-        print(f"  보드: {df['보드명'].nunique()}개")
+        from _safe_csv import safe_to_csv
+        safe_to_csv(df, output_path, label='monday')
+        print(f"\n[저장 시도] {output_path} (총 {len(df)}건, 보드 {df['보드명'].nunique()}개)")
     else:
-        print("\n수집된 데이터 없음")
+        print("\n수집된 데이터 없음 — 직전 파일 유지")
 
     print("=" * 60)
 

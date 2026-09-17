@@ -1,0 +1,8 @@
+# Caddy = 리버스 프록시 + 자동 HTTPS(Let's Encrypt)
+# YOUR_DOMAIN 을 실제 도메인으로 바꾸세요 (예: maehong.duckdns.org)
+# Caddy가 80/443에서 받아 내부 Flask(8000)로 전달하고 인증서를 자동 발급/갱신.
+
+YOUR_DOMAIN {
+    reverse_proxy localhost:8000
+    encode gzip
+}

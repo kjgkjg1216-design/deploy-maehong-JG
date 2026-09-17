@@ -39,3 +39,26 @@ desktop.ini
 
 # Claude Code
 .claude/
+
+# ── 2026-09-17 추가: 비밀/임시/대용량/업무데이터 제외 ──
+.reload_token
+*.lock
+_seed_data/
+_snap*/
+data/*.tmp
+data/*.partial
+data/*.json
+data/*.jsonl
+data/리포트/
+data/마감/
+*.bak
+*.bak[0-9]*
+*.bak_*
+*.orig
+# 판매 실적(타부서 자료)·중간 산출물 — 확정 매핑표(SKU매핑_확정.csv)만 커밋
+월간판매수량*.csv
+*공급가*.csv
+SKU매핑_초벌.csv
+SKU매핑_확인필요.csv
+SKU매핑_세트확인.csv
+BOM미등록_*.csv

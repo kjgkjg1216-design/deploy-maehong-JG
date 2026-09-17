@@ -1,0 +1,23 @@
+# 데이터(1.8GB)는 이미지에 넣지 않고 Fly 볼륨에 별도 시드
+data/
+_seed_data/
+
+# 시크릿 — 절대 이미지에 포함 금지 (Fly secrets로 주입)
+.env
+maehong-scm-firebase-adminsdk-*.json
+
+# 로컬 전용/불필요
+.git/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.bak*
+*.csv.partial
+*.csv.tmp
+ngrok.log
+flask.log
+start_maehong.bat
+start_maehong.ps1
+*.xlsx

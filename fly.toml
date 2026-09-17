@@ -1,0 +1,29 @@
+# 매홍 L&F 대시보드 — Fly.io 설정
+# app 이름은 전 세계 유일해야 함. 중복이면 fly launch 시 다른 이름으로 바꾸세요.
+app = "maehong-dashboard"
+primary_region = "nrt"   # 도쿄 (한국에서 가장 가까운 Fly 리전)
+
+[build]
+
+[env]
+  APP_BASE_DIR = "/app"
+  DATA_DIR = "/data"
+  PORT = "8080"
+  TZ = "Asia/Seoul"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # 24시간 가동 + 백그라운드 수집 스케줄러 때문에 절대 멈추면 안 됨
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+# 데이터(CSV) 영구 저장 볼륨 — 재배포/재시작해도 유지
+[[mounts]]
+  source = "maehong_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "2gb"   # pandas로 monday CSV(약 4만행) 로드 → 넉넉히. 비용 줄이려면 1gb로 조정

@@ -1,0 +1,22 @@
+[Unit]
+Description=Maehong L&F Dashboard (Flask)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/maehong
+Environment=APP_BASE_DIR=/opt/maehong
+Environment=DATA_DIR=/opt/maehong/data
+Environment=PORT=8000
+Environment=TZ=Asia/Seoul
+# 가상환경 파이썬으로 실행 (setup 단계에서 /opt/maehong/venv 생성)
+ExecStart=/opt/maehong/venv/bin/python /opt/maehong/app.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/maehong.log
+StandardError=append:/var/log/maehong.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>입수 테스트 3D</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: -apple-system, "Segoe UI", "Malgun Gothic", sans-serif; background:#f1f5f9; color:#0f172a; }
+  .wrap { max-width:1200px; margin:0 auto; padding:16px; }
+  .panel { background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:14px 16px; margin-bottom:14px; border-top:3px solid #7c3aed; }
+  h2 { margin:0 0 4px; font-size:15px; }
+  .sub { font-size:11.5px; color:#64748b; margin-bottom:12px; }
+  .block { border:1px solid #e2e8f0; border-radius:10px; padding:10px 12px; margin-bottom:10px; }
+  .block > .bt { font-size:11.5px; font-weight:700; color:#7c3aed; margin-bottom:8px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; }
+  .fld { display:flex; flex-direction:column; gap:3px; }
+  .fld label { font-size:10.5px; color:#64748b; font-weight:600; }
+  .dims { display:flex; gap:4px; }
+  .dims input, .num { width:56px; padding:6px 4px; font-size:12px; border:1px solid #cbd5e1; border-radius:6px; text-align:center; font-variant-numeric:tabular-nums; }
+  .num.big { width:66px; font-size:14px; font-weight:700; color:#6d28d9; }
+  select { padding:6px 8px; font-size:12px; border:1px solid #cbd5e1; border-radius:6px; }
+  .stages { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width:820px){ .stages { grid-template-columns:1fr; } }
+  .stage h3 { margin:0 0 6px; font-size:13px; display:flex; justify-content:space-between; align-items:baseline; }
+  .stage h3 .cnt { font-size:18px; font-weight:800; color:#7c3aed; font-variant-numeric:tabular-nums; }
+  .canvas-box { width:100%; height:300px; background:#0f172a; border-radius:10px; overflow:hidden; position:relative; cursor:grab; }
+  .canvas-box:active { cursor:grabbing; }
+  .hint { position:absolute; bottom:6px; left:8px; font-size:10px; color:#94a3b8; pointer-events:none; }
+  .badge { font-size:11px; color:#475569; margin-top:6px; }
+  .total { background:#7c3aed; color:#fff; border-radius:10px; padding:12px 16px; margin-top:12px; display:flex; justify-content:space-between; align-items:center; }
+  .total .big { font-size:30px; font-weight:800; font-variant-numeric:tabular-nums; }
+  .total .lbl { font-size:12px; opacity:.9; }
+  .warn { color:#fde68a; font-size:11px; }
+  .eq { font-size:12px; opacity:.9; margin-right:14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="panel">
+    <h2>📦 입수 테스트 (3D · 실측 시각화)</h2>
+    <div class="sub">아는 입수 수량과 배열 방식을 입력하면 실제 파우치 형상 그대로 3D로 그려줍니다 · 드래그=회전, 휠=확대</div>
+
+    <!-- ① 1차파우치 -->
+    <div class="block">
+      <div class="bt">① 1차파우치 (형상)</div>
+      <div class="row">
+        <div class="fld"><label>형태</label>
+          <select id="aForm" onchange="onForm('a')">
+            <option value="스탠드">스탠드파우치(밑지)</option>
+            <option value="3면실링">3면실링 평파우치</option>
+          </select></div>
+        <div class="fld"><label>가로 W</label><input id="aw" class="num" type="number" value="130" oninput="calc()"></div>
+        <div class="fld"><label>세로 H</label><input id="ah" class="num" type="number" value="155" oninput="calc()"></div>
+        <div class="fld" id="aBaseFld"><label>밑지(거싯)</label><input id="abase" class="num" type="number" value="80" oninput="calc()"></div>
+        <div class="fld"><label>채움두께 T</label><input id="at" class="num" type="number" value="30" oninput="calc()"></div>
+      </div>
+    </div>
+
+    <!-- ② 내부용기 -->
+    <div class="block">
+      <div class="bt">② 내부용기 (2차파우치 / 단상자)</div>
+      <div class="row">
+        <div class="fld"><label>형태</label>
+          <select id="bForm" onchange="onForm('b')">
+            <option value="스탠드">스탠드파우치</option>
+            <option value="3면실링">3면실링 파우치</option>
+            <option value="단상자">단상자(박스)</option>
+          </select></div>
+        <div class="fld"><label>프리셋</label>
+          <select id="bPreset" onchange="applyPreset('b')"><option value="">직접입력</option></select></div>
+        <span id="bPouchFields" style="display:contents">
+          <div class="fld"><label>가로 W</label><input id="bw" class="num" type="number" value="220" oninput="calc()"></div>
+          <div class="fld"><label>세로 H</label><input id="bh" class="num" type="number" value="290" oninput="calc()"></div>
+          <div class="fld" id="bBaseFld"><label>밑지(거싯)</label><input id="bbase" class="num" type="number" value="60" oninput="calc()"></div>
+          <div class="fld"><label>채움두께 T</label><input id="bt" class="num" type="number" value="60" oninput="calc()"></div>
+        </span>
+        <span id="bBoxFields" style="display:none">
+          <div class="fld"><label>내치수 (W×D×H)</label>
+            <div class="dims">
+              <input id="bbw" type="number" value="200" oninput="calc()">
+              <input id="bbd" type="number" value="140" oninput="calc()">
+              <input id="bbh" type="number" value="170" oninput="calc()">
+            </div></div>
+        </span>
+      </div>
+    </div>
+
+    <!-- ③ 외박스 -->
+    <div class="block">
+      <div class="bt">③ 외박스</div>
+      <div class="row">
+        <div class="fld"><label>프리셋</label>
+          <select id="cPreset" onchange="applyPreset('c')"><option value="">직접입력</option></select></div>
+        <div class="fld"><label>내치수 (W×D×H)</label>
+          <div class="dims">
+            <input id="cw" type="number" value="360" oninput="calc()">
+            <input id="cd" type="number" value="360" oninput="calc()">
+            <input id="ch" type="number" value="270" oninput="calc()">
+          </div></div>
+      </div>
+    </div>
+
+    <!-- ④ 실측 입수 & 배열 -->
+    <div class="block" style="border-color:#c4b5fd; background:#faf5ff">
+      <div class="bt">④ 실측 입수 · 배열 방식</div>
+      <div class="row">
+        <div class="fld"><label>1단계 · 2차당 1차 입수</label><input id="n1" class="num big" type="number" value="3" min="1" oninput="calc()"></div>
+        <div class="fld"><label>1단계 배열</label>
+          <select id="pat1" onchange="calc()">
+            <option value="row-alt">세워서 · 1개씩 교대 뒤집기(네스팅)</option>
+            <option value="row">세워서 줄로</option>
+            <option value="stack">눕혀서 적층</option>
+          </select></div>
+        <div style="width:1px;background:#ddd6fe;align-self:stretch;margin:0 4px"></div>
+        <div class="fld"><label>2단계 · 외박스당 2차 입수</label><input id="n2" class="num big" type="number" value="10" min="1" oninput="calc()"></div>
+        <div class="fld"><label>2단계 배열</label>
+          <select id="pat2" onchange="calc()">
+            <option value="row">세워서 줄로</option>
+            <option value="row-alt">세워서 · 1개씩 교대 뒤집기(네스팅)</option>
+            <option value="stack">눕혀서 적층</option>
+          </select></div>
+      </div>
+    </div>
+
+    <div class="stages">
+      <div class="stage">
+        <h3><span>1단계 · 1차파우치 → <span id="s1name">2차파우치</span></span><span class="cnt" id="s1cnt">0</span></h3>
+        <div class="canvas-box" id="cv1"><div class="hint">드래그 회전 · 휠 확대</div></div>
+        <div class="badge" id="s1badge"></div>
+      </div>
+      <div class="stage">
+        <h3><span>2단계 · <span id="s2name">2차파우치</span> → 외박스</span><span class="cnt" id="s2cnt">0</span></h3>
+        <div class="canvas-box" id="cv2"><div class="hint">드래그 회전 · 휠 확대</div></div>
+        <div class="badge" id="s2badge"></div>
+      </div>
+    </div>
+
+    <div class="total">
+      <div><div class="lbl">외박스 1개당 1차파우치 총 입수</div><div class="warn">※ 실측 입수 기반 시각화 — 파우치 형상은 눌림/부풂으로 실제와 다소 차이</div></div>
+      <div style="display:flex;align-items:center"><span class="eq" id="eq">3 × 10 =</span><span class="big" id="totalCnt">30 <span style="font-size:14px;font-weight:600">개</span></span></div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ===================== 파우치 지오메트리 =====================
+function spow(v,p){ return Math.sign(v)*Math.pow(Math.abs(v),p); }
+function smooth(t){ t=Math.max(0,Math.min(1,t)); return t*t*(3-2*t); }
+function lerp(a,b,t){ return a+(b-a)*t; }
+function loft(rings, seg){
+  const v=[], idx=[], R=rings.length;
+  for(let i=0;i<R;i++){ const r=rings[i];
+    for(let j=0;j<=seg;j++){ const th=j/seg*Math.PI*2;
+      v.push(r.ax*spow(Math.cos(th),0.72), r.y, r.bz*spow(Math.sin(th),0.72)); } }
+  const st=seg+1;
+  for(let i=0;i<R-1;i++)for(let j=0;j<seg;j++){ const a=i*st+j,b=a+1,c=a+st,d=c+1; idx.push(a,c,b,b,c,d); }
+  const bc=v.length/3; v.push(0,rings[0].y,0);
+  for(let j=0;j<seg;j++) idx.push(bc, j, j+1);
+  const ts=(R-1)*st, tc=v.length/3; v.push(0,rings[R-1].y,0);
+  for(let j=0;j<seg;j++) idx.push(tc, ts+j+1, ts+j);
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(v,3));
+  g.setIndex(idx); g.computeVertexNormals(); return g;
+}
+function standupGeom(W,H,base,T){
+  const N=22, body=Math.max(T,base,4), rings=[];
+  for(let i=0;i<=N;i++){ const h=i/N, y=h*H; let bz, ax=W/2;
+    if(h<0.18) bz=lerp(Math.max(base,2)/2, body/2, smooth(h/0.18));
+    else if(h<0.78) bz=body/2;
+    else bz=lerp(body/2, 0.8, smooth((h-0.78)/0.22));
+    if(h>0.86) ax=lerp(W/2, W*0.44, smooth((h-0.86)/0.14));
+    rings.push({y,ax,bz}); }
+  return loft(rings,20);
+}
+function pillowGeom(W,H,T){
+  const N=20, rings=[];
+  for(let i=0;i<=N;i++){ const h=i/N, y=h*H, ax=W/2;
+    const bz=0.8+(Math.max(T,4)/2-0.8)*Math.sin(Math.PI*h); rings.push({y,ax,bz:Math.max(0.6,bz)}); }
+  return loft(rings,20);
+}
+function pouchGeom(form,W,H,base,T){ return form==='스탠드'?standupGeom(W,H,base,T):pillowGeom(W,H,T); }
+
+// posture: 세움/눕힘, flip:180° 뒤집기 → min 원점 정렬
+function orient(geom, posture, flip){
+  const g=geom.clone();
+  if(posture==='눕힘') g.applyMatrix4(new THREE.Matrix4().makeRotationX(Math.PI/2));
+  if(flip) g.applyMatrix4(new THREE.Matrix4().makeRotationZ(Math.PI));  // 상하 뒤집기
+  g.computeBoundingBox(); const b=g.boundingBox;
+  g.translate(-b.min.x,-b.min.y,-b.min.z); g.computeBoundingBox();
+  const s=g.boundingBox.max;
+  return {geom:g, size:{x:s.x,y:s.y,z:s.z}};
+}
+function boxGeom(W,D,H){ const g=new THREE.BoxGeometry(W,H,D); g.translate(W/2,H/2,D/2);
+  return {geom:g, size:{x:W,y:H,z:D}}; }
+
+// ===================== 배열(레이아웃) =====================
+function chooseGrid(count, Wc, Dc){
+  let cols=Math.max(1, Math.round(Math.sqrt(count*Wc/Math.max(1,Dc))));
+  let rows=Math.ceil(count/cols);
+  while(cols*rows<count) cols++;
+  while(cols>1 && (cols-1)*rows>=count) cols--;
+  return {cols,rows};
+}
+// pattern: row / row-alt / stack. return {items:[{x,y,z,sc,flip}], cols,rows,layers, orient}
+function layout(count, cont, form, W,H,base,T, pattern){
+  count=Math.max(1, Math.round(count));
+  if(pattern==='stack'){
+    const o=orient(pouchGeom(form,W,H,base,T),'눕힘',false), ns=o.size;
+    // 눕혀서 H쪽으로 적층 (필요시 다층 그리드)
+    const perCol=Math.max(1, Math.floor(cont.H/(ns.y* (cont.H/(count*ns.y)>=1?1:1) )) ); // 단순화 아래
+    const layers=count, pitchY=cont.H/layers;
+    const sc=Math.min(cont.W/ns.x, cont.D/ns.z, pitchY/ns.y)*0.94;
+    const w=ns.x*sc,d=ns.z*sc,h=ns.y*sc, items=[];
+    for(let k=0;k<count;k++) items.push({x:(cont.W-w)/2, z:(cont.D-d)/2, y:k*pitchY+(pitchY-h)/2, sc, flip:false});
+    return {items, geom:o.geom, geomFlip:o.geom, ns, cols:1,rows:1,layers, label:`눕혀서 ${count}층 적층`};
+  }
+  // 세움
+  const o=orient(pouchGeom(form,W,H,base,T),'세움',false), ns=o.size;
+  const of=orient(pouchGeom(form,W,H,base,T),'세움',true);
+  const {cols,rows}=chooseGrid(count, cont.W, cont.D);
+  const nest = pattern==='row-alt' ? 0.68 : 1.0;   // 교대 뒤집기=겹쳐 끼움
+  // cols개가 겹침(nest) 포함해 폭에 맞도록 아이템 크기 산정
+  const itemW = cont.W/((cols-1)*nest+1);
+  let sc = itemW/ns.x;
+  sc = Math.min(sc, (cont.D/rows)/ns.z, cont.H/ns.y*0.96);
+  const w=ns.x*sc, d=ns.z*sc, pitchX=w*nest, pitchZ=d;
+  const blockW=(cols-1)*pitchX+w, blockD=(rows-1)*pitchZ+d;
+  const sx=(cont.W-blockW)/2, sz=(cont.D-blockD)/2, items=[];
+  for(let k=0;k<count;k++){ const c=k%cols, r=Math.floor(k/cols);
+    const flip = pattern==='row-alt' && (c%2===1);
+    items.push({x:sx+c*pitchX, z:sz+r*pitchZ, y:0, sc, flip}); }
+  const lab = pattern==='row-alt' ? `세워서 ${cols}×${rows} · 교대 뒤집기(네스팅)` : `세워서 ${cols}×${rows} 줄`;
+  return {items, geom:o.geom, geomFlip:of.geom, ns, cols,rows,layers:1, label:lab};
+}
+// 박스 아이템(2차=단상자) 배열
+function layoutBox(count, cont, W,D,H){
+  count=Math.max(1,Math.round(count));
+  const {cols,rows}=chooseGrid(count, cont.W, cont.D);
+  let layers=Math.ceil(count/(cols*rows));
+  const pitchX=cont.W/cols, pitchZ=cont.D/rows, pitchY=cont.H/layers;
+  const sc=Math.min(pitchX/W, pitchZ/D, pitchY/H)*0.92;
+  const w=W*sc,d=D*sc,h=H*sc, o=boxGeom(w,d,h), items=[];
+  for(let k=0;k<count;k++){ const lay=Math.floor(k/(cols*rows)), rem=k%(cols*rows), c=rem%cols, r=Math.floor(rem/cols);
+    items.push({x:c*pitchX+(pitchX-w)/2, z:r*pitchZ+(pitchZ-d)/2, y:lay*pitchY+(pitchY-h)/2, sc:1, flip:false}); }
+  return {items, geom:o.geom, geomFlip:o.geom, ns:o.size, cols,rows,layers, label:`${cols}×${rows}×${layers}`};
+}
+
+// ===================== 3D 뷰어 =====================
+function makeViewer(el){
+  const scene=new THREE.Scene();
+  const cam=new THREE.PerspectiveCamera(45, el.clientWidth/el.clientHeight, 1, 200000);
+  const renderer=new THREE.WebGLRenderer({antialias:true});
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(el.clientWidth, el.clientHeight); renderer.setClearColor(0x0f172a);
+  el.insertBefore(renderer.domElement, el.firstChild);
+  scene.add(new THREE.AmbientLight(0xffffff,0.75));
+  const dl=new THREE.DirectionalLight(0xffffff,0.55); dl.position.set(1,2,1.5); scene.add(dl);
+  const dl2=new THREE.DirectionalLight(0xffffff,0.25); dl2.position.set(-1,0.5,-1); scene.add(dl2);
+  const root=new THREE.Group(); scene.add(root);
+  let yaw=0.7,pitch=0.5,dist=800,target=new THREE.Vector3();
+  function upd(){ cam.position.set(
+    target.x+dist*Math.cos(pitch)*Math.sin(yaw), target.y+dist*Math.sin(pitch),
+    target.z+dist*Math.cos(pitch)*Math.cos(yaw)); cam.lookAt(target); }
+  let drag=false,lx=0,ly=0;
+  el.addEventListener('mousedown',e=>{drag=true;lx=e.clientX;ly=e.clientY;});
+  window.addEventListener('mouseup',()=>drag=false);
+  window.addEventListener('mousemove',e=>{ if(!drag)return;
+    yaw-=(e.clientX-lx)*0.008; pitch+=(e.clientY-ly)*0.008;
+    pitch=Math.max(-1.4,Math.min(1.4,pitch)); lx=e.clientX; ly=e.clientY; upd(); });
+  el.addEventListener('wheel',e=>{e.preventDefault(); dist*=(1+Math.sign(e.deltaY)*0.12); dist=Math.max(40,dist); upd();},{passive:false});
+  (function loop(){ requestAnimationFrame(loop); renderer.render(scene,cam); })();
+  function clear(){ while(root.children.length){ const c=root.children[0]; root.remove(c); if(c.geometry)c.geometry.dispose(); } }
+  function wire(W,H,D){ const e=new THREE.LineSegments(
+    new THREE.EdgesGeometry(new THREE.BoxGeometry(W,H,D)), new THREE.LineBasicMaterial({color:0x94a3b8}));
+    e.position.set(W/2,H/2,D/2); root.add(e); }
+  return {
+    render(cont, lay, shellGeom){
+      clear();
+      if(shellGeom){
+        root.add(new THREE.Mesh(shellGeom, new THREE.MeshLambertMaterial({
+          color:0x38bdf8, transparent:true, opacity:0.12, side:THREE.DoubleSide, depthWrite:false })));
+        root.add(new THREE.LineSegments(new THREE.EdgesGeometry(shellGeom),
+          new THREE.LineBasicMaterial({color:0x38bdf8, transparent:true, opacity:0.4})));
+      } else wire(cont.W,cont.H,cont.D);
+      const mat=new THREE.MeshLambertMaterial({color:0x8b5cf6, side:THREE.DoubleSide});
+      const matF=new THREE.MeshLambertMaterial({color:0xa78bfa, side:THREE.DoubleSide});
+      for(const it of lay.items){
+        const g=it.flip?lay.geomFlip:lay.geom;
+        const m=new THREE.Mesh(g, it.flip?matF:mat);
+        m.scale.set(it.sc,it.sc,it.sc); m.position.set(it.x,it.y,it.z); root.add(m);
+      }
+      target.set(cont.W/2,cont.H/2,cont.D/2); dist=Math.max(cont.W,cont.H,cont.D)*1.9; upd();
+    },
+    resize(){ renderer.setSize(el.clientWidth,el.clientHeight);
+      cam.aspect=el.clientWidth/el.clientHeight; cam.updateProjectionMatrix(); }
+  };
+}
+
+// ===================== 프리셋 =====================
+const B_PRESETS=[
+  {name:'2차 스탠드 220×290 (밑지60)', form:'스탠드', w:220,h:290,base:60,t:60},
+  {name:'2차 스탠드 260×230 (밑지90)', form:'스탠드', w:260,h:230,base:90,t:75},
+  {name:'2차 3면실링 240×200', form:'3면실링', w:240,h:200,base:0,t:55},
+  {name:'단상자 소 150×90×160', form:'단상자', bw:150,bd:90, bh:160},
+  {name:'단상자 중 200×140×170', form:'단상자', bw:200,bd:140,bh:170},
+  {name:'단상자 대 240×160×210', form:'단상자', bw:240,bd:160,bh:210},
+];
+const C_PRESETS=[
+  {name:'외박스 360×360×270', w:360,d:360,h:270},
+  {name:'외박스 A 420×280×320', w:420,d:280,h:320},
+  {name:'외박스 B 480×340×300', w:480,d:340,h:300},
+  {name:'외박스 C 530×380×340', w:530,d:380,h:340},
+];
+function fillPresets(){
+  const bp=document.getElementById('bPreset'); B_PRESETS.forEach((p,i)=>bp.add(new Option(p.name,i)));
+  const cp=document.getElementById('cPreset'); C_PRESETS.forEach((p,i)=>cp.add(new Option(p.name,i)));
+}
+function applyPreset(which){
+  if(which==='b'){ const i=document.getElementById('bPreset').value; if(i==='')return; const p=B_PRESETS[+i];
+    document.getElementById('bForm').value=p.form; onForm('b',true);
+    if(p.form==='단상자'){ set('bbw',p.bw); set('bbd',p.bd); set('bbh',p.bh); }
+    else { set('bw',p.w); set('bh',p.h); set('bbase',p.base); set('bt',p.t); }
+    calc();
+  } else { const i=document.getElementById('cPreset').value; if(i==='')return; const p=C_PRESETS[+i];
+    set('cw',p.w); set('cd',p.d); set('ch',p.h); calc(); }
+}
+function set(id,v){ document.getElementById(id).value=v; }
+function g(id){ return parseFloat(document.getElementById(id).value)||0; }
+
+// ===================== 계산/렌더 =====================
+let v1,v2;
+function onForm(who, noCalc){
+  if(who==='a'){
+    document.getElementById('aBaseFld').style.display = document.getElementById('aForm').value==='스탠드'?'flex':'none';
+  } else {
+    const f=document.getElementById('bForm').value, isBox=(f==='단상자');
+    document.getElementById('bPouchFields').style.display = isBox?'none':'contents';
+    document.getElementById('bBoxFields').style.display   = isBox?'contents':'none';
+    document.getElementById('bBaseFld').style.display     = (f==='스탠드')?'flex':'none';
+    document.getElementById('s1name').textContent = isBox?'단상자':'2차파우치';
+    document.getElementById('s2name').textContent = isBox?'단상자':'2차파우치';
+  }
+  if(!noCalc) calc();
+}
+function readB(){
+  const f=document.getElementById('bForm').value;
+  if(f==='단상자'){ const W=g('bbw'),D=g('bbd'),H=g('bbh');
+    return {form:f, inner:{W,H,D}, shell:null, box:{W,D,H}}; }
+  const W=g('bw'),H=g('bh'),base=f==='스탠드'?g('bbase'):0,T=g('bt');
+  const depth=f==='스탠드'?Math.max(base,T):T;
+  const shell=orient(pouchGeom(f,W,H,base,T),'세움',false).geom;
+  return {form:f, inner:{W,H,D:depth}, shell, pouch:{W,H,base,T}};
+}
+function calc(){
+  const aForm=document.getElementById('aForm').value;
+  const aW=g('aw'),aH=g('ah'),aBase=aForm==='스탠드'?g('abase'):0,aT=g('at');
+  const B=readB();
+  const C={W:g('cw'),H:g('ch'),D:g('cd')};
+  const n1=Math.max(1,Math.round(g('n1'))), n2=Math.max(1,Math.round(g('n2')));
+  const pat1=document.getElementById('pat1').value, pat2=document.getElementById('pat2').value;
+
+  // 1단계: 1차 n1개 → 2차 내부
+  const lay1=layout(n1, B.inner, aForm,aW,aH,aBase,aT, pat1);
+  v1.render(B.inner, lay1, B.shell);
+
+  // 2단계: 2차 n2개 → 외박스
+  let lay2;
+  if(B.form==='단상자') lay2=layoutBox(n2, C, B.box.W,B.box.D,B.box.H);
+  else lay2=layout(n2, C, B.form,B.pouch.W,B.pouch.H,B.pouch.base,B.pouch.T, pat2);
+  v2.render(C, lay2, null);
+
+  document.getElementById('s1cnt').textContent=n1;
+  document.getElementById('s2cnt').textContent=n2;
+  document.getElementById('s1badge').textContent=lay1.label;
+  document.getElementById('s2badge').textContent=lay2.label;
+  document.getElementById('eq').textContent=`${n1} × ${n2} =`;
+  document.getElementById('totalCnt').innerHTML=(n1*n2).toLocaleString()+' <span style="font-size:14px;font-weight:600">개</span>';
+}
+window.addEventListener('load',()=>{
+  fillPresets();
+  v1=makeViewer(document.getElementById('cv1'));
+  v2=makeViewer(document.getElementById('cv2'));
+  onForm('a',true); onForm('b',true); calc();
+});
+window.addEventListener('resize',()=>{ if(v1)v1.resize(); if(v2)v2.resize(); });
+</script>
+</body>
+</html>

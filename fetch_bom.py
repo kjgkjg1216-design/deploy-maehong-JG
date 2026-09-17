@@ -19,7 +19,9 @@ from dotenv import load_dotenv
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-load_dotenv('C:/Users/jgkim/maehong-JG/.env')
+BASE_DIR = os.environ.get('APP_BASE_DIR', 'C:/Users/jgkim/maehong-JG')
+DATA_DIR = os.environ.get('DATA_DIR', BASE_DIR + '/data')
+load_dotenv(os.path.join(BASE_DIR, '.env'))
 
 ACCESS_TOKEN = os.getenv('AMARANTH_ACCESS_TOKEN', '').strip()
 HASH_KEY     = os.getenv('AMARANTH_HASH_KEY', '').strip()
@@ -74,9 +76,9 @@ def fetch_item_master():
     items = r.get('resultData', [])
     print(f"  전체 품목: {len(items)}건")
 
-    # G/H/I 코드만 추출
-    target = [i for i in items if str(i.get('itemCd', '')).startswith(('G', 'H', 'I'))]
-    print(f"  G/H/I 코드: {len(target)}건")
+    # E/G/H/I 코드 추출 (E=반제품 포함)
+    target = [i for i in items if str(i.get('itemCd', '')).startswith(('E', 'G', 'H', 'I'))]
+    print(f"  E/G/H/I 코드: {len(target)}건")
     return target
 
 
@@ -107,6 +109,59 @@ def fetch_bom_data(item_codes):
 
     print(f"\n  BOM 수집 완료: {len(all_bom)}건 (BOM 등록 품번 {hit_count}개)")
     return all_bom
+
+
+def fetch_outsource_bom(regular_parents):
+    """외주BOM 수집 (헤더 api20A03S01101 → 디테일 api20A03S01102). 2026-09-09 추가.
+    - 일반 BOM(api20A00S01001)이 있는 모품번은 건너뜀 (둘 다 넣으면 _explode_bom에서 자재가 2배로 합산됨)
+    - 모품번당 거래처 1곳만: '사용' 헤더 우선, 없으면 최신 '미사용' 헤더를 대체 사용(BOM종류='외주(미사용대체)')
+    - 컬럼은 일반 BOM과 동일 키(itemparentCd/itemchildCd/realQt…)라 save_bom_csv의 rename을 그대로 탐"""
+    print("\n[외주BOM] 헤더 조회 (api20A03S01101)")
+    r = call_api('/apiproxy/api20A03S01101', {'coCd': CO_CD})
+    heads = (r or {}).get('resultData') or []
+    if not heads:
+        print("  외주BOM 헤더 없음/조회 실패")
+        return []
+    byp = {}
+    for x in heads:
+        p = str(x.get('itemparentCd', '') or '').strip()
+        if p:
+            byp.setdefault(p, []).append(x)
+    targets = [p for p in byp if p not in regular_parents]
+    print(f"  헤더 {len(heads)}건 / 모품번 {len(byp)}개 / 일반BOM 없는 대상 {len(targets)}개")
+    rows, n_par, n_fb = [], 0, 0
+
+    def _ts(x):
+        return str(x.get('modifyDt') or x.get('insertDt') or '')
+
+    for i, p in enumerate(sorted(targets)):
+        hs = byp[p]
+        use = [x for x in hs if x.get('useYnNm') == '사용']
+        if use:
+            pick, kind = max(use, key=_ts), '외주'
+        else:
+            pick, kind = max(hs, key=_ts), '외주(미사용대체)'
+        d = call_api('/apiproxy/api20A03S01102', {'coCd': CO_CD, 'itemparentCd': p, 'trCd1': pick.get('trCd1')})
+        det = (d or {}).get('resultData') or []
+        if det:
+            n_par += 1
+            n_fb += (kind != '외주')
+            for x in det:
+                x = dict(x)
+                x['itemparentDc'] = pick.get('itemDc')
+                x['itemparentUnitDc'] = pick.get('unitDc')
+                x['acctFgNm'] = x.get('acctFgNm') or pick.get('acctFgNm')
+                x['useYnNm'] = '사용'          # 앱의 BOM 인덱스는 사용여부=='사용'만 씀
+                x['outFgNm'] = x.get('outFgNm') or ''
+                x['BOM종류'] = kind
+                x['외주거래처'] = pick.get('trNm1')
+                x['외주거래처코드'] = pick.get('trCd1')
+                rows.append(x)
+        sys.stdout.write(f"\r  [{i+1}/{len(targets)}] {p}: {len(det)}건 (누적 {len(rows)}건, 모품번 {n_par}개, 미사용대체 {n_fb})")
+        sys.stdout.flush()
+        time.sleep(0.2)
+    print(f"\n  외주BOM 수집 완료: {len(rows)}건 (모품번 {n_par}개, 그중 미사용 헤더 대체 {n_fb}개)")
+    return rows
 
 
 def fetch_item_prices():
@@ -164,6 +219,11 @@ def save_bom_csv(bom_data, price_map=None):
 
     rename_map = {k: v for k, v in col_rename.items() if k in df.columns}
     df = df.rename(columns=rename_map)
+    # BOM종류: 일반(api20A00S01001) / 외주(api20A03S011xx) / 외주(미사용대체)
+    if 'BOM종류' in df.columns:
+        df['BOM종류'] = df['BOM종류'].fillna('일반')
+    else:
+        df['BOM종류'] = '일반'
 
     # 단가 매칭 (자품번 기준)
     if price_map and '자품번' in df.columns:
@@ -184,9 +244,10 @@ def save_bom_csv(bom_data, price_map=None):
     df = df[priority + extra + others]
 
     today = datetime.now().strftime('%Y%m%d')
-    output = f'C:/Users/jgkim/maehong-JG/data/{today}_BOM.csv'
-    df.to_csv(output, index=False, encoding='utf-8-sig')
-    print(f"\n[3/3] 저장 완료: {output} ({len(df)}건)")
+    output = f'{DATA_DIR}/{today}_BOM.csv'
+    from _safe_csv import safe_to_csv
+    safe_to_csv(df, output, label='BOM')
+    print(f"\n[3/3] 저장 시도 완료: {output} ({len(df)}건)")
     return output
 
 
@@ -208,8 +269,10 @@ if __name__ == '__main__':
     i_cnt = len([c for c in codes if c.startswith('I')])
     print(f"  G코드: {g_cnt}개 | H코드: {h_cnt}개 | I코드: {i_cnt}개")
 
-    # BOM 수집
+    # BOM 수집 (일반) + 외주BOM (일반 BOM 없는 모품번만)
     bom_data = fetch_bom_data(codes)
+    regular_parents = set(str(x.get('itemparentCd', '') or '').strip() for x in bom_data)
+    bom_data.extend(fetch_outsource_bom(regular_parents))
 
     # 단가 수집
     price_map = fetch_item_prices()
