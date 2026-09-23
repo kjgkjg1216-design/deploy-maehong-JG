@@ -8510,8 +8510,8 @@ def api_sales_gap():
 @app.route('/api/channel_price_changes', methods=['GET'])
 @cached_api()
 def api_channel_price_changes():
-    """채널 공급단가 변동 — 채널·SKU별 unit_supply_price 시계열(최근 180일). 현재가 = 최근 연속 구간(2회 이상 관측, 단발 행사가 제외),
-    이전가 = 그 직전 다른 가격. |변화| ≥ 3%. 월 영향액 = (현재가−이전가) × 최근 90일 납품수량 ÷ 3 (판매가 쪽이므로 인하=마진 압박)."""
+    """채널 공급단가 변동 — 채널·SKU별 unit_supply_price 시계열(최근 365일). 현재가 = 최근 연속 구간(2회 이상 관측, 단발 행사가 제외),
+    이전가 = 그 직전 다른 가격. 변동 전체(기준 없음). 월 영향액 = (현재가−이전가) × 최근 90일 납품수량 ÷ 3 (판매가 쪽이므로 인하=마진 압박)."""
     df = SALES_DAILY_DF
     if df is None or df.empty:
         return jsonify({'items': []})
@@ -8523,7 +8523,7 @@ def api_channel_price_changes():
     raw['p'] = pd.to_numeric(raw['unit_supply_price'], errors='coerce')
     raw['q'] = pd.to_numeric(raw['delivery_qty'], errors='coerce').fillna(0)
     end = pd.to_datetime(raw['date'].max())
-    raw = raw[pd.to_datetime(raw['date']) >= end - pd.Timedelta(days=180)]
+    raw = raw[pd.to_datetime(raw['date']) >= end - pd.Timedelta(days=365)]   # 2026-09-23 6개월→12개월
     code_of = dict(zip(df['sku'].astype(str), df['code']))
     names = _sales_name_map()
     cut90 = (end - pd.Timedelta(days=89)).strftime('%Y-%m-%d')
@@ -8539,9 +8539,8 @@ def api_channel_price_changes():
             continue
         prev = ps[i - 1]
         pct = (cur - prev) / prev * 100
-        if abs(pct) < 3:
-            continue
-        q90 = float(raw[(raw['channel'] == ch) & (raw['sku'] == sku) & (raw['date'] >= cut90)]['q'].sum())
+        # 2026-09-23 기준 없음 — 변동 전체(단발 제외 규칙만 유지)
+        q90 =float(raw[(raw['channel'] == ch) & (raw['sku'] == sku) & (raw['date'] >= cut90)]['q'].sum())
         code = code_of.get(str(sku), '') or str(g['self_code'].iloc[-1])
         items.append({'channel_name': str(g['channel_name'].iloc[-1]), 'sku': sku, 'code': code,
                       'name': names.get(code, '') or str(g['name'].iloc[-1]), 'prev': int(prev), 'cur': int(cur),
@@ -11056,7 +11055,14 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .chart-panel.lens-gap { border-top: 3px solid #0d9488; }
   .chart-panel.lens-price { border-top: 3px solid #9333ea; }
   .chart-panel.lens-wd { border-top: 3px solid #64748b; }
-  .wd-row { display: grid; grid-template-columns: 22px 1fr 58px 44px; align-items: center; gap: 6px; font-size: 11.5px; padding: 4px 0; }
+  /* 줄 높이 맞춤: 목록이 패널 남은 높이를 채움(한쪽 헤더가 길어져도 옆 패널에 빈 공간 안 생김) */
+  .lens-strip > .chart-panel { display: flex; flex-direction: column; }
+  .lens-strip > .chart-panel > .alert-list { flex: 1 1 0; min-height: 310px; max-height: none; }
+  .wd-row { display: grid; grid-template-columns: 22px 1fr 58px 44px; align-items: center; column-gap: 6px; row-gap: 3px; font-size: 11.5px; padding: 7px 0; }
+  .wd-row + .wd-row { border-top: 1px dashed rgba(15,23,42,0.06); }
+  .wd-split { grid-column: 2 / 5; display: flex; gap: 12px; font-size: 10.5px; font-variant-numeric: tabular-nums; }
+  .wd-split b { font-weight: 800; }
+  .wd-row.wd-total { border-top: 1px solid var(--border); margin-top: 2px; }
   .wd-bar { height: 14px; border-radius: 4px; background: #f1f5f9; overflow: hidden; display: flex; }
   .wd-bar i { display: block; height: 100%; }
   .wd-row .n { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-2); }
@@ -12286,8 +12292,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   <div class="chart-panel plan-panel">
     <div class="chart-head">
       <div><span class="chart-title">📦 완제품 수급 플래너</span><span class="chart-sub">최근 판매속도 vs 창고재고(판정)·채널재고(참고) vs 생산계획·입고예정 · 클릭=상세</span></div>
-      <div style="display:flex;align-items:center;gap:8px">
-        <input id="plan-search" type="text" placeholder="품번/품명" oninput="renderPlan()" style="width:120px;padding:3px 8px;font-size:11px;border:1px solid var(--border);border-radius:6px">
+      <div style="display:flex;align-items:center;gap:8px;flex:1 1 100%">
+        <input id="plan-search" type="text" placeholder="품번/품명 검색" oninput="renderPlan()" style="flex:1;min-width:0;padding:6px 10px;font-size:12px;border:1px solid var(--border);border-radius:6px">
         <div id="plan-count" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
       </div>
     </div>
@@ -12692,7 +12698,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   </div>
   <div class="chart-panel lens-price">
     <div class="chart-head">
-      <div><span class="chart-title">🏷 채널 공급단가 변동</span><span class="chart-sub">최근 6개월 · 3% 이상 · 월 영향액순 · 클릭=상세</span></div>
+      <div><span class="chart-title">🏷 채널 공급단가 변동</span><span class="chart-sub">최근 12개월 · 변동 전체 · 월 영향액순 · 클릭=상세</span></div>
       <div id="cpc-count" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
     </div>
     <div id="cpc-list" class="alert-list"><div class="loading" style="padding:20px">로딩 중...</div></div>
@@ -14569,18 +14575,27 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       const s = d.summary || {};
       document.getElementById('gap-count').textContent = items.length + '건';
       if (d.from) document.getElementById('gap-sub').textContent = (d.from.slice(5) + '~' + d.to.slice(5)).split('-').join('/') + ' 28일 · POS 보고 채널만 · 클릭=상세';
-      document.getElementById('gap-summary').innerHTML = '<b style="color:#c2410c">납품 과다 ' + (s.over || 0) + '</b> (채널에 재고 쌓임 → 곧 발주 감소) · '
-        + '<b style="color:#1d4ed8">납품 부족 ' + (s.under || 0) + '</b> (채널 재고 소진 중 → 곧 추가 발주) · 정상 ' + (s.ok || 0);
+      document.getElementById('gap-summary').innerHTML = '최근 28일 <b>우리가 납품한 양</b>과 <b>매장에서 실제 팔린 양</b> 비교<br>'
+        + '<b style="color:#c2410c">채널에 쌓임 ' + (s.over || 0) + '</b> 팔린 것보다 많이 보냄 → 앞으로 발주 줄어들 수 있음 · '
+        + '<b style="color:#1d4ed8">채널 소진 중 ' + (s.under || 0) + '</b> 팔린 것보다 적게 보냄 → 곧 추가 발주 올 수 있음 · 비슷함 ' + (s.ok || 0);
       if (!items.length) { list.innerHTML = '<div class="alert-empty">납품과 실판매가 비슷합니다 👍</div>'; return; }
       list.innerHTML = items.slice(0, 40).map(x => {
         const over = x.level === 'over';
-        const sc = x.stock_change == null ? '' : ' · 채널재고 ' + (x.stock_change >= 0 ? '+' : '') + fmtInt(x.stock_change);
+        // 오른쪽 = 납품−판매 차이(개) + 한 줄 해석. 배수(×1.87)는 읽기 어려워 문장으로 바꿈(2026-09-23)
+        const col = over ? '#c2410c' : '#1d4ed8';
+        const diff = x.delivery - x.pos;
+        let big, small;
+        if (x.pos <= 0) { big = '판매 0'; small = '납품만 ' + fmtInt(x.delivery); }
+        else if (x.delivery <= 0) { big = '납품 0'; small = '팔린 것 ' + fmtInt(x.pos); }
+        else if (over) { big = '+' + fmtInt(diff); small = '팔린 양의 ' + (Math.round(x.ratio * 10) / 10) + '배 납품'; }
+        else { big = fmtInt(diff); small = '팔린 양의 ' + Math.round(x.ratio * 100) + '%만 납품'; }
+        const sc = x.stock_change == null ? '' : ' · 채널재고 ' + (x.stock_change > 0 ? '<b style="color:#c2410c">' + fmtInt(x.stock_change) + ' 늘어남</b>' : x.stock_change < 0 ? '<b style="color:#1d4ed8">' + fmtInt(-x.stock_change) + ' 줄어듦</b>' : '변화 없음');
         return '<div class="alert-row" onclick="openItemModal(&quot;' + x.code + '&quot;)">'
-          + '<span class="alert-badge ' + (over ? 'warning' : 'low') + '" style="' + (over ? '' : 'background:#dbeafe;color:#1d4ed8') + '">' + (over ? '납품 과다' : '납품 부족') + '</span>'
+          + '<span class="alert-badge ' + (over ? 'warning' : 'low') + '" style="' + (over ? '' : 'background:#dbeafe;color:#1d4ed8') + '">' + (over ? '채널에 쌓임' : '채널 소진 중') + '</span>'
           + '<div><div class="alert-name">' + escapeHtml(x.name) + '</div>'
-          + '<div class="alert-code">' + escapeHtml(x.code) + ' · 납품 ' + fmtInt(x.delivery) + ' · POS ' + fmtInt(x.pos) + sc + ' · ' + escapeHtml(x.channels) + '</div></div>'
+          + '<div class="alert-code">' + escapeHtml(x.code) + ' · 우리가 납품 <b>' + fmtInt(x.delivery) + '</b> vs 매장에서 팔림 <b>' + fmtInt(x.pos) + '</b>' + sc + ' · ' + escapeHtml(x.channels) + '</div></div>'
           + '<div class="alert-qty"></div>'
-          + '<div class="alert-days" style="color:' + (over ? '#c2410c' : '#1d4ed8') + '">' + (x.ratio == null ? 'POS 0' : '×' + x.ratio) + '</div></div>';
+          + '<div class="alert-days" style="text-align:right;line-height:1.25;color:' + col + '"><div>' + big + '</div><div style="font-size:10px;font-weight:600;color:var(--text-3);white-space:nowrap">' + small + '</div></div></div>';
       }).join('');
     } catch (e) { list.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
   }
@@ -14603,6 +14618,11 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       }).join('');
     } catch (e) { list.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
   }
+  function wdSplit(on, off) {   // 요일별 온라인/오프라인 비중 줄
+    const t = on + off, po = t ? Math.round(on / t * 100) : 0;
+    return '<div class="wd-split"><span style="color:#2563eb">온라인 ' + fmtInt(on) + ' <b>' + po + '%</b></span>'
+      + '<span style="color:#d97706">오프라인 ' + fmtInt(off) + ' <b>' + (t ? 100 - po : 0) + '%</b></span></div>';
+  }
   async function loadWeekday() {
     const body = document.getElementById('wd-body');
     try {
@@ -14617,8 +14637,12 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         + days.map(x => '<div class="wd-row" title="' + escapeHtml(Object.entries(x.by_ch).map(([k, v]) => k + ' ' + v.toLocaleString()).join(' / ')) + '">'
           + '<span style="font-weight:700;color:' + (x.wd === '일' ? '#dc2626' : (x.wd === '토' ? '#2563eb' : 'var(--text-1)')) + '">' + x.wd + '</span>'
           + '<div class="wd-bar"><i style="width:' + (x.online / mx * 100) + '%;background:#2563eb"></i><i style="width:' + (x.offline / mx * 100) + '%;background:#f59e0b"></i></div>'
-          + '<span class="n">' + fmtInt(x.qty) + '</span><span class="p">' + x.share + '%</span></div>').join('')
-        + '<div style="font-size:10.5px;color:var(--text-3);margin-top:8px;line-height:1.5">막대에 마우스를 올리면 주요 채널(' + escapeHtml((d.channels || []).join(', ')) + ')별 수량이 보입니다.</div>';
+          + '<span class="n">' + fmtInt(x.qty) + '</span><span class="p">' + x.share + '%</span>'
+          + wdSplit(x.online, x.offline) + '</div>').join('')
+        + (() => { const on = days.reduce((a, x) => a + x.online, 0), off = days.reduce((a, x) => a + x.offline, 0);
+             return '<div class="wd-row wd-total"><span style="font-weight:700">계</span><span style="font-size:11px;color:var(--text-2)">주간 합계</span>'
+               + '<span class="n">' + fmtInt(on + off) + '</span><span class="p">100%</span>' + wdSplit(on, off) + '</div>'; })()
+        + '<div style="font-size:10.5px;color:var(--text-3);margin-top:10px;line-height:1.5">요일 아래 % = 그 요일 납품 중 온라인·오프라인 비중. 막대에 마우스를 올리면 주요 채널(' + escapeHtml((d.channels || []).join(', ')) + ')별 수량이 보입니다.</div>';
     } catch (e) { body.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
   }
 
