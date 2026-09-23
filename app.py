@@ -10886,9 +10886,12 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .chart-panel.pcalc-panel   { grid-column: span 18; }
   .chart-panel.alert-span    { grid-column: span 10; }   /* 자사·외주·발주타이밍 3등분 */
   .chart-panel.price-span    { grid-column: span 12; }   /* 단가변동 (단가계산기와 한 줄) */
-  .chart-panel.plan-panel    { grid-column: span 15; border-top: 3px solid #0891b2; }   /* 수급 플래너 — 시안 */
-  .chart-panel.chstock-panel { grid-column: span 15; border-top: 3px solid #ea580c; }   /* 채널 품절 경보 — 주황 (2026-09-23) */
-  .chart-panel.vendor-panel  { grid-column: span 30; border-top: 3px solid #7c3aed; }   /* 거래처 스코어 — 보라 (채널 품절 경보가 수급 플래너 옆으로 오면서 전체 폭) */
+  .chart-panel.plan-panel    { grid-column: span 10; border-top: 3px solid #0891b2; }   /* 수급 플래너 — 시안 (2026-09-23: 수급·채널품절·거래처 3등분 한 줄) */
+  .chart-panel.chstock-panel { grid-column: span 10; border-top: 3px solid #ea580c; }   /* 채널 품절 경보 — 주황 (2026-09-23) */
+  .chart-panel.vendor-panel  { grid-column: span 10; border-top: 3px solid #7c3aed; }   /* 거래처 스코어 — 보라 */
+  /* 3등분 폭에 맞춰 헤더 부제목은 한 줄 말줄임, 헤더 오른쪽 컨트롤은 줄바꿈 허용 */
+  .plan-panel .chart-head, .chstock-panel .chart-head, .vendor-panel .chart-head { flex-wrap: wrap; row-gap: 6px; }
+  .plan-panel .chart-sub, .chstock-panel .chart-sub, .vendor-panel .chart-sub { display: block; margin-left: 0; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
   .ch-tag { display:inline-block; font-size:10px; font-weight:700; padding:1px 6px; border-radius:5px; margin-left:4px; background:#fff7ed; color:#c2410c; vertical-align:1px; }
   .ch-tag.on { background:#eff6ff; color:#1d4ed8; }
   .vk-chips { display:flex; gap:3px; background:#f1f5f9; border-radius:8px; padding:2px; }
@@ -11047,6 +11050,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .prod-chart-wrap { height: 240px; position: relative; }
   /* ───── 월 판매기반 자료 패널 ───── */
   .salesbase-strip { max-width: 1440px; margin: 12px auto 0; padding: 0 32px; }
+  .retired { display: none !important; }   /* 제거한 영역 (JS가 style.display를 바꿔도 숨김 유지) */
   /* ───── 판매 분석 (2026-09-23) ───── */
   .lens-strip { max-width: 1440px; margin: 12px auto 0; padding: 0 32px; display: grid; grid-template-columns: 1.15fr 1.15fr 0.8fr; gap: 12px; }
   .chart-panel.lens-gap { border-top: 3px solid #0d9488; }
@@ -11061,6 +11065,11 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .chart-panel.salesbase-panel { border-top: 3px solid #3f9e8f; }
   .salesbase-body { display: grid; grid-template-columns: 1fr 1.7fr; gap: 16px; align-items: start; }
   .salesbase-chart-wrap { height: 460px; position: relative; min-width: 0; }
+  /* 매출현황 자리(발주·입고 추이 옆)로 옮기면서 폭이 줄어 차트:목록 비율·높이 조정 (2026-09-23) */
+  .sales-npd-strip .salesbase-body { grid-template-columns: 1.15fr 1fr; gap: 12px; }
+  .sales-npd-strip .salesbase-chart-wrap { height: 400px; }
+  .sales-npd-strip .sb-top-list { max-height: 330px; }
+  .sales-npd-strip .prod-chart-wrap { height: 360px; }
   .salesbase-side { display: flex; flex-direction: column; min-width: 0; }
   .sb-side-title { font-size: 11px; font-weight: 700; color: var(--text-2); margin-bottom: 6px; }
   .sb-top-list { flex: 1; overflow-y: auto; max-height: 460px; margin: 0 -2px; }
@@ -12216,7 +12225,6 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   <a href="#sec-return" data-sec="sec-return">회송</a>
   <a href="#sec-ipsu" data-sec="sec-ipsu">3D</a>
   <a href="#sec-sales" data-sec="sec-sales">매출</a>
-  <a href="#sec-salesbase" data-sec="sec-salesbase">추이</a>
   <a href="#sec-lens" data-sec="sec-lens">분석</a>
   <a href="#sec-cal" data-sec="sec-cal">달력</a>
 </nav>
@@ -12634,22 +12642,28 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   </div>
 </section>
 
-<!-- 매출 현황 + 신제품 NPD -->
+<!-- 월 매출·판매 추이 + 발주·입고 추이 (2026-09-23: '매출 현황' 패널을 없애고 이 패널로 통합 — 채널별 보기·월 상품 TOP10은 [채널별] 모드로 흡수) -->
 <section class="sales-npd-strip">
-  <div class="chart-panel sales-panel">
+  <div class="chart-panel salesbase-panel">
     <div class="chart-head">
-      <div><span class="chart-title">💰 매출 현황</span><span class="chart-sub" style="color:#dc2626">온라인팀 판매자료 · 공급가 기준 월별 추이 · 채널별</span></div>
+      <div><span class="chart-title">🛍 월 매출·판매 추이</span><span class="chart-sub" style="color:#2f8576">온라인팀 판매자료 · 온라인+오프라인 · 공급가 기준</span></div>
       <div style="display:flex;align-items:center;gap:8px">
-        <div id="sales-kpi" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
-        <div class="chart-nav">
-          <button id="sales-prev" onclick="moveSales(1)" title="과거로">‹</button>
-          <button id="sales-next" onclick="moveSales(-1)" title="최근으로">›</button>
+        <div class="vk-chips" id="sb-mode">
+          <button class="vk-chip on" data-m="cls" onclick="setSbMode('cls',this)" title="자사·유상사급·상품매입 · 막대 클릭=분류 상세">분류별</button>
+          <button class="vk-chip" data-m="ch" onclick="setSbMode('ch',this)" title="쿠팡·롯데·이마트 등 · 막대 클릭=그 달 상품 TOP 10">채널별</button>
         </div>
+        <div id="sb-kpi" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
       </div>
     </div>
-    <div class="sales-body">
-      <div class="sales-chart-wrap"><canvas id="salesChart"></canvas></div>
-      <div id="sales-div-list" class="sales-div-list"></div>
+    <div class="salesbase-body">
+      <div class="salesbase-chart-wrap"><canvas id="salesBaseChart"></canvas></div>
+      <div class="salesbase-side">
+        <div class="sb-side-title" id="sb-top-title">제품 TOP 10</div>
+        <input id="sb-search" type="text" placeholder="품번·품명 검색…" oninput="renderSbList()"
+               style="width:100%;padding:6px 10px;margin-bottom:6px;font-size:11.5px;border:1px solid var(--border-2);border-radius:6px;outline:none">
+        <div class="sb-list-head"><span class="sb-lh-name">제품 (낱개/월)</span><span class="sb-lh-avg">3개월평균</span><span class="sb-lh-m1">최근1개월</span></div>
+        <div id="sb-top-list" class="sb-top-list"><div class="loading" style="padding:12px">로딩 중...</div></div>
+      </div>
     </div>
   </div>
   <div class="chart-panel prod-panel">
@@ -12665,25 +12679,6 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   </div>
 </section>
 
-<!-- 월 판매기반 자료 -->
-<section class="salesbase-strip">
-  <div class="chart-panel salesbase-panel">
-    <div class="chart-head">
-      <div><span class="chart-title">🛍 월 매출·판매 추이</span><span class="chart-sub" style="color:#2f8576">온라인팀 판매자료 · 온라인+오프라인 · 공급가 기준 매출액(억)·수량 · 분류별</span></div>
-      <div id="sb-kpi" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
-    </div>
-    <div class="salesbase-body">
-      <div class="salesbase-chart-wrap"><canvas id="salesBaseChart"></canvas></div>
-      <div class="salesbase-side">
-        <div class="sb-side-title" id="sb-top-title">제품 TOP 10</div>
-        <input id="sb-search" type="text" placeholder="품번·품명 검색…" oninput="renderSbList()"
-               style="width:100%;padding:6px 10px;margin-bottom:6px;font-size:11.5px;border:1px solid var(--border-2);border-radius:6px;outline:none">
-        <div class="sb-list-head"><span class="sb-lh-name">제품 (낱개/월)</span><span class="sb-lh-avg">3개월평균</span><span class="sb-lh-m1">최근1개월</span></div>
-        <div id="sb-top-list" class="sb-top-list"><div class="loading" style="padding:12px">로딩 중...</div></div>
-      </div>
-    </div>
-  </div>
-</section>
 
 <!-- 판매 분석 (2026-09-23): 납품 vs POS 괴리 · 채널 공급단가 변동 · 납품 요일 패턴 -->
 <section class="lens-strip">
@@ -12773,16 +12768,15 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   <div id="ai-area"></div>
   <div id="search-area"></div>
 
-  <div class="tabs">
+  <!-- 2026-09-23 사용자 요청: 맨 아래 E/G/H/I 품목 나열 제거. 검색 스크립트가 .tabs/#product-area 표시를 토글하므로 요소는 남기고 retired(!important)로 항상 숨김 -->
+  <div class="tabs retired">
     <button class="tab active" data-tab="E">E · 반제품</button>
     <button class="tab" data-tab="G">G · 자사제품</button>
     <button class="tab" data-tab="H">H · 외주제품</button>
     <button class="tab" data-tab="I">I · 외주생산제품</button>
   </div>
 
-  <div id="product-area">
-    <div class="loading">품목 로딩 중...</div>
-  </div>
+  <div id="product-area" class="retired"></div>
 </div>
 </div>
 
@@ -13921,7 +13915,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     searchInput.focus();
   }
 
-  loadProducts();
+  // loadProducts();   // 2026-09-23 하단 품목 나열 제거 — 목록을 불러오지 않음
 
   // ───── Calendar ─────
   const CAL_STATE = {};
@@ -15674,7 +15668,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   loadPriceCalc();
   loadSpecList();
   loadIpsuSpecs();
-  loadSalesSummary();
+  // loadSalesSummary();   // 2026-09-23 매출 현황 패널 제거 — 월 매출·판매 추이 [채널별] 모드가 /api/sales_summary 사용
   loadOrderReceipt();
   loadSalesBased();
   loadKpi();
@@ -15844,7 +15838,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   }
 
   // ───── 패널 접기 (상태는 브라우저에 기억) ─────
-  const COL_DEFAULT = { 'sec-ipsu': true, 'sec-salesbase': true };   // 기본 접힘: 3D 입수, 월매출 추이
+  const COL_DEFAULT = { 'sec-ipsu': true };   // 기본 접힘: 3D 입수 (월 매출 추이는 2026-09-23 매출 섹션으로 통합, 기본 펼침)
   function colState() { try { return JSON.parse(localStorage.getItem('mhCollapsed') || '{}'); } catch (e) { return {}; } }
   function isCollapsed(id) { const s = colState(); return id in s ? !!s[id] : !!COL_DEFAULT[id]; }
   function toggleSection(sec, collapse) {
@@ -15854,17 +15848,17 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     try { const s = colState(); s[id] = c; localStorage.setItem('mhCollapsed', JSON.stringify(s)); } catch (e) {}
     if (!c) {   // 펼칠 때 지연 초기화 (3D 뷰어·차트 리사이즈)
       if (id === 'sec-ipsu' && typeof ipsuInitViewers === 'function') { ipsuInitViewers(); setTimeout(() => [_ipsuV1, _ipsuV2, _ipsuV3].forEach(v => v && v.resize && v.resize()), 50); }
-      if (id === 'sec-salesbase' && typeof _sbChart !== 'undefined' && _sbChart) setTimeout(() => _sbChart.resize(), 50);
+      if (id === 'sec-sales' && typeof _sbChart !== 'undefined' && _sbChart) setTimeout(() => _sbChart.resize(), 50);
       window.dispatchEvent(new Event('resize'));
     }
   }
   function initCollapsibles() {
-    const map = [['.chart-grid', 'sec-alerts'], ['.spec-strip', 'sec-spec'], ['.return-strip', 'sec-return'], ['.ipsu-strip', 'sec-ipsu'], ['.sales-npd-strip', 'sec-sales'], ['.salesbase-strip', 'sec-salesbase'], ['.lens-strip', 'sec-lens'], ['.cal-strip', 'sec-cal']];
+    const map = [['.chart-grid', 'sec-alerts'], ['.spec-strip', 'sec-spec'], ['.return-strip', 'sec-return'], ['.ipsu-strip', 'sec-ipsu'], ['.sales-npd-strip', 'sec-sales'], ['.lens-strip', 'sec-lens'], ['.cal-strip', 'sec-cal']];
     map.forEach(([sel, id]) => { const s = document.querySelector('section' + sel); if (s && !s.id) s.id = id; });
     // 그리드 내부 앵커 (내비용)
     const pr = document.querySelector('.price-span'); if (pr) pr.id = pr.id || 'sec-price';
     const pl = document.querySelector('.plan-panel'); if (pl) pl.id = pl.id || 'sec-plan';
-    ['sec-spec', 'sec-return', 'sec-ipsu', 'sec-sales', 'sec-salesbase', 'sec-lens'].forEach(id => {
+    ['sec-spec', 'sec-return', 'sec-ipsu', 'sec-sales', 'sec-lens'].forEach(id => {
       const sec = document.getElementById(id); if (!sec) return;
       const head = sec.querySelector('.chart-head'); if (!head) return;
       const b = document.createElement('button'); b.className = 'col-btn'; b.type = 'button';
@@ -16429,15 +16423,49 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         kpi += '  ' + (g >= 0 ? '▲' : '▼') + Math.abs(g).toFixed(0) + '%';
       }
       document.getElementById('sb-kpi').textContent = kpi;
+      _sbMonthly = monthly;
+      _sbProducts = d.products || [];
+      _sbLatestMonth = d.latest_month || '';
+      renderSbList();
+      try { const s = await (await fetch('/api/sales_summary')).json(); _sbChData = s.div_map || {}; } catch (e) { _sbChData = {}; }
+      drawSbChart();
+    } catch (e) {
+      const el = document.getElementById('sb-top-list');
+      if (el) el.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>';
+    }
+  }
 
-      // 차트: 분류별 (매출액 억 / 없으면 판매수량) 누적막대
+  // [분류별 / 채널별] 전환 (2026-09-23 매출 현황 패널 통합)
+  let _sbMode = 'cls', _sbChData = {};
+  const SB_CH_COLORS = ['#2563eb', '#f59e0b', '#10b981', '#ef4444', '#8b5cf6', '#0ea5e9', '#94a3b8'];
+  function setSbMode(m, el) {
+    _sbMode = m;
+    document.querySelectorAll('#sb-mode .vk-chip').forEach(b => b.classList.toggle('on', b === el));
+    drawSbChart();
+  }
+  function drawSbChart() {
+    const monthly = _sbMonthly; if (!monthly || !monthly.length) return;
+    const chMode = _sbMode === 'ch' && _sbHasAmt;
+      // 차트: 분류별 (매출액 억 / 없으면 판매수량) 누적막대 · 채널별 모드는 상위 6채널 + 기타
       const CLS = [['자사', '#6276c5'], ['유상사급', '#dcb058'], ['상품매입', '#49aa9c']];
       const labels = monthly.map(m => m.ym.slice(2).replace('-', '/') + (m.is_current ? '*' : ''));
-      const datasets = CLS.map(([k, c]) => ({
-        label: k,
-        data: monthly.map(m => _sbHasAmt ? +(((m[k + '_amt']) || 0) / 1e8).toFixed(2) : (m[k] || 0)),
-        backgroundColor: c, stack: 'sb', borderRadius: 3, borderSkipped: false
-      }));
+      let datasets;
+      if (chMode) {
+        const tot = {};
+        Object.values(_sbChData).forEach(arr => arr.forEach(x => { tot[x.div] = (tot[x.div] || 0) + x.amount; }));
+        const top = Object.keys(tot).sort((a, b) => tot[b] - tot[a]).slice(0, 6);
+        const amtOf = (ym, ch) => ((_sbChData[ym] || []).find(x => x.div === ch) || {}).amount || 0;
+        datasets = top.map((ch, i) => ({ label: ch, data: monthly.map(m => +(amtOf(m.ym, ch) / 1e8).toFixed(2)),
+          backgroundColor: SB_CH_COLORS[i], stack: 'sb', borderRadius: 3, borderSkipped: false }));
+        datasets.push({ label: '기타', backgroundColor: SB_CH_COLORS[6], stack: 'sb', borderRadius: 3, borderSkipped: false,
+          data: monthly.map(m => +(((_sbChData[m.ym] || []).filter(x => !top.includes(x.div)).reduce((s, x) => s + x.amount, 0)) / 1e8).toFixed(2)) });
+      } else {
+        datasets = CLS.map(([k, c]) => ({
+          label: k,
+          data: monthly.map(m => _sbHasAmt ? +(((m[k + '_amt']) || 0) / 1e8).toFixed(2) : (m[k] || 0)),
+          backgroundColor: c, stack: 'sb', borderRadius: 3, borderSkipped: false
+        }));
+      }
       // 막대 세그먼트에 분류별 금액 + 상단 합계 표기 (매출액 모드일 때)
       const sbSegLabels = {
         id: 'sbSegLabels',
@@ -16499,15 +16527,17 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
             const p = pts[0];
             const cls = _sbChart.data.datasets[p.datasetIndex].label;
             const mo = _sbMonthly[p.index];
-            if (mo && mo.ym) openClassDetail(mo.ym, cls);
+            if (!mo || !mo.ym) return;
+            if (chMode) openSalesDetail(mo.ym);      // 채널별 모드: 그 달 상품 TOP 10 (구 매출 현황 상세)
+            else openClassDetail(mo.ym, cls);
           },
           plugins: {
             legend: { display: true, labels: { boxWidth: 11, font: { size: 10 } } },
-            tooltip: { callbacks: {
+            tooltip: { mode: chMode ? 'index' : 'nearest', callbacks: {
               label: c => c.dataset.label + ': ' + (_sbHasAmt ? c.parsed.y + '억' : fmtInt(c.parsed.y) + '개'),
               footer: items => '합계 ' + (_sbHasAmt
                 ? items.reduce((s, i) => s + i.parsed.y, 0).toFixed(2) + '억'
-                : fmtInt(items.reduce((s, i) => s + i.parsed.y, 0)) + '개') + '  ·  클릭 시 분류별 상세'
+                : fmtInt(items.reduce((s, i) => s + i.parsed.y, 0)) + '개') + '  ·  클릭 시 ' + (chMode ? '상품 TOP 10' : '분류별 상세')
             } }
           },
           scales: {
@@ -16516,16 +16546,6 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
           }
         }
       });
-
-      // 제품 목록 (검색 가능) — 저장 후 렌더
-      _sbMonthly = monthly;
-      _sbProducts = d.products || [];
-      _sbLatestMonth = d.latest_month || '';
-      renderSbList();
-    } catch (e) {
-      const el = document.getElementById('sb-top-list');
-      if (el) el.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>';
-    }
   }
 
   // ───── 부자재 규격 패널 ─────
