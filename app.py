@@ -728,6 +728,47 @@ RCV_DF = load_rcv_data()
 STOCK_DF = load_stock_data()
 
 SALES_SOURCE = {'kind': '', 'file': '', 'unmapped': []}   # 판매 자료 출처 (건강검진·패널 표기용)
+SALES_DAILY_DF = None       # 판매 API 일자별 원자료 (품번 매핑 적용) — _load_sales_from_daily가 채움
+_SALES_VEL_CACHE = {}
+VEL_W28 = 0.7               # 판매속도 = 최근 4주 일평균×0.7 + 최근 3개월 일평균×0.3 (납품은 주 단위로 몰려 7일은 요동이 커서 4주 기준)
+
+
+def _sales_velocity():
+    """품번별 일 판매속도 (2026-09-23, 사용자 "판매속도를 최근 기준으로").
+    납품(delivery, 낱개×환산계수) 기준 — 우리 재고가 실제로 빠져나가는 양.
+    반환 {'end': 'YYYY-MM-DD', 'by': {품번: {'v': 일평균(가중), 'v28', 'v90', 'v14', 'v14p', 'trend': v28/v90}}} 또는 None(월간 CSV 모드)."""
+    df = SALES_DAILY_DF
+    if df is None or df.empty or SALES_SOURCE.get('kind') != 'api':
+        return None
+    key = id(df)
+    if _SALES_VEL_CACHE.get('key') == key:
+        return _SALES_VEL_CACHE['val']
+    d = df[(df['ea'] > 0) & (df['code'] != '')]
+    if d.empty:
+        return None
+    end = pd.to_datetime(d['date'].max())
+    dt = pd.to_datetime(d['date'])
+
+    def _win(days, offset=0):
+        hi = end - pd.Timedelta(days=offset)
+        lo = hi - pd.Timedelta(days=days - 1)
+        return d[(dt >= lo) & (dt <= hi)].groupby('code')['ea'].sum() / days
+    v28, v90, v14, v14p = _win(28), _win(90), _win(14), _win(14, 14)
+    by = {}
+    for c in set(v90.index) | set(v28.index):
+        a, b = float(v28.get(c, 0)), float(v90.get(c, 0))
+        v = VEL_W28 * a + (1 - VEL_W28) * b
+        if v <= 0:
+            continue
+        by[c] = {'v': v, 'v28': a, 'v90': b, 'v14': float(v14.get(c, 0)), 'v14p': float(v14p.get(c, 0)),
+                 'trend': round(min(2.0, max(0.5, a / b)), 2) if b > 0 else 1.0}
+    val = {'end': end.strftime('%Y-%m-%d'), 'by': by}
+    _SALES_VEL_CACHE.update(key=key, val=val)
+    return val
+
+
+def _vel_basis_label(vel):
+    return f"최근 4주·3개월 납품 속도 (~{vel['end'][5:].replace('-', '/')})" if vel else ''
 
 
 def _load_sales_from_daily():
@@ -742,6 +783,7 @@ def _load_sales_from_daily():
         return None
     d = pd.read_csv(files[-1], dtype=str, encoding='utf-8-sig').fillna('')
     d['dq'] = pd.to_numeric(d['delivery_qty'], errors='coerce').fillna(0)
+    raw_all = d
     d = d[d['dq'] > 0].copy()
     if d.empty:
         return None
@@ -770,6 +812,23 @@ def _load_sales_from_daily():
     d.loc[d['pcls'] == '', 'pcls'] = d.loc[d['pcls'] == '', 'prefix'].map(_pfx).fillna('기타')
     d['ch'] = d['channel_type'].astype(str)
     out = (d.groupby(['ym', 'code', 'prefix', 'pcls', 'ch'], as_index=False)[['ea', 'amt']].sum())
+    # 일자별 원자료 보관 (2026-09-23): 판매속도(_sales_velocity)·채널 품절 경보(/api/channel_stock)용.
+    # 납품 없는 날의 POS·점재고 행도 필요하므로 전체 행에 같은 품번 규칙을 적용해 둔다.
+    ra = raw_all.copy()
+    rs = ra['sku'].astype(str).str.strip()
+    rm = rs.map(mp['확정품번']).fillna('').str.strip().str.upper()
+    rself = ra['self_code'].astype(str).str.strip().str.upper()
+    rself = rself.where(rself.str.match(r'^[A-Z]\d{4}$'), '')
+    ra['code'] = rm.where(rm != '', rself)
+    rf = pd.to_numeric(rs.map(mp['환산계수']), errors='coerce')
+    ra['f'] = rf.where(rm != '', 1.0).fillna(1.0)
+    ra['ea'] = ra['dq'] * ra['f']
+    ra['pos'] = pd.to_numeric(ra['pos_qty'], errors='coerce')
+    ra['stock'] = pd.to_numeric(ra['stock_qty'], errors='coerce')
+    ra['amt'] = pd.to_numeric(ra['supply_amount'], errors='coerce').fillna(0)   # 공급가 합계(VAT 제외) = 매출 (2026-09-23 매출 전면 대체)
+    globals()['SALES_DAILY_DF'] = ra[['date', 'channel', 'channel_name', 'channel_type', 'sku', 'name', 'category', 'code', 'f',
+                                      'dq', 'ea', 'pos', 'stock', 'amt']].reset_index(drop=True)
+    _SALES_VEL_CACHE.clear()
     SALES_SOURCE.update(kind='api', file=os.path.basename(files[-1]))
     print(f"[판매데이터 로드] API 일자별 {os.path.basename(files[-1])} - {len(d)}행 -> {out['code'].nunique()}품번, "
           f"{out['ym'].min()}~{out['ym'].max()}, 미매핑 SKU {len(SALES_SOURCE['unmapped'])}")
@@ -3811,6 +3870,49 @@ SALES_TRIGGER_KW = ['매출', '매출현황', '매출정보', '매출내역',
                     '출하', '출하정보', '출하현황', '출하내역',
                     '출고', '출고정보', '출고현황', '출고내역', '자재이동']
 
+def search_sales_api(query_lower: str) -> str:
+    """매출·판매 질문 → 온라인팀 판매자료(SALES_DAILY_DF) 요약 (2026-09-23).
+    기간: '9월'/'26년 9월' 등 월 지정, 날짜 지정, 없으면 최근 3개월. 품명·품번 키워드 있으면 해당 상품만."""
+    df = SALES_DAILY_DF
+    if df is None or df.empty:
+        return ''
+    q = query_lower
+    date_f, month_f, dtoks = _parse_date_filter(q)
+    d = df.copy()
+    d['d8'] = d['date'].astype(str).str.replace('-', '')
+    if date_f:
+        d = d[d['d8'] == date_f]; period = f'{date_f[:4]}-{date_f[4:6]}-{date_f[6:]}'
+    elif month_f:
+        d = d[d['d8'].str.startswith(month_f)]; period = f'{month_f[:4]}-{month_f[4:6]}'
+    else:
+        end = pd.to_datetime(d['date'].max())
+        lo = (end - pd.Timedelta(days=89)).strftime('%Y%m%d')
+        d = d[d['d8'] >= lo]; period = f'최근 3개월({lo[:4]}-{lo[4:6]}-{lo[6:]}~{end:%Y-%m-%d})'
+    skip = set(SALES_TRIGGER_KW) | {'알려줘', '알려', '보여줘', '보여', '현황', '조회', '전체', '얼마', '얼마야', '어때',
+                                    '월별', '채널별', '품목별', '상품별', '합계', '요약', '추이', '이번달', '지난달', '최근'} | set(dtoks or [])
+    kws = [t for t in re.split(r'\s+', q) if len(t) >= 2 and t not in skip and not re.search(r'\d+월|\d+년', t)]
+    if kws:
+        m = pd.Series(False, index=d.index)
+        for k in kws:
+            m |= d['name'].astype(str).str.lower().str.contains(k, regex=False) | (d['code'].astype(str).str.lower() == k)
+        if m.any():
+            d = d[m]
+    if d.empty:
+        return ''
+    tot_amt, tot_q = float(d['amt'].sum()), float(d['dq'].sum()) if 'dq' in d.columns else float(d['ea'].sum())
+    lines = [f'[매출 · 온라인팀 판매자료 · 공급가(VAT 제외)] 기간 {period}' + (f" · 필터 '{' '.join(kws)}'" if kws else ''),
+             f'합계 매출 {tot_amt:,.0f}원 · 납품수량 {tot_q:,.0f}개 · 자료 최종일 {df["date"].max()}']
+    mo = d.assign(ym=d['date'].astype(str).str[:7]).groupby('ym')['amt'].sum()
+    if len(mo) > 1:
+        lines.append('월별: ' + ' / '.join(f'{k} {v/1e8:.2f}억' for k, v in mo.items()))
+    ch = d.groupby('channel_name')['amt'].sum().sort_values(ascending=False)
+    lines.append('채널별: ' + ' / '.join(f'{k} {v:,.0f}원' for k, v in ch.items() if v > 0))
+    pr = d.groupby(['code', 'name'])[['amt', 'dq']].sum().sort_values('amt', ascending=False).head(15)
+    lines.append('상품 TOP 15 (품번 | 상품명 | 매출 | 납품수량):')
+    lines += [f'- {c or "-"} | {n} | {a:,.0f}원 | {q_:,.0f}개' for (c, n), (a, q_) in pr.iterrows()]
+    return '\n'.join(lines)
+
+
 def search_sales(query_lower: str) -> str:
     """출하(매출)/출고 데이터 검색"""
     q = query_lower
@@ -3972,7 +4074,8 @@ def search_monday(query_lower: str) -> str:
         return ''
 
     q = query_lower
-    df = MONDAY_DF
+    # 매출은 온라인팀 판매자료로 일원화(2026-09-23) — Monday '매출 현황' 보드는 챗봇 검색에서 제외
+    df = MONDAY_DF[~MONDAY_DF['보드명'].astype(str).str.contains('매출 현황', regex=False)]
 
     # 날짜 필터
     date_filter, month_filter, date_tokens = _parse_date_filter(q)
@@ -4643,6 +4746,12 @@ def search_relevant_rows(query: str, max_rows: int = 30) -> str:
         prod_result = search_production(query_lower)
         if prod_result:
             return prod_result
+
+    # ⓪-0a 매출·판매 → 온라인팀 판매자료 (2026-09-23: 매출은 무조건 팀장님 자료). 출하/출고를 명시하면 아래 아마란스 검색
+    if any(k in query_lower for k in ('매출', '판매')) and not any(k in query_lower for k in ('출하', '출고', '자재이동')):
+        sa = search_sales_api(query_lower)
+        if sa:
+            return sa
 
     # ⓪-0 출하/출고(매출) 검색
     _is_sales_query = (SHIP_DF is not None or ISSUE_DF is not None) and any(k in query_lower for k in SALES_TRIGGER_KW)
@@ -6992,6 +7101,23 @@ def _calc_sales_consumption(scope):
     반환: {자재코드: 월평균소비량}."""
     if SALES_DF is None or SALES_DF.empty:
         return {}
+    vel = _sales_velocity()
+    if vel:
+        # 판매 API 모드(2026-09-23): 완제품 일 판매속도(최근 4주·3개월 가중) × 30 × BOM 전개 = 자재 월 소비
+        bom_parents = set(_get_bom_index().keys())
+        out = {}
+        for code, v in vel['by'].items():
+            p = code[:1]
+            if scope == 'jasa':
+                if p != 'G':
+                    continue
+            elif not (p == 'H' or (p == 'I' and code in bom_parents)):
+                continue
+            m = v['v'] * 30
+            for c, q in _explode_bom(code).items():
+                if c[:1] in ('A', 'B', 'C', 'D'):
+                    out[c] = out.get(c, 0) + m * q
+        return out
     cur_ym = datetime.now().strftime('%Y%m')
     # 당월 부분치 제외 + 최근 완결 3개월만 (2026-09-23: 판매 API가 1월부터 제공 → 전체 평균이면 옛 달이 섞여 최근 흐름 희석)
     months = sorted(y for y in SALES_DF['ym'].astype(str).unique() if y < cur_ym)[-3:]
@@ -7285,15 +7411,29 @@ def _goods_reorder_items(lead=None):
     리드타임은 구매발주→입고 실측(_calc_leadtimes, I코드 48품번 표본 있음). 소진일 45일 미만만 반환."""
     if SALES_DF is None or SALES_DF.empty or STOCK_DF is None or STOCK_DF.empty:
         return []
-    yms = _complete_months(3)
-    if not yms:
-        return []
-    w = [0.5, 0.3, 0.2][:len(yms)]
-    sub = SALES_DF[(SALES_DF['ym'].astype(str).isin(yms)) & (SALES_DF['prefix'] == 'I')]
-    sales = {}
-    for _, r in sub.iterrows():
-        c = _goods_canon(r['code'])          # 구품번 판매 이력 → 신품번으로 합산
-        sales.setdefault(c, [0.0] * len(yms))[yms.index(str(r['ym']))] += float(r['ea'])
+    vel = _sales_velocity()
+    vtrend = {}
+    if vel:
+        # 판매 API 모드: 월판매 = 일 판매속도(최근 4주·3개월 가중)×30, 추세 = 4주÷3개월
+        yms, w, sales = ['vel'], [1.0], {}
+        for code, v in vel['by'].items():
+            if code[:1] != 'I':
+                continue
+            c = _goods_canon(code)
+            sales.setdefault(c, [0.0])[0] += v['v'] * 30
+            vtrend.setdefault(c, []).append((v['v28'], v['v90']))
+        vtrend = {c: (round(min(2.0, max(0.5, sum(a for a, _ in x) / sum(b for _, b in x))), 2) if sum(b for _, b in x) > 0 else 1.0)
+                  for c, x in vtrend.items()}
+    else:
+        yms = _complete_months(3)
+        if not yms:
+            return []
+        w = [0.5, 0.3, 0.2][:len(yms)]
+        sub = SALES_DF[(SALES_DF['ym'].astype(str).isin(yms)) & (SALES_DF['prefix'] == 'I')]
+        sales = {}
+        for _, r in sub.iterrows():
+            c = _goods_canon(r['code'])          # 구품번 판매 이력 → 신품번으로 합산
+            sales.setdefault(c, [0.0] * len(yms))[yms.index(str(r['ym']))] += float(r['ea'])
     if not sales:
         return []
     stock, names = {}, {}
@@ -7397,7 +7537,7 @@ def _goods_reorder_items(lead=None):
             lt, lead_note = {'days': ve['lt_days'], 'n': 0, 'src': '업체표'}, ''
         out.append({'code': c, 'name': names.get(c, ''), 'qty': int(st), 'incoming': int(inc), 'lead_note': lead_note,
                     'rule': rule, 'vendor_note': vendor_note, 'vendor_rule': {'거래처': ve['거래처'], 'kind': ve['kind'], 'lt_days': ve['lt_days']} if ve else None,
-                    'monthly_avg': int(fc), 'trend': round(fc / mean, 2) if mean else 1.0,
+                    'monthly_avg': int(fc), 'trend': vtrend.get(c, 1.0) if vel else (round(fc / mean, 2) if mean else 1.0),
                     'days_left': round(days_left, 1), 'days_left_incoming': round((st + inc) / daily, 1),
                     'level': level, 'lead': lt, 'vendor': last_vendor.get(c, ''), 'last_order': last_order.get(c, ''),
                     'src': src, 'basis': 'sales'})
@@ -7415,6 +7555,7 @@ def api_reorder_advice():
     DEFAULT_LEAD = 14   # 리드타임 표본 없을 때 가정값
     lead = _calc_leadtimes()
     ratio = _trend_ratio_by_material()   # 판매 추세계수 (최근 3개월 가중/평균)
+    fmul = (lambda c: 1.0) if _sales_velocity() else (lambda c: ratio.get(c, 1.0))   # 판매속도 모드는 이미 최근 반영 → 곱하지 않음
     rows = []
     for scope in ('jasa', 'outsource'):
         for a in _stock_alert_items(scope):
@@ -7434,7 +7575,7 @@ def api_reorder_advice():
                 'urgency': urgency,
                 'vendors': a.get('vendors', []),
                 'trend': ratio.get(a['code'], 1.0),
-                'forecast': int(a['monthly_avg'] * ratio.get(a['code'], 1.0)),
+                'forecast': int(a['monthly_avg'] * fmul(a['code'])),
             })
     # 상품매입 완제품: 이미 발주된 미입고분까지 합쳐도 리드+여유일을 못 넘길 때만 대상
     for a in _goods_reorder_items(lead):
@@ -7488,7 +7629,7 @@ def api_purchase_req_draft():
             base = lt['days'] if lt else 14
             if a['days_left'] > base + 7:
                 continue
-            monthly = a['monthly_avg'] * ratio.get(a['code'], 1.0)   # 예측 월소비
+            monthly = a['monthly_avg'] * (1.0 if _sales_velocity() else ratio.get(a['code'], 1.0))   # 예측 월소비 (판매속도 모드는 이미 최근 반영)
             need = monthly * ((base + 7) / 30.0 + 1.0) - a['qty']
             if need <= 0:
                 need = monthly  # 최소 1개월분
@@ -7852,7 +7993,7 @@ def _report_data(ym):
     def _find(rows, key):
         return next((r for r in rows if r.get('ym') == key), None) or {}
 
-    # 매출 (Monday 매출현황 / 판매CSV)
+    # 매출 — 온라인팀 판매 API 공급가 (2026-09-23: Monday 매출현황 대체). mon = 같은 자료의 월별 합계(추이용)
     with app.test_request_context('/api/sales_summary'):
         mon = api_sales_summary().get_json()
     with app.test_request_context('/api/sales_qty'):
@@ -7991,15 +8132,14 @@ def _report_html(d):
          f'<div class="sub">매홍 구매/외주 대시보드 · 생성 {d["generated"]} · 데이터 상태: '
          f'<span class="badge {"ok" if d["health"]["overall"]=="ok" else ("warn" if d["health"]["overall"]=="warn" else "err")}">{esc(d["health"]["summary"])}</span></div>',
          '<div class="kpis">',
-         kpi('매출 (Monday 매출현황)', d['sales_monday']['cur'], d['sales_monday']['pct']),
-         kpi('채널 매출 (판매CSV·공급가)', d['sales_csv']['cur'], d['sales_csv']['pct'],
+         kpi('매출 (판매자료·공급가)', d['sales_monday']['cur'], d['sales_monday']['pct'],
              f'<div class="d flat">판매 {int(d["sales_csv"]["qty"]):,}개</div>'),
          kpi('구매 발주액', d['po']['cur'], d['po']['pct']),
          kpi('입고액', d['rcv']['cur'], d['rcv']['pct']),
          '</div>']
     # 12개월 추이
     mx_s = max([t['sales'] for t in d['trend']] + [1]); mx_p = max([t['po'] for t in d['trend']] + [1])
-    h.append('<h2>12개월 추이</h2><div class="grid2"><div><div style="font-size:11px;color:#64748b;margin-bottom:4px">매출 (Monday)</div>')
+    h.append('<h2>12개월 추이</h2><div class="grid2"><div><div style="font-size:11px;color:#64748b;margin-bottom:4px">매출 (판매자료·공급가)</div>')
     for t in d['trend']:
         h.append(f'<div class="bar"><span class="lb">{t["ym"][2:]}</span><div class="b" style="width:{t["sales"]/mx_s*260:.0f}px"></div><span class="n">{_fmt_won(t["sales"])}</span></div>')
     h.append('</div><div><div style="font-size:11px;color:#64748b;margin-bottom:4px">구매 발주액</div>')
@@ -8008,7 +8148,7 @@ def _report_html(d):
     h.append('</div></div>')
     # 채널 매출 분류
     if d['sales_csv']['by_class']:
-        h.append('<h2>채널 매출 분류별</h2><table><tr><th>분류</th><th class="num">매출액</th><th class="num">비중</th></tr>')
+        h.append('<h2>매출 분류별</h2><table><tr><th>분류</th><th class="num">매출액</th><th class="num">비중</th></tr>')
         tot = d['sales_csv']['cur'] or 1
         for k, v in sorted(d['sales_csv']['by_class'].items(), key=lambda x: -x[1]):
             h.append(f'<tr><td>{esc(k)}</td><td class="num">{int(v):,}원</td><td class="num">{v/tot*100:.1f}%</td></tr>')
@@ -8040,7 +8180,7 @@ def _report_html(d):
     names = {'out': '🔴 신규 품절', 'reorder': '🕐 지금 발주 진입', 'health': '⚠️ 데이터 이상', 'daily': '☀️ 아침 요약', 'report': '📊 월간 리포트'}
     h += [f'<tr><td>{names.get(k, k)}</td><td class="num">{v}</td></tr>' for k, v in sorted(d['alerts'].items())] or ['<tr><td colspan=2 style="color:#94a3b8">알림 없음</td></tr>']
     h.append('</table></div></div>')
-    h.append('<div class="note">※ 매출(Monday)은 영업팀 입력 기준, 채널 매출은 판매CSV×공급가(일부 채널) · 발주/입고는 아마란스 합계금액 · 단가 변동은 발주단가 3% 이상 변경분 · 재고 마감은 매월 자동보관 스냅샷</div>')
+    h.append('<div class="note">※ 매출은 온라인팀 판매자료(쿠팡·마트 등 온라인+오프라인 납품) 공급가 합계, VAT 제외 · 발주/입고는 아마란스 합계금액 · 단가 변동은 발주단가 3% 이상 변경분 · 재고 마감은 매월 자동보관 스냅샷</div>')
     h.append('</div>')
     return '<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>월간 리포트 ' + d['ymd'] + '</title></head><body>' + ''.join(h) + '</body></html>'
 
@@ -8083,6 +8223,16 @@ def _complete_months(n=3):
 def _trend_ratio_by_material():
     """자재별 추세계수 = 최근 완결 3개월 가중(0.5/0.3/0.2) ÷ 단순평균. 0.5~2.0 클립.
     재고경고의 monthly_avg(단순평균)에 곱해 '다음달 예측 소비'로 씀."""
+    vel = _sales_velocity()
+    if vel:
+        # 판매 API 모드: 자재 추세 = Σ(완제품 4주 속도×소요) ÷ Σ(3개월 속도×소요). 표시용(소비량에 이미 최근 속도가 반영돼 곱하지 않음)
+        a, b = {}, {}
+        for code, v in vel['by'].items():
+            for mat, q in _explode_bom(code).items():
+                if mat[:1] in ('A', 'B', 'C', 'D'):
+                    a[mat] = a.get(mat, 0) + v['v28'] * q
+                    b[mat] = b.get(mat, 0) + v['v90'] * q
+        return {m: round(min(2.0, max(0.5, a[m] / b[m])), 2) for m in a if b.get(m, 0) > 0}
     yms = _complete_months(3)
     if len(yms) < 2:
         return {}
@@ -8113,14 +8263,27 @@ def api_supply_plan():
     커버리지(주) = 재고 ÷ 주판매. 계획 반영 커버리지도 함께."""
     if SALES_DF is None or SALES_DF.empty:
         return jsonify({'items': [], 'total': 0, 'reason': '판매 데이터 없음'})
-    yms = _complete_months(3)
-    w = [0.5, 0.3, 0.2][:len(yms)]
-    sub = SALES_DF[SALES_DF['ym'].astype(str).isin(yms)]
-    sales = {}   # code → [by month]
     _al = _goods_aliases()   # 구품번→신품번 (상품매입 전환 품목, 재고·계획·미입고를 신품번으로 합산)
-    for _, r in sub.iterrows():
-        c = _al.get(str(r['code']).strip().upper(), str(r['code']).strip().upper())
-        sales.setdefault(c, [0.0] * len(yms))[yms.index(str(r['ym']))] += float(r['ea'])
+    vel = _sales_velocity()
+    vtr = {}
+    sales = {}   # code → [by month]
+    if vel:
+        # 판매 API 모드(2026-09-23): 월판매 = 일 판매속도(최근 4주 70%·3개월 30%)×30, 추세 = 4주÷3개월
+        yms, w = [], [1.0]
+        acc = {}
+        for code, v in vel['by'].items():
+            c = _al.get(code, code)
+            sales.setdefault(c, [0.0])[0] += v['v'] * 30
+            a, b = acc.get(c, (0.0, 0.0))
+            acc[c] = (a + v['v28'], b + v['v90'])
+        vtr = {c: (round(min(2.0, max(0.5, a / b)), 2) if b > 0 else 1.0) for c, (a, b) in acc.items()}
+    else:
+        yms = _complete_months(3)
+        w = [0.5, 0.3, 0.2][:len(yms)]
+        sub = SALES_DF[SALES_DF['ym'].astype(str).isin(yms)]
+        for _, r in sub.iterrows():
+            c = _al.get(str(r['code']).strip().upper(), str(r['code']).strip().upper())
+            sales.setdefault(c, [0.0] * len(yms))[yms.index(str(r['ym']))] += float(r['ea'])
 
     stock, names = {}, {}
     if STOCK_DF is not None and not STOCK_DF.empty and '품번' in STOCK_DF.columns:
@@ -8195,14 +8358,218 @@ def api_supply_plan():
         else:
             level = 'ok'
         items.append({'code': c, 'name': names.get(c, ''), 'cls': {'G': '자사', 'H': '유상사급', 'I': '상품매입'}.get(c[:1], ''),
-                      'monthly': int(fc), 'trend': round(fc / mean, 2) if mean else 1.0,
+                      'monthly': int(fc), 'trend': vtr.get(c, 1.0) if vel else (round(fc / mean, 2) if mean else 1.0),
                       'stock': int(st), 'plan': int(plan.get(c, 0)), 'incoming': int(incoming.get(c, 0)),
                       'cov_weeks': round(cov, 1), 'cov_plan_weeks': round(cov_plan, 1), 'level': level})
+    # 채널 재고 합산 (2026-09-23): 쿠팡 센터·마트 매장 재고까지 더한 커버. 판정(level)은 창고 기준 유지(생산 착수 판단),
+    # 채널 포함 커버는 참고 — 창고가 부족해도 채널이 4주 이상이면 '채널 여유', 창고는 괜찮아도 채널 합계가 2주 미만이면 '채널 부족'.
+    try:
+        chs = _channel_stock_by_code()
+    except Exception:
+        chs = {}
+    for x in items:
+        cs = chs.get(x['code'])
+        weekly = x['monthly'] / 4.33 if x['monthly'] else 0
+        x['ch_stock'] = int(cs['qty']) if cs else None
+        x['cov_ch_weeks'] = round((max(x['stock'], 0) + cs['qty']) / weekly, 1) if (cs and weekly) else None
+        x['ch_note'] = ''
+        if cs and x['cov_ch_weeks'] is not None:
+            if x['level'] in ('out', 'critical') and x['cov_ch_weeks'] >= 4:
+                x['ch_note'] = '채널 여유'
+            elif x['level'] in ('ok', 'low') and cs['qty'] / weekly < 1:
+                x['ch_note'] = '채널 부족'
     order = {'out': 0, 'critical': 1, 'warning': 2, 'low': 3, 'ok': 4}
     items.sort(key=lambda x: (order[x['level']], x['cov_plan_weeks']))
     summary = {k: sum(1 for x in items if x['level'] == k) for k in order}
     # 전체 반환 — 프론트가 검색 필터별 집계를 다시 계산하므로 잘라내지 않음 (완제품 ~100개)
-    return jsonify({'items': items, 'total': len(items), 'summary': summary, 'months': yms})
+    return jsonify({'items': items, 'total': len(items), 'summary': summary, 'months': yms, 'basis': _vel_basis_label(vel)})
+
+
+# ====== 채널 품절 경보 (2026-09-23, 판매 API의 점재고·센터재고 ÷ POS 판매속도) ======
+CH_STOCK_SKIP = {'homeplus_hyper', 'homeplus_express', 'costco'}   # 점재고 미제공(통합 homeplus에만) / 코스트코는 납품만
+
+
+@app.route('/api/channel_stock', methods=['GET'])
+@cached_api()
+def api_channel_stock():
+    """채널(쿠팡 센터·마트 매장) 재고가 며칠 버티는지 — 최신 재고 ÷ 최근 14일 POS 일평균.
+    level: out(재고 0, 판매 중) / critical(3일 미만) / warning(7일 미만). stale=최근 7일 재고값이 변하지 않음(이마트 등 스냅샷 부족 → 신뢰 낮음).
+    ?all=1 이면 7일 이상도 포함."""
+    df = SALES_DAILY_DF
+    if df is None or df.empty:
+        return jsonify({'items': [], 'total': 0, 'reason': '판매 API 자료 없음'})
+    show_all = request.args.get('all') == '1'
+    d = df[~df['channel'].isin(CH_STOCK_SKIP)]
+    end = pd.to_datetime(d['date'].max())
+    dt = pd.to_datetime(d['date'])
+    d = d.assign(_dt=dt)[dt >= end - pd.Timedelta(days=44)]
+    w14 = d[d['_dt'] >= end - pd.Timedelta(days=13)]
+    ours = {}
+    if STOCK_DF is not None and not STOCK_DF.empty and '품번' in STOCK_DF.columns:
+        _al = _goods_aliases()
+        for _, r in STOCK_DF.iterrows():
+            c = str(r.get('품번', '')).strip().upper()
+            c = _al.get(c, c)
+            ours[c] = ours.get(c, 0) + _num(r.get('현재고', 0))
+    items = []
+    for (ch, sku), g in d.groupby(['channel', 'sku']):
+        st = g[g['stock'].notna()].sort_values('_dt')
+        if st.empty:
+            continue
+        last = st.iloc[-1]
+        if (end - last['_dt']).days > 7:          # 재고 스냅샷이 오래됨
+            continue
+        p = w14[(w14['channel'] == ch) & (w14['sku'] == sku)]
+        pdays = int(p['pos'].notna().sum())
+        if pdays < 5:                              # POS가 5일 미만이면 판매속도 신뢰 불가
+            continue
+        pos_d = float(p['pos'].sum()) / pdays
+        if pos_d <= 0:
+            continue
+        stock = float(last['stock'])
+        cover = stock / pos_d if stock > 0 else 0.0
+        level = 'out' if stock <= 0 else ('critical' if cover < 3 else ('warning' if cover < 7 else 'ok'))
+        if level == 'ok' and not show_all:
+            continue
+        s7 = st[st['_dt'] >= end - pd.Timedelta(days=6)]['stock']
+        dl = g[g['ea'] > 0].sort_values('_dt')
+        code = str(g['code'].iloc[0] or '')
+        items.append({'channel': ch, 'channel_name': str(g['channel_name'].iloc[0]), 'channel_type': str(g['channel_type'].iloc[0]),
+                      'sku': sku, 'code': code, 'name': str(g['name'].iloc[-1]),
+                      'stock': int(stock), 'stock_date': last['date'], 'pos_d': round(pos_d, 1), 'cover': round(cover, 1),
+                      'level': level, 'stale': bool(len(s7) >= 4 and s7.nunique() == 1 and stock > 0),
+                      'last_delivery': dl['date'].iloc[-1] if len(dl) else '',
+                      'last_delivery_qty': int(dl['ea'].iloc[-1] / (dl['f'].iloc[-1] or 1)) if len(dl) else 0,
+                      'ours': int(ours.get(code, 0)) if code else None})
+    order = {'out': 0, 'critical': 1, 'warning': 2, 'ok': 3}
+    items.sort(key=lambda x: (order[x['level']], x['stale'], x['cover'], -x['pos_d']))
+    summary = {k: sum(1 for x in items if x['level'] == k) for k in ('out', 'critical', 'warning')}
+    return jsonify({'items': items, 'total': len(items), 'summary': summary, 'as_of': end.strftime('%Y-%m-%d')})
+
+
+def _channel_stock_by_code():
+    """품번별 채널 재고 합계 (쿠팡 센터·마트 매장) — 채널·SKU별 최신 스냅샷(자료 최종일 7일 이내)의 합. {code: {'qty', 'n'}}"""
+    df = SALES_DAILY_DF
+    if df is None or df.empty:
+        return {}
+    d = df[(~df['channel'].isin(CH_STOCK_SKIP)) & df['stock'].notna() & (df['code'] != '')]
+    if d.empty:
+        return {}
+    end = pd.to_datetime(df['date'].max())
+    d = d[pd.to_datetime(d['date']) >= end - pd.Timedelta(days=7)]
+    last = d.sort_values('date').groupby(['channel', 'sku']).tail(1)
+    _al = _goods_aliases()
+    out = {}
+    for _, r in last.iterrows():
+        c = _al.get(r['code'], r['code'])
+        e = out.setdefault(c, {'qty': 0.0, 'n': 0})
+        e['qty'] += max(float(r['stock']), 0.0) * float(r['f'] or 1)   # 세트 SKU는 환산계수만큼 단품으로
+        e['n'] += 1
+    return out
+
+
+# ====== 판매 분석 3종 (2026-09-23): 납품 vs POS 괴리 · 채널 공급단가 변동 · 납품 요일 패턴 ======
+@app.route('/api/sales_gap', methods=['GET'])
+@cached_api()
+def api_sales_gap():
+    """최근 28일 납품 vs POS(실판매) — POS를 주는 채널·SKU만 비교(코스트코 등 POS 없는 채널 제외, POS 14일 이상 보고).
+    ratio = 납품/POS. over(≥1.5): 채널에 재고가 쌓이는 중 → 곧 발주 감소 신호 / under(≤0.5): 채널 재고 소진 중 → 곧 추가 발주 신호."""
+    df = SALES_DAILY_DF
+    if df is None or df.empty:
+        return jsonify({'items': [], 'reason': '판매 API 자료 없음'})
+    end = pd.to_datetime(df['date'].max())
+    start = end - pd.Timedelta(days=27)
+    d = df[(pd.to_datetime(df['date']) >= start) & (df['code'] != '')].copy()
+    pdays = d.groupby(['channel', 'sku'])['pos'].apply(lambda s: int(s.notna().sum()))
+    ok = set(pdays[pdays >= 14].index)
+    d = d[[k in ok for k in zip(d['channel'], d['sku'])]]
+    if d.empty:
+        return jsonify({'items': []})
+    d['pos_ea'] = d['pos'].fillna(0) * d['f']
+    names = _sales_name_map()
+    stk = d[d['stock'].notna()].sort_values('date')
+    items = []
+    for code, g in d.groupby('code'):
+        dl, ps = float(g['ea'].sum()), float(g['pos_ea'].sum())
+        if ps < 100 and dl < 100:
+            continue
+        ratio = dl / ps if ps > 0 else None
+        s = stk[stk['code'] == code]
+        first = s.groupby(['channel', 'sku'])['stock'].first().sum() if len(s) else None
+        last = s.groupby(['channel', 'sku'])['stock'].last().sum() if len(s) else None
+        level = 'over' if (ratio is None or ratio >= 1.5) else ('under' if ratio <= 0.5 else 'ok')
+        items.append({'code': code, 'name': names.get(code, '') or str(g['name'].iloc[-1]),
+                      'delivery': int(dl), 'pos': int(ps), 'ratio': round(ratio, 2) if ratio is not None else None,
+                      'stock_change': int(last - first) if first is not None else None,
+                      'channels': ', '.join(sorted(set(g['channel_name']))[:3]), 'level': level})
+    items.sort(key=lambda x: (x['level'] == 'ok', -abs((x['ratio'] or 9) - 1) * (x['pos'] + x['delivery'])))
+    return jsonify({'items': items, 'from': start.strftime('%Y-%m-%d'), 'to': end.strftime('%Y-%m-%d'),
+                    'summary': {k: sum(1 for x in items if x['level'] == k) for k in ('over', 'under', 'ok')}})
+
+
+@app.route('/api/channel_price_changes', methods=['GET'])
+@cached_api()
+def api_channel_price_changes():
+    """채널 공급단가 변동 — 채널·SKU별 unit_supply_price 시계열(최근 180일). 현재가 = 최근 연속 구간(2회 이상 관측, 단발 행사가 제외),
+    이전가 = 그 직전 다른 가격. |변화| ≥ 3%. 월 영향액 = (현재가−이전가) × 최근 90일 납품수량 ÷ 3 (판매가 쪽이므로 인하=마진 압박)."""
+    df = SALES_DAILY_DF
+    if df is None or df.empty:
+        return jsonify({'items': []})
+    files = sorted(glob.glob(f'{DATA_DIR}/*_판매일별.csv'))
+    if not files:
+        return jsonify({'items': []})
+    raw = pd.read_csv(files[-1], dtype=str, encoding='utf-8-sig', usecols=['date', 'channel', 'channel_name', 'sku', 'name', 'self_code',
+                                                                          'delivery_qty', 'unit_supply_price']).fillna('')
+    raw['p'] = pd.to_numeric(raw['unit_supply_price'], errors='coerce')
+    raw['q'] = pd.to_numeric(raw['delivery_qty'], errors='coerce').fillna(0)
+    end = pd.to_datetime(raw['date'].max())
+    raw = raw[pd.to_datetime(raw['date']) >= end - pd.Timedelta(days=180)]
+    code_of = dict(zip(df['sku'].astype(str), df['code']))
+    names = _sales_name_map()
+    cut90 = (end - pd.Timedelta(days=89)).strftime('%Y-%m-%d')
+    items = []
+    for (ch, sku), g in raw[raw['p'].notna() & (raw['p'] > 0)].sort_values('date').groupby(['channel', 'sku']):
+        ps = list(g['p'].round(0)); ds = list(g['date'])
+        if len(ps) < 3:
+            continue
+        cur = ps[-1]; i = len(ps) - 1
+        while i > 0 and ps[i - 1] == cur:
+            i -= 1
+        if len(ps) - i < 2 or i == 0:        # 현재가가 1회뿐(단발) 이거나 변동 없음
+            continue
+        prev = ps[i - 1]
+        pct = (cur - prev) / prev * 100
+        if abs(pct) < 3:
+            continue
+        q90 = float(raw[(raw['channel'] == ch) & (raw['sku'] == sku) & (raw['date'] >= cut90)]['q'].sum())
+        code = code_of.get(str(sku), '') or str(g['self_code'].iloc[-1])
+        items.append({'channel_name': str(g['channel_name'].iloc[-1]), 'sku': sku, 'code': code,
+                      'name': names.get(code, '') or str(g['name'].iloc[-1]), 'prev': int(prev), 'cur': int(cur),
+                      'pct': round(pct, 1), 'since': ds[i], 'impact': int((cur - prev) * q90 / 3)})
+    items.sort(key=lambda x: -abs(x['impact']))
+    return jsonify({'items': items, 'to': end.strftime('%Y-%m-%d')})
+
+
+@app.route('/api/delivery_weekday', methods=['GET'])
+@cached_api()
+def api_delivery_weekday():
+    """최근 12주 납품 요일 패턴 — 요일별 납품 수량·금액, 온라인/오프라인, 주요 채널별 비중."""
+    df = SALES_DAILY_DF
+    if df is None or df.empty:
+        return jsonify({'days': []})
+    end = pd.to_datetime(df['date'].max())
+    d = df[(pd.to_datetime(df['date']) >= end - pd.Timedelta(days=83)) & (df['dq'] > 0)].copy()
+    d['wd'] = pd.to_datetime(d['date']).dt.dayofweek
+    labels = ['월', '화', '수', '목', '금', '토', '일']
+    tot = float(d['dq'].sum()) or 1
+    top_ch = list(d.groupby('channel_name')['dq'].sum().sort_values(ascending=False).head(4).index)
+    days = []
+    for w in range(7):
+        g = d[d['wd'] == w]
+        days.append({'wd': labels[w], 'qty': int(g['dq'].sum()), 'amt': int(g['amt'].sum()), 'share': round(float(g['dq'].sum()) / tot * 100, 1),
+                     'online': int(g[g['channel_type'] == 'online']['dq'].sum()), 'offline': int(g[g['channel_type'] == 'offline']['dq'].sum()),
+                     'by_ch': {c: int(g[g['channel_name'] == c]['dq'].sum()) for c in top_ch}})
+    return jsonify({'days': days, 'channels': top_ch, 'from': (end - pd.Timedelta(days=83)).strftime('%Y-%m-%d'), 'to': end.strftime('%Y-%m-%d')})
 
 
 @app.route('/api/vendor_scorecard', methods=['GET'])
@@ -8432,7 +8799,9 @@ def api_return_cost():
         total_qty = per * qty
         lines.append({'code': c, 'name': m.get('name', ''), 'grp': grp, 'cls': cls_raw, 'unit': m.get('unit', ''),
                       'per_unit': round(per, 6), 'total_qty': round(total_qty, 4),
-                      'price': round(price, 2), 'price_src': src, 'amount': round(total_qty * price)})
+                      'price': round(price, 2), 'price_src': src, 'amount': round(total_qty * price),
+                      # 1개 기준 반올림 전 값 — 화면이 수량을 곱해 즉시 계산할 때 오차 없도록 (2026-09-23)
+                      'unit_amount': per * price, 'unit_qty': per})
     order = {'원재료': 0, '부재료': 1, '기타': 2}
     lines.sort(key=lambda x: (order[x['grp']], -x['amount']))
     sub = {}
@@ -9906,7 +10275,36 @@ def api_ipsu_calib():
 @app.route('/api/sales_summary', methods=['GET'])
 @cached_api()
 def api_sales_summary():
-    """Monday '2026년 매출 현황' 보드 — 월별 매출 추이 + 구분별 분석."""
+    """매출 현황 — 온라인팀(팀장님) 판매 API 공급가 합계 기준 월별 추이 + 채널별 (2026-09-23 사용자 지시: 매출은 전부 팀장님 자료).
+    Monday '2026년 매출 현황' 보드는 더 이상 쓰지 않음 (_sales_summary_monday_legacy 참고용 보존)."""
+    df = SALES_DAILY_DF
+    empty = {'monthly': [], 'div_map': {}, 'latest_month': '', 'kpi': {}, 'source': '판매 API 자료 없음'}
+    if df is None or df.empty or 'amt' not in df.columns:
+        return jsonify(empty)
+    d = df[df['amt'] > 0].copy()
+    if d.empty:
+        return jsonify(empty)
+    d['ym'] = d['date'].astype(str).str[:7]
+    monthly = d.groupby('ym')['amt'].sum()
+    months = sorted(monthly.index)
+    div_map = {}
+    for ym, g in d.groupby('ym'):
+        s = g.groupby('channel_name')['amt'].sum().sort_values(ascending=False)
+        div_map[ym] = [{'div': k, 'amount': int(v)} for k, v in s.items() if v > 0]
+    latest = months[-1]
+    prev = months[-2] if len(months) >= 2 else ''
+    cur_amt, prev_amt = float(monthly.get(latest, 0)), float(monthly.get(prev, 0))
+    kpi = {'latest_month': latest, 'latest_amount': int(cur_amt), 'prev_amount': int(prev_amt),
+           'mom_pct': round((cur_amt - prev_amt) / prev_amt * 100, 1) if prev_amt > 0 else 0,
+           'avg_12m': int(sum(monthly[m] for m in months[-12:]) / max(len(months[-12:]), 1))}
+    return jsonify({'monthly': [{'ym': m, 'amount': int(monthly[m])} for m in months], 'div_map': div_map,
+                    'latest_month': latest, 'kpi': kpi, 'as_of': str(d['date'].max()),
+                    'current_month': datetime.now().strftime('%Y-%m'),
+                    'source': '온라인팀 판매자료 · 공급가(VAT 제외) · 온라인+오프라인'})
+
+
+def _sales_summary_monday_legacy():
+    """(미사용) Monday '2026년 매출 현황' 보드 — 월별 매출 추이 + 구분별 분석. 2026-09-23 판매 API로 대체."""
     if MONDAY_DF is None or MONDAY_DF.empty:
         return jsonify({'monthly': [], 'by_div': [], 'latest_month': '', 'kpi': {}})
     s = MONDAY_DF[MONDAY_DF['보드명'] == '2026년 매출 현황'].copy()
@@ -10202,8 +10600,26 @@ def api_sales_qty_product():
 
 @app.route('/api/sales_detail', methods=['GET'])
 def api_sales_detail():
-    """특정 월 매출 TOP 10 (거래처/항목별) — 매출 차트 클릭 시."""
+    """특정 월 매출 TOP 10 — 상품(품번)별 공급가 합계, 채널 표기. 판매 API 기준 (2026-09-23)."""
     ym = (request.args.get('ym') or '').strip()  # 'YYYY-MM'
+    df = SALES_DAILY_DF
+    if df is None or df.empty or not re.match(r'^\d{4}-\d{2}$', ym):
+        return jsonify({'ym': ym, 'items': [], 'total': 0, 'count': 0})
+    d = df[(df['date'].astype(str).str[:7] == ym) & (df['amt'] > 0)].copy()
+    if d.empty:
+        return jsonify({'ym': ym, 'items': [], 'total': 0, 'count': 0})
+    d['key'] = d['code'].where(d['code'] != '', 'SKU ' + d['sku'].astype(str))
+    names = _sales_name_map()
+    g = d.groupby('key').agg(amount=('amt', 'sum'), sname=('name', 'first'),
+                             chs=('channel_name', lambda s: ', '.join(sorted(set(s))[:3]))).sort_values('amount', ascending=False)
+    rows = [{'name': f"{k} {names.get(k, '') or r['sname']}".strip(), 'amount': int(r['amount']), 'div': r['chs']}
+            for k, r in g.iterrows()]
+    total = float(d['amt'].sum())
+    return jsonify({'ym': ym, 'items': rows[:10], 'total': int(total), 'count': len(rows)})
+
+
+def _sales_detail_monday_legacy(ym):
+    """(미사용) Monday 매출 현황 TOP 10. 2026-09-23 판매 API로 대체."""
     if MONDAY_DF is None or MONDAY_DF.empty or not re.match(r'^\d{4}-\d{2}$', ym):
         return jsonify({'ym': ym, 'items': [], 'total': 0})
     s = MONDAY_DF[MONDAY_DF['보드명'] == '2026년 매출 현황']
@@ -10471,7 +10887,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .chart-panel.alert-span    { grid-column: span 10; }   /* 자사·외주·발주타이밍 3등분 */
   .chart-panel.price-span    { grid-column: span 12; }   /* 단가변동 (단가계산기와 한 줄) */
   .chart-panel.plan-panel    { grid-column: span 15; border-top: 3px solid #0891b2; }   /* 수급 플래너 — 시안 */
-  .chart-panel.vendor-panel  { grid-column: span 15; border-top: 3px solid #7c3aed; }   /* 거래처 스코어 — 보라 */
+  .chart-panel.chstock-panel { grid-column: span 15; border-top: 3px solid #ea580c; }   /* 채널 품절 경보 — 주황 (2026-09-23) */
+  .chart-panel.vendor-panel  { grid-column: span 30; border-top: 3px solid #7c3aed; }   /* 거래처 스코어 — 보라 (채널 품절 경보가 수급 플래너 옆으로 오면서 전체 폭) */
+  .ch-tag { display:inline-block; font-size:10px; font-weight:700; padding:1px 6px; border-radius:5px; margin-left:4px; background:#fff7ed; color:#c2410c; vertical-align:1px; }
+  .ch-tag.on { background:#eff6ff; color:#1d4ed8; }
   .vk-chips { display:flex; gap:3px; background:#f1f5f9; border-radius:8px; padding:2px; }
   .vk-chip { border:0; background:transparent; font-size:11px; font-weight:700; color:#64748b; padding:3px 9px; border-radius:6px; cursor:pointer; font-family:inherit; }
   .vk-chip.on { background:#fff; color:#7c3aed; box-shadow:0 1px 2px rgba(0,0,0,.12); }
@@ -10628,6 +11047,17 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .prod-chart-wrap { height: 240px; position: relative; }
   /* ───── 월 판매기반 자료 패널 ───── */
   .salesbase-strip { max-width: 1440px; margin: 12px auto 0; padding: 0 32px; }
+  /* ───── 판매 분석 (2026-09-23) ───── */
+  .lens-strip { max-width: 1440px; margin: 12px auto 0; padding: 0 32px; display: grid; grid-template-columns: 1.15fr 1.15fr 0.8fr; gap: 12px; }
+  .chart-panel.lens-gap { border-top: 3px solid #0d9488; }
+  .chart-panel.lens-price { border-top: 3px solid #9333ea; }
+  .chart-panel.lens-wd { border-top: 3px solid #64748b; }
+  .wd-row { display: grid; grid-template-columns: 22px 1fr 58px 44px; align-items: center; gap: 6px; font-size: 11.5px; padding: 4px 0; }
+  .wd-bar { height: 14px; border-radius: 4px; background: #f1f5f9; overflow: hidden; display: flex; }
+  .wd-bar i { display: block; height: 100%; }
+  .wd-row .n { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-2); }
+  .wd-row .p { text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
+  @media (max-width: 900px) { .lens-strip { grid-template-columns: 1fr; padding: 0 12px; } }
   .chart-panel.salesbase-panel { border-top: 3px solid #3f9e8f; }
   .salesbase-body { display: grid; grid-template-columns: 1fr 1.7fr; gap: 16px; align-items: start; }
   .salesbase-chart-wrap { height: 460px; position: relative; min-width: 0; }
@@ -11045,7 +11475,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
 
   @media (max-width: 980px) {
     .chart-grid { grid-template-columns: 1fr; padding: 0 16px; }
-    .chart-panel.po-inline, .chart-panel.os-inline, .chart-panel.pcalc-panel, .chart-panel.alert-span, .chart-panel.price-span, .chart-panel.plan-panel, .chart-panel.vendor-panel { grid-column: auto; }
+    .chart-panel.po-inline, .chart-panel.os-inline, .chart-panel.pcalc-panel, .chart-panel.alert-span, .chart-panel.price-span, .chart-panel.plan-panel, .chart-panel.chstock-panel, .chart-panel.vendor-panel { grid-column: auto; }
   }
 
   /* ───── Header ───── */
@@ -11787,6 +12217,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   <a href="#sec-ipsu" data-sec="sec-ipsu">3D</a>
   <a href="#sec-sales" data-sec="sec-sales">매출</a>
   <a href="#sec-salesbase" data-sec="sec-salesbase">추이</a>
+  <a href="#sec-lens" data-sec="sec-lens">분석</a>
   <a href="#sec-cal" data-sec="sec-cal">달력</a>
 </nav>
 
@@ -11846,7 +12277,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   <!-- 줄 순서(2026-09-04): 수급·거래처 → 단가변동·계산기 → (아래 규격 스트립). 규격의 ↑가 계산기에 적용되므로 계산기가 규격 바로 위에 와야 함 -->
   <div class="chart-panel plan-panel">
     <div class="chart-head">
-      <div><span class="chart-title">📦 완제품 수급 플래너</span><span class="chart-sub">월판매(추세) vs 재고 vs 생산계획·입고예정 · 클릭=상세</span></div>
+      <div><span class="chart-title">📦 완제품 수급 플래너</span><span class="chart-sub">최근 판매속도 vs 창고재고(판정)·채널재고(참고) vs 생산계획·입고예정 · 클릭=상세</span></div>
       <div style="display:flex;align-items:center;gap:8px">
         <input id="plan-search" type="text" placeholder="품번/품명" oninput="renderPlan()" style="width:120px;padding:3px 8px;font-size:11px;border:1px solid var(--border);border-radius:6px">
         <div id="plan-count" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
@@ -11854,6 +12285,21 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     </div>
     <div id="plan-summary" style="font-size:11px;color:var(--text-2);margin-bottom:6px"></div>
     <div id="plan-list" class="alert-list"><div class="loading" style="padding:20px">로딩 중...</div></div>
+  </div>
+  <div class="chart-panel chstock-panel">
+    <div class="chart-head">
+      <div><span class="chart-title">🏬 채널 품절 경보</span><span class="chart-sub">쿠팡 센터·마트 매장 재고 ÷ 최근 14일 POS · 7일 미만 · 클릭=상세</span></div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <div class="vk-chips">
+          <button class="vk-chip on" data-t="all" onclick="setChType('all',this)">전체</button>
+          <button class="vk-chip" data-t="online" onclick="setChType('online',this)">온라인</button>
+          <button class="vk-chip" data-t="offline" onclick="setChType('offline',this)">오프라인</button>
+        </div>
+        <div id="chstock-count" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
+      </div>
+    </div>
+    <div id="chstock-summary" style="font-size:11px;color:var(--text-2);margin-bottom:6px"></div>
+    <div id="chstock-list" class="alert-list"><div class="loading" style="padding:20px">로딩 중...</div></div>
   </div>
   <div class="chart-panel vendor-panel">
     <div class="chart-head">
@@ -11940,7 +12386,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         <button class="vk-chip" data-g="G" onclick="rcGroup('G',this)">자사</button>
         <button class="vk-chip" data-g="HI" onclick="rcGroup('HI',this)">외주</button>
       </div>
-      <div class="rc-field"><label>수량</label><input id="rc-qty" type="number" min="1" value="1" style="width:90px;text-align:right" oninput="rcRun()"></div>
+      <div class="rc-field"><label>수량</label><input id="rc-qty" type="number" min="0" value="1" style="width:90px;text-align:right" oninput="rcQtyChange()" placeholder="수량"></div>
       <button class="rc-btn" onclick="rcRun()">계산</button>
       <button class="rc-btn ghost" onclick="rcCopy()" id="rc-copy" disabled>복사</button>
       <span id="rc-msg" style="font-size:11px;color:var(--text-3)"></span>
@@ -12192,7 +12638,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
 <section class="sales-npd-strip">
   <div class="chart-panel sales-panel">
     <div class="chart-head">
-      <div><span class="chart-title">💰 매출 현황</span><span class="chart-sub" style="color:#dc2626">Monday 월별 매출 추이 · 구분별 분석</span></div>
+      <div><span class="chart-title">💰 매출 현황</span><span class="chart-sub" style="color:#dc2626">온라인팀 판매자료 · 공급가 기준 월별 추이 · 채널별</span></div>
       <div style="display:flex;align-items:center;gap:8px">
         <div id="sales-kpi" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
         <div class="chart-nav">
@@ -12223,7 +12669,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
 <section class="salesbase-strip">
   <div class="chart-panel salesbase-panel">
     <div class="chart-head">
-      <div><span class="chart-title">🛍 월 매출·판매 추이</span><span class="chart-sub" style="color:#2f8576">일부 채널 · 공급가 기준 매출액(억)·수량 · 분류별 (전체 매출 아님)</span></div>
+      <div><span class="chart-title">🛍 월 매출·판매 추이</span><span class="chart-sub" style="color:#2f8576">온라인팀 판매자료 · 온라인+오프라인 · 공급가 기준 매출액(억)·수량 · 분류별</span></div>
       <div id="sb-kpi" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
     </div>
     <div class="salesbase-body">
@@ -12236,6 +12682,31 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         <div id="sb-top-list" class="sb-top-list"><div class="loading" style="padding:12px">로딩 중...</div></div>
       </div>
     </div>
+  </div>
+</section>
+
+<!-- 판매 분석 (2026-09-23): 납품 vs POS 괴리 · 채널 공급단가 변동 · 납품 요일 패턴 -->
+<section class="lens-strip">
+  <div class="chart-panel lens-gap">
+    <div class="chart-head">
+      <div><span class="chart-title">🔎 납품 vs 실판매(POS) 괴리</span><span class="chart-sub" id="gap-sub">최근 28일 · POS 보고 채널만 · 클릭=상세</span></div>
+      <div id="gap-count" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
+    </div>
+    <div id="gap-summary" style="font-size:11px;color:var(--text-2);margin-bottom:6px"></div>
+    <div id="gap-list" class="alert-list"><div class="loading" style="padding:20px">로딩 중...</div></div>
+  </div>
+  <div class="chart-panel lens-price">
+    <div class="chart-head">
+      <div><span class="chart-title">🏷 채널 공급단가 변동</span><span class="chart-sub">최근 6개월 · 3% 이상 · 월 영향액순 · 클릭=상세</span></div>
+      <div id="cpc-count" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
+    </div>
+    <div id="cpc-list" class="alert-list"><div class="loading" style="padding:20px">로딩 중...</div></div>
+  </div>
+  <div class="chart-panel lens-wd">
+    <div class="chart-head">
+      <div><span class="chart-title">📅 납품 요일 패턴</span><span class="chart-sub" id="wd-sub">최근 12주</span></div>
+    </div>
+    <div id="wd-body"><div class="loading" style="padding:20px">로딩 중...</div></div>
   </div>
 </section>
 
@@ -14008,7 +14479,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         return '<div class="alert-row" onclick="openItemModal(\\'' + a.code + '\\')">'
              + '<span class="alert-badge ' + a.level + '">' + labelMap[a.level] + '</span>'
              + '<div><div class="alert-name">' + escapeHtml(a.name) + vendorTxt + '</div>'
-             + '<div class="alert-code">' + escapeHtml(a.code) + ' · ' + (a.basis === 'sales' ? '월판매기반 ' : '월평균 ') + fmtInt(a.monthly_avg) + '</div></div>'
+             + '<div class="alert-code">' + escapeHtml(a.code) + ' · ' + (a.basis === 'sales' ? '판매속도 월환산 ' : '월평균 ') + fmtInt(a.monthly_avg) + '</div></div>'
              + '<div class="alert-qty">재고 ' + fmtInt(a.qty) + '</div>'
              + '<div class="alert-days ' + a.level + '">' + daysTxt + '</div>'
              + '</div>';
@@ -14057,7 +14528,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     try {
       const d = await (await fetch('/api/supply_plan')).json();
       _planItems = d.items || [];
-      _planMeta = { months: d.months || [], reason: d.reason || '' };
+      _planMeta = { months: d.months || [], reason: d.reason || '', basis: d.basis || '' };
       renderPlan();
     } catch (e) { list.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
   }
@@ -14070,8 +14541,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const s = { out: 0, critical: 0, warning: 0, low: 0, ok: 0 };
     matched.forEach(x => { if (x.level in s) s[x.level]++; });
     document.getElementById('plan-count').textContent = (q ? matched.length + '/' + _planItems.length : _planItems.length) + '품목';
-    document.getElementById('plan-summary').innerHTML = _planMeta.months.length
-      ? '기준 ' + _planMeta.months.slice().reverse().map(m => m.slice(2, 4) + '/' + m.slice(4)).join('·') + ' 판매 · '
+    document.getElementById('plan-summary').innerHTML = (_planMeta.months.length || _planMeta.basis)
+      ? (_planMeta.basis ? '기준 ' + escapeHtml(_planMeta.basis) + ' · '
+                         : '기준 ' + _planMeta.months.slice().reverse().map(m => m.slice(2, 4) + '/' + m.slice(4)).join('·') + ' 판매 · ')
         + (q ? '<span style="color:#0891b2;font-weight:700">검색 ' + matched.length + '건</span> · ' : '')
         + '<b style="color:#dc2626">품절 ' + s.out + '</b> · <b style="color:#ea580c">2주↓ ' + s.critical + '</b> · '
         + '<b style="color:#ca8a04">4주↓ ' + s.warning + '</b> · 8주↓ ' + s.low + ' · 여유 ' + s.ok
@@ -14085,9 +14557,116 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       return '<div class="alert-row" onclick="openItemModal(\\'' + x.code + '\\')">'
         + '<span class="alert-badge ' + cls + '">' + lb + '</span>'
         + '<div><div class="alert-name">' + escapeHtml(x.name || x.code) + '</div>'
-        + '<div class="alert-code">' + escapeHtml(x.code) + ' · ' + x.cls + ' · 월판매 ' + fmtInt(x.monthly) + tr + plus + '</div></div>'
-        + '<div class="alert-qty">재고 ' + fmtInt(x.stock) + '</div>'
+        + '<div class="alert-code">' + escapeHtml(x.code) + ' · ' + x.cls + ' · 월판매 ' + fmtInt(x.monthly) + tr + plus + '</div>'
+        + (x.ch_stock != null ? '<div class="alert-code" style="margin-top:1px">채널재고 ' + fmtInt(x.ch_stock) + ' → 채널 포함 <b>' + x.cov_ch_weeks + '주</b>'
+            + (x.ch_note ? ' <span class="ch-tag' + (x.ch_note === '채널 여유' ? ' on' : '') + '">' + x.ch_note + '</span>' : '') + '</div>' : '')
+        + '</div>'
+        + '<div class="alert-qty">창고 ' + fmtInt(x.stock) + '</div>'
         + '<div class="alert-days ' + cls + '">' + x.cov_weeks + '주</div></div>';
+    }).join('');
+  }
+
+  // ───── 판매 분석 3종 (2026-09-23) ─────
+  async function loadSalesGap() {
+    const list = document.getElementById('gap-list');
+    try {
+      const d = await (await fetch('/api/sales_gap')).json();
+      const items = (d.items || []).filter(x => x.level !== 'ok');
+      const s = d.summary || {};
+      document.getElementById('gap-count').textContent = items.length + '건';
+      if (d.from) document.getElementById('gap-sub').textContent = (d.from.slice(5) + '~' + d.to.slice(5)).split('-').join('/') + ' 28일 · POS 보고 채널만 · 클릭=상세';
+      document.getElementById('gap-summary').innerHTML = '<b style="color:#c2410c">납품 과다 ' + (s.over || 0) + '</b> (채널에 재고 쌓임 → 곧 발주 감소) · '
+        + '<b style="color:#1d4ed8">납품 부족 ' + (s.under || 0) + '</b> (채널 재고 소진 중 → 곧 추가 발주) · 정상 ' + (s.ok || 0);
+      if (!items.length) { list.innerHTML = '<div class="alert-empty">납품과 실판매가 비슷합니다 👍</div>'; return; }
+      list.innerHTML = items.slice(0, 40).map(x => {
+        const over = x.level === 'over';
+        const sc = x.stock_change == null ? '' : ' · 채널재고 ' + (x.stock_change >= 0 ? '+' : '') + fmtInt(x.stock_change);
+        return '<div class="alert-row" onclick="openItemModal(&quot;' + x.code + '&quot;)">'
+          + '<span class="alert-badge ' + (over ? 'warning' : 'low') + '" style="' + (over ? '' : 'background:#dbeafe;color:#1d4ed8') + '">' + (over ? '납품 과다' : '납품 부족') + '</span>'
+          + '<div><div class="alert-name">' + escapeHtml(x.name) + '</div>'
+          + '<div class="alert-code">' + escapeHtml(x.code) + ' · 납품 ' + fmtInt(x.delivery) + ' · POS ' + fmtInt(x.pos) + sc + ' · ' + escapeHtml(x.channels) + '</div></div>'
+          + '<div class="alert-qty"></div>'
+          + '<div class="alert-days" style="color:' + (over ? '#c2410c' : '#1d4ed8') + '">' + (x.ratio == null ? 'POS 0' : '×' + x.ratio) + '</div></div>';
+      }).join('');
+    } catch (e) { list.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
+  }
+  async function loadChannelPrice() {
+    const list = document.getElementById('cpc-list');
+    try {
+      const d = await (await fetch('/api/channel_price_changes')).json();
+      const items = d.items || [];
+      document.getElementById('cpc-count').textContent = items.length + '건';
+      if (!items.length) { list.innerHTML = '<div class="alert-empty">최근 6개월 공급단가 변동이 없습니다</div>'; return; }
+      list.innerHTML = items.slice(0, 40).map(x => {
+        const up = x.pct > 0;
+        const click = x.code ? ' onclick="openItemModal(&quot;' + x.code + '&quot;)"' : '';
+        return '<div class="alert-row"' + click + '>'
+          + '<span class="alert-badge ' + (up ? 'low' : 'out') + '">' + (up ? '▲' : '▼') + ' ' + Math.abs(x.pct) + '%</span>'
+          + '<div><div class="alert-name">' + escapeHtml(x.name) + '<span class="ch-tag">' + escapeHtml(x.channel_name) + '</span></div>'
+          + '<div class="alert-code">' + escapeHtml(x.code || ('SKU ' + x.sku)) + ' · ' + fmtInt(x.prev) + '원 → <b>' + fmtInt(x.cur) + '원</b> (' + escapeHtml(x.since.slice(5).replace('-', '/')) + '부터)</div></div>'
+          + '<div class="alert-qty">월 영향</div>'
+          + '<div class="alert-days" style="color:' + (x.impact >= 0 ? '#047857' : '#dc2626') + '">' + (x.impact >= 0 ? '+' : '−') + fmtEok(Math.abs(x.impact)) + '</div></div>';
+      }).join('');
+    } catch (e) { list.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
+  }
+  async function loadWeekday() {
+    const body = document.getElementById('wd-body');
+    try {
+      const d = await (await fetch('/api/delivery_weekday')).json();
+      const days = d.days || [];
+      if (!days.length) { body.innerHTML = '<div class="alert-empty">자료 없음</div>'; return; }
+      if (d.from) document.getElementById('wd-sub').textContent = '최근 12주 (' + d.from.slice(5).replace('-', '/') + '~' + d.to.slice(5).replace('-', '/') + ') · 납품수량';
+      const mx = Math.max(...days.map(x => x.qty), 1);
+      body.innerHTML = '<div style="display:flex;gap:10px;font-size:10.5px;color:var(--text-3);margin-bottom:6px">'
+        + '<span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#2563eb;margin-right:3px"></i>온라인</span>'
+        + '<span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#f59e0b;margin-right:3px"></i>오프라인</span></div>'
+        + days.map(x => '<div class="wd-row" title="' + escapeHtml(Object.entries(x.by_ch).map(([k, v]) => k + ' ' + v.toLocaleString()).join(' / ')) + '">'
+          + '<span style="font-weight:700;color:' + (x.wd === '일' ? '#dc2626' : (x.wd === '토' ? '#2563eb' : 'var(--text-1)')) + '">' + x.wd + '</span>'
+          + '<div class="wd-bar"><i style="width:' + (x.online / mx * 100) + '%;background:#2563eb"></i><i style="width:' + (x.offline / mx * 100) + '%;background:#f59e0b"></i></div>'
+          + '<span class="n">' + fmtInt(x.qty) + '</span><span class="p">' + x.share + '%</span></div>').join('')
+        + '<div style="font-size:10.5px;color:var(--text-3);margin-top:8px;line-height:1.5">막대에 마우스를 올리면 주요 채널(' + escapeHtml((d.channels || []).join(', ')) + ')별 수량이 보입니다.</div>';
+    } catch (e) { body.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
+  }
+
+  // ───── 채널 품절 경보 (2026-09-23) ─────
+  let _chItems = [], _chType = 'all', _chMeta = {};
+  const CH_LV = { out: ['품절', 'out'], critical: ['3일↓', 'critical'], warning: ['7일↓', 'warning'], ok: ['여유', 'low'] };
+  async function loadChStock() {
+    const list = document.getElementById('chstock-list');
+    try {
+      const d = await (await fetch('/api/channel_stock')).json();
+      _chItems = d.items || []; _chMeta = d;
+      renderChStock();
+    } catch (e) { list.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
+  }
+  function setChType(t, el) {
+    _chType = t;
+    document.querySelectorAll('.chstock-panel .vk-chip').forEach(b => b.classList.toggle('on', b === el));
+    renderChStock();
+  }
+  function renderChStock() {
+    const list = document.getElementById('chstock-list');
+    const items = _chItems.filter(x => _chType === 'all' || x.channel_type === _chType);
+    const s = { out: 0, critical: 0, warning: 0 };
+    items.forEach(x => { if (x.level in s) s[x.level]++; });
+    document.getElementById('chstock-count').textContent = items.length + '건';
+    document.getElementById('chstock-summary').innerHTML = _chMeta.reason ? escapeHtml(_chMeta.reason)
+      : ('재고 기준 ~' + escapeHtml((_chMeta.as_of || '').slice(5).replace('-', '/')) + ' · '
+        + '<b style="color:#dc2626">품절 ' + s.out + '</b> · <b style="color:#ea580c">3일↓ ' + s.critical + '</b> · '
+        + '<b style="color:#ca8a04">7일↓ ' + s.warning + '</b>');
+    if (!items.length) { list.innerHTML = '<div class="alert-empty">7일 안에 비는 채널 재고가 없습니다 👍</div>'; return; }
+    list.innerHTML = items.slice(0, 40).map(x => {
+      const [lb, cls] = CH_LV[x.level] || CH_LV.warning;
+      const dl = x.last_delivery ? ' · 최근납품 ' + x.last_delivery.slice(5).replace('-', '/') + ' ' + fmtInt(x.last_delivery_qty) : '';
+      const ours = (x.ours != null) ? ' · 우리재고 ' + fmtInt(x.ours) : '';
+      const stale = x.stale ? ' <span style="color:#94a3b8" title="최근 7일 재고값이 변하지 않음 — 채널 재고 스냅샷이 갱신되지 않았을 수 있음">(재고값 정체)</span>' : '';
+      const click = x.code ? ' onclick="openItemModal(\\'' + x.code + '\\')"' : '';
+      return '<div class="alert-row"' + click + '>'
+        + '<span class="alert-badge ' + cls + '">' + lb + '</span>'
+        + '<div><div class="alert-name">' + escapeHtml(x.name) + '<span class="ch-tag' + (x.channel_type === 'online' ? ' on' : '') + '">' + escapeHtml(x.channel_name) + '</span></div>'
+        + '<div class="alert-code">' + escapeHtml(x.code || ('SKU ' + x.sku)) + ' · POS 일 ' + x.pos_d + dl + ours + stale + '</div></div>'
+        + '<div class="alert-qty">채널재고 ' + fmtInt(x.stock) + '</div>'
+        + '<div class="alert-days ' + cls + '">' + x.cover + '일</div></div>';
     }).join('');
   }
 
@@ -15085,6 +15664,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   loadPriceChanges();
   loadNotifyBadge();
   loadPlan();
+  loadChStock();
+  loadSalesGap();
+  loadChannelPrice();
+  loadWeekday();
   loadVendors();
   loadPoInline();
   loadOsInline();
@@ -15181,64 +15764,82 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     }
     rcRun();
   }
+  // 수량 (2026-09-23): 비었거나 0 이하면 0 → 수량에 따라 달라지는 금액·총소요량은 비움.
+  // 금액은 수량에 정비례하므로 서버는 품번이 바뀔 때만 부르고, 수량 변경은 화면에서 바로 곱한다(늦게 온 이전 응답이 덮어쓰는 문제도 제거).
+  function _rcQtyNow() { const v = parseFloat(document.getElementById('rc-qty').value); return (isFinite(v) && v > 0) ? v : 0; }
+  function _rcCode() { const raw = document.getElementById('rc-q').value.trim(); return (raw.split(/[ \t]/)[0] || '').toUpperCase(); }
+  function rcQtyChange() {
+    if (_rcData && _rcData.code === _rcCode()) rcRender();   // 같은 품번 → 즉시 재계산
+    else rcRun();
+  }
+  let _rcSeq = 0;
   async function rcRun() {
     const raw = document.getElementById('rc-q').value.trim();
-    const code = (raw.split(/[ \t]/)[0] || '').toUpperCase();
-    const qty = parseFloat(document.getElementById('rc-qty').value) || 1;
+    const code = _rcCode();
     const msg = document.getElementById('rc-msg');
     if (!/^[A-Z][0-9]{3,}/.test(code)) { msg.textContent = raw ? '품번을 선택해 주세요' : ''; return; }
     msg.textContent = '계산 중...';
+    const seq = ++_rcSeq;
     try {
-      const r = await fetch('/api/return_cost?code=' + encodeURIComponent(code) + '&qty=' + qty);
+      const r = await fetch('/api/return_cost?code=' + encodeURIComponent(code) + '&qty=1');   // 1개 기준으로 받아 수량은 화면에서 곱함
       const d = await r.json();
-      if (!r.ok) { msg.textContent = d.error || '오류'; document.getElementById('rc-summary').style.display = 'none'; document.getElementById('rc-table').style.display = 'none'; return; }
+      if (seq !== _rcSeq) return;   // 더 최근 요청이 있으면 버림
+      if (!r.ok) { msg.textContent = d.error || '오류'; document.getElementById('rc-summary').style.display = 'none'; document.getElementById('rc-table').style.display = 'none'; _rcData = null; return; }
       _rcData = d; _rcOff = new Set(d.lines.filter(x => x.grp === '기타').map(x => x.code));
       msg.textContent = '';
       rcRender();
-    } catch (e) { msg.textContent = '오류: ' + e.message; }
+    } catch (e) { if (seq === _rcSeq) msg.textContent = '오류: ' + e.message; }
   }
   function rcToggle(code) { if (_rcOff.has(code)) _rcOff.delete(code); else _rcOff.add(code); rcRender(); }
+  // 1개 기준 금액·소요량 (서버 응답 qty로 나눠 정규화)
+  const _rcUnitAmt = x => (x.unit_amount != null ? x.unit_amount : x.amount / (_rcData.qty || 1));
+  const _rcUnitTot = x => (x.unit_qty != null ? x.unit_qty : x.total_qty / (_rcData.qty || 1));
   function rcRender() {
     const d = _rcData; if (!d) return;
+    const q = _rcQtyNow();
     const on = d.lines.filter(x => !_rcOff.has(x.code));
-    const sum = g => on.filter(x => x.grp === g).reduce((a, x) => a + x.amount, 0);
-    const raw = sum('원재료'), sub = sum('부재료'), etc = sum('기타'), tot = raw + sub + etc;
-    const unit = tot / d.qty;
+    const usum = g => on.filter(x => x.grp === g).reduce((a, x) => a + _rcUnitAmt(x), 0);   // 1개 기준
+    const uraw = usum('원재료'), usub = usum('부재료'), uetc = usum('기타'), unit = uraw + usub + uetc;
+    const raw = uraw * q, sub = usub * q, etc = uetc * q, tot = unit * q;
+    const won = v => q ? _rcFmt(v) + '원' : '-';
     const ratio = d.sale_price > 0 ? (unit / d.sale_price * 100).toFixed(1) + '%' : '-';
     const kindTxt = d.bom_kind && d.bom_kind !== '일반' ? ' · ' + d.bom_kind + 'BOM' + (d.bom_vendor ? '(' + d.bom_vendor + ')' : '') : '';
     document.getElementById('rc-count').textContent = escapeHtml(d.code) + ' · ' + (d.name || '') + ' · 자재 ' + d.lines.length + '종' + kindTxt + (d.missing ? ' · 단가없음 ' + d.missing : '');
     const S = document.getElementById('rc-summary');
     S.style.display = 'grid';
-    S.innerHTML = '<div class="rc-card raw"><div class="k">원재료</div><div class="v">' + _rcFmt(raw) + '원</div><div class="s">' + on.filter(x => x.grp === '원재료').length + '종</div></div>'
-      + '<div class="rc-card sub"><div class="k">부재료</div><div class="v">' + _rcFmt(sub) + '원</div><div class="s">' + on.filter(x => x.grp === '부재료').length + '종</div></div>'
-      + '<div class="rc-card tot"><div class="k">합계 (' + _rcQty(d.qty) + '개)</div><div class="v">' + _rcFmt(tot) + '원</div><div class="s">' + (etc ? '기타 ' + _rcFmt(etc) + '원 포함' : '체크 해제 항목 제외') + '</div></div>'
-      + '<div class="rc-card"><div class="k">개당 자재원가</div><div class="v">' + _rcFmt(unit) + '원</div><div class="s">원재료 ' + _rcFmt(raw / d.qty) + ' + 부재료 ' + _rcFmt(sub / d.qty) + '</div></div>'
+    const noq = '<div class="s" style="color:#b45309">수량을 입력하세요</div>';
+    S.innerHTML = '<div class="rc-card raw"><div class="k">원재료</div><div class="v">' + won(raw) + '</div>' + (q ? '<div class="s">' + on.filter(x => x.grp === '원재료').length + '종</div>' : noq) + '</div>'
+      + '<div class="rc-card sub"><div class="k">부재료</div><div class="v">' + won(sub) + '</div>' + (q ? '<div class="s">' + on.filter(x => x.grp === '부재료').length + '종</div>' : noq) + '</div>'
+      + '<div class="rc-card tot"><div class="k">합계' + (q ? ' (' + _rcQty(q) + '개)' : '') + '</div><div class="v">' + won(tot) + '</div>' + (q ? '<div class="s">' + (etc ? '기타 ' + _rcFmt(etc) + '원 포함' : '체크 해제 항목 제외') + '</div>' : noq) + '</div>'
+      + '<div class="rc-card"><div class="k">개당 자재원가</div><div class="v">' + _rcFmt(unit) + '원</div><div class="s">원재료 ' + _rcFmt(uraw) + ' + 부재료 ' + _rcFmt(usub) + '</div></div>'
       + '<div class="rc-card"><div class="k">판매단가 대비</div><div class="v">' + ratio + '</div><div class="s">' + (d.sale_price > 0 ? '판매단가 ' + _rcFmt(d.sale_price) + '원' : '판매단가 없음') + '</div></div>';
     const src = s => s.startsWith('발주') ? 'po' : s === '단가표' ? 'tbl' : s === 'BOM' ? 'bom' : 'none';
     let html = '<table><thead><tr><th></th><th>품번</th><th>품명</th><th>구분</th><th class="num">개당 소요</th><th class="num">총 소요량</th><th>단위</th><th class="num">단가</th><th>단가 출처</th><th class="num">금액</th></tr></thead><tbody>';
     ['원재료', '부재료', '기타'].forEach(g => {
       const rows = d.lines.filter(x => x.grp === g); if (!rows.length) return;
-      html += '<tr class="grp"><td colspan="9">' + g + ' · ' + rows.length + '종</td><td class="num">' + _rcFmt(sum(g)) + '원</td></tr>';
+      html += '<tr class="grp"><td colspan="9">' + g + ' · ' + rows.length + '종</td><td class="num">' + won(usum(g) * q) + '</td></tr>';
       rows.forEach(x => {
         const off = _rcOff.has(x.code);
         html += '<tr class="' + (off ? 'off' : '') + '"><td><input type="checkbox" ' + (off ? '' : 'checked') + ' onchange="rcToggle(&quot;' + x.code + '&quot;)"></td>'
           + '<td class="code" onclick="openItemModal(&quot;' + x.code + '&quot;)">' + escapeHtml(x.code) + '</td><td>' + escapeHtml(x.name) + '</td><td style="font-size:11px;color:#64748b">' + escapeHtml(x.cls || '') + '</td>'
-          + '<td class="num">' + _rcQty(x.per_unit) + '</td><td class="num"><b>' + _rcQty(x.total_qty) + '</b></td><td>' + escapeHtml(x.unit) + '</td>'
+          + '<td class="num">' + _rcQty(x.per_unit) + '</td><td class="num"><b>' + (q ? _rcQty(_rcUnitTot(x) * q) : '-') + '</b></td><td>' + escapeHtml(x.unit) + '</td>'
           + '<td class="num">' + (x.price ? _rcFmt(x.price) : '-') + '</td><td><span class="rc-src ' + src(x.price_src) + '">' + escapeHtml(x.price_src) + '</span></td>'
-          + '<td class="num"><b>' + _rcFmt(x.amount) + '</b></td></tr>';
+          + '<td class="num"><b>' + (q ? _rcFmt(_rcUnitAmt(x) * q) : '-') + '</b></td></tr>';
       });
     });
     html += '</tbody></table>';
     const T = document.getElementById('rc-table'); T.style.display = 'block'; T.innerHTML = html;
-    document.getElementById('rc-copy').disabled = false;
+    document.getElementById('rc-copy').disabled = !q;
   }
   function rcCopy() {
     const d = _rcData; if (!d) return;
+    const q = _rcQtyNow();
+    if (!q) { document.getElementById('rc-msg').textContent = '수량을 입력하세요'; return; }
     const on = d.lines.filter(x => !_rcOff.has(x.code));
     const TAB = String.fromCharCode(9), NL = String.fromCharCode(10);   // 파이썬 문자열 안이라 탭/줄바꿈 이스케이프를 직접 쓰면 깨짐
     const lines = [['품번', '품명', '구분', '개당소요', '총소요량', '단위', '단가', '출처', '금액'].join(TAB)];
-    on.forEach(x => lines.push([x.code, x.name, x.grp, x.per_unit, x.total_qty, x.unit, x.price, x.price_src, x.amount].join(TAB)));
-    lines.push(['합계', d.code + ' × ' + d.qty, '', '', '', '', '', '', on.reduce((a, x) => a + x.amount, 0)].join(TAB));
+    on.forEach(x => lines.push([x.code, x.name, x.grp, x.per_unit, Math.round(_rcUnitTot(x) * q * 100) / 100, x.unit, x.price, x.price_src, Math.round(_rcUnitAmt(x) * q)].join(TAB)));
+    lines.push(['합계', d.code + ' × ' + q, '', '', '', '', '', '', Math.round(on.reduce((a, x) => a + _rcUnitAmt(x), 0) * q)].join(TAB));
     navigator.clipboard.writeText(lines.join(NL)).then(() => { const m = document.getElementById('rc-msg'); m.textContent = '복사됨 (엑셀에 붙여넣기)'; setTimeout(() => m.textContent = '', 2000); });
   }
 
@@ -15258,12 +15859,12 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     }
   }
   function initCollapsibles() {
-    const map = [['.chart-grid', 'sec-alerts'], ['.spec-strip', 'sec-spec'], ['.return-strip', 'sec-return'], ['.ipsu-strip', 'sec-ipsu'], ['.sales-npd-strip', 'sec-sales'], ['.salesbase-strip', 'sec-salesbase'], ['.cal-strip', 'sec-cal']];
+    const map = [['.chart-grid', 'sec-alerts'], ['.spec-strip', 'sec-spec'], ['.return-strip', 'sec-return'], ['.ipsu-strip', 'sec-ipsu'], ['.sales-npd-strip', 'sec-sales'], ['.salesbase-strip', 'sec-salesbase'], ['.lens-strip', 'sec-lens'], ['.cal-strip', 'sec-cal']];
     map.forEach(([sel, id]) => { const s = document.querySelector('section' + sel); if (s && !s.id) s.id = id; });
     // 그리드 내부 앵커 (내비용)
     const pr = document.querySelector('.price-span'); if (pr) pr.id = pr.id || 'sec-price';
     const pl = document.querySelector('.plan-panel'); if (pl) pl.id = pl.id || 'sec-plan';
-    ['sec-spec', 'sec-return', 'sec-ipsu', 'sec-sales', 'sec-salesbase'].forEach(id => {
+    ['sec-spec', 'sec-return', 'sec-ipsu', 'sec-sales', 'sec-salesbase', 'sec-lens'].forEach(id => {
       const sec = document.getElementById(id); if (!sec) return;
       const head = sec.querySelector('.chart-head'); if (!head) return;
       const b = document.createElement('button'); b.className = 'col-btn'; b.type = 'button';
@@ -15308,6 +15909,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   let _salesAll = [];      // 전체 월별 [{ym, amount}]
   let _salesDivMap = {};   // {ym: [{div, amount}]}
   let _salesOffset = 0;    // 0=최신, +면 과거로
+  let _salesCurMonth = '', _salesAsOf = '';
   function fmtEok(v) {
     if (v >= 1e8) return (v/1e8).toFixed(1) + '억';
     if (v >= 1e4) return Math.round(v/1e4) + '만';
@@ -15319,6 +15921,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       const d = await res.json();
       _salesAll = d.monthly || [];
       _salesDivMap = d.div_map || {};
+      _salesCurMonth = d.current_month || ''; _salesAsOf = d.as_of || '';
       _salesOffset = 0;
       renderSalesWindow();
     } catch (e) {
@@ -15352,7 +15955,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         const c = mom >= 0 ? '#dc2626' : '#2563eb';
         momHtml = ' <span style="color:' + c + '">' + (mom>=0?'▲':'▼') + Math.abs(mom).toFixed(1) + '%</span>';
       }
-      kpiEl.innerHTML = last.ym + ' <b style="color:#0369a1">' + fmtEok(last.amount) + '</b>' + momHtml;
+      const partial = (last.ym === _salesCurMonth);
+      if (partial) momHtml = '';   // 진행 중인 달은 전월 대비가 의미 없음
+      kpiEl.innerHTML = last.ym + (partial ? ' <span style="color:#b45309">(~' + escapeHtml(_salesAsOf.slice(5).replace('-', '/')) + ' 진행중)</span>' : '')
+        + ' <b style="color:#0369a1">' + fmtEok(last.amount) + '</b>' + momHtml;
     }
     // 구분별 (윈도우 마지막 월)
     const divEl = document.getElementById('sales-div-list');
@@ -15622,12 +16228,12 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     document.getElementById('cd-badge').textContent = '매출';
     document.getElementById('cd-badge').style.background = 'linear-gradient(135deg,#0ea5e9,#38bdf8)';
     document.getElementById('cd-title').textContent = ym + ' 매출 TOP 10';
-    document.getElementById('cd-sub').textContent = '거래처별 매출 (Monday 매출 현황)';
+    document.getElementById('cd-sub').textContent = '상품별 매출 (온라인팀 판매자료 · 공급가)';
     const body = document.getElementById('cd-body');
     body.innerHTML = '<div class="loading" style="padding:24px">로딩 중...</div>';
     try {
       const d = await (await fetch('/api/sales_detail?ym=' + encodeURIComponent(ym))).json();
-      document.getElementById('cd-sub').textContent = '거래처별 매출 · 전체 ' + fmtEok(d.total) + ' (' + d.count + '건)';
+      document.getElementById('cd-sub').textContent = '상품별 매출 (공급가) · 전체 ' + fmtEok(d.total) + ' (' + d.count + '품목)';
       body.innerHTML = _cdRows(d.items, d.total, '#0369a1');
     } catch (e) { body.innerHTML = '<div style="color:#ef4444;padding:16px">오류: ' + escapeHtml(e.message) + '</div>'; }
   }
