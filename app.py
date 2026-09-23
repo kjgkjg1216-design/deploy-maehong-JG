@@ -7827,7 +7827,15 @@ def _notify_snapshot():
         print(f'[알림] 상품매입 스냅샷 오류: {e!r:.120}')
     with app.test_request_context('/api/data_health'):
         health = api_data_health().get_json()
-    return {'out': out, 'now': now_items, 'health': health}
+    # 채널(쿠팡 센터·마트 매장) 품절·3일 미만 (2026-09-23) — 재고값이 멈춘(stale) 채널은 신뢰 낮아 제외
+    ch = []
+    try:
+        with app.test_request_context('/api/channel_stock'):
+            cs = api_channel_stock().get_json() or {}
+        ch = [x for x in cs.get('items', []) if x['level'] in ('out', 'critical') and not x.get('stale')]
+    except Exception as e:
+        print(f'[알림] 채널 재고 스냅샷 오류: {e!r:.120}')
+    return {'out': out, 'now': now_items, 'health': health, 'ch': ch}
 
 
 def _notify_check(force_daily=False):
@@ -7851,6 +7859,25 @@ def _notify_check(force_daily=False):
             made.append(_notify('warn', 'reorder', f'🕐 지금 발주 진입 {len(new_now)}건', body, st))
         st['now'] = [sc(x) for x in snap['now']]
 
+        # 채널 품절·임박: 같은 채널·SKU는 7일에 한 번만 (재고가 매일 오르내려 들락날락하므로)
+        _today = datetime.now().strftime('%Y-%m-%d')
+        _cut = (datetime.now() - _timedelta(days=7)).strftime('%Y-%m-%d')
+        seen = {k: v for k, v in (st.get('ch_seen') or {}).items() if v >= (datetime.now() - _timedelta(days=14)).strftime('%Y-%m-%d')}
+        chk = lambda x: f"c:{x['channel']}:{x['sku']}"
+        new_ch = [x for x in snap.get('ch', []) if seen.get(chk(x), '') < _cut]
+        if new_ch and st.get('ch_seen') is not None:
+            new_ch.sort(key=lambda x: (x['level'] != 'out', -x['pos_d']))
+            body = '\n'.join(f"· {x['channel_name']} {x['code'] or x['sku']} {x['name'][:30]} — "
+                             + (f"재고 0 (하루 {x['pos_d']:.0f}개 팔림)" if x['level'] == 'out' else f"재고 {x['stock']:,} · {x['cover']:.1f}일분")
+                             for x in new_ch[:15])
+            n_out = sum(1 for x in new_ch if x['level'] == 'out')
+            made.append(_notify('warn', 'chstock', f'🏪 채널 품절 {n_out}건 · 3일 내 {len(new_ch) - n_out}건', body
+                                + '\n대시보드 → 채널 품절 경보 패널에서 납품 일정 확인', st))
+        for x in snap.get('ch', []):
+            if seen.get(chk(x), '') < _cut:
+                seen[chk(x)] = _today
+        st['ch_seen'] = seen
+
         h = snap['health']
         bad = [x['label'] for x in h.get('items', []) if x['status'] in ('error', 'warn')]
         if bad and bad != st.get('health_bad', []):
@@ -7865,6 +7892,9 @@ def _notify_check(force_daily=False):
                            and st.get('last_daily') != today):
             body = (f"품절 {len(snap['out'])}건 · 지금 발주 {len(snap['now'])}건 · 데이터 {h['summary']}\n"
                     + ('\n'.join(f"· {x['code']} {x['name']}" for x in snap['out'][:8]) if snap['out'] else '품절 없음 👍'))
+            _cho = sum(1 for x in snap.get('ch', []) if x['level'] == 'out')
+            if snap.get('ch'):
+                body += f"\n채널 품절 {_cho}건 · 3일 내 {len(snap['ch']) - _cho}건 (쿠팡 센터·마트 매장)"
             # 거래처 포털 입력 현황 (2026-09-17): 요약에 한 줄 + 입력하던 거래처가 영업일 3일 이상 끊기면 별도 경고
             try:
                 vs = _vendor_idle_status()
@@ -8872,6 +8902,13 @@ def api_kpi_summary():
     sp = _call(api_supply_plan, '/api/supply_plan')
     s = sp.get('summary', {}) or {}
     out['supply'] = {'out': s.get('out', 0), 'critical': s.get('critical', 0), 'warning': s.get('warning', 0)}
+    # 채널 재고 (쿠팡 센터·마트 매장) — 재고값 멈춘(stale) 채널은 참고로만 따로 셈
+    cs = _call(api_channel_stock, '/api/channel_stock')
+    ci = cs.get('items', [])
+    out['channel'] = {'out': sum(1 for x in ci if x['level'] == 'out' and not x.get('stale')),
+                      'critical': sum(1 for x in ci if x['level'] == 'critical' and not x.get('stale')),
+                      'warning': sum(1 for x in ci if x['level'] == 'warning' and not x.get('stale')),
+                      'stale': sum(1 for x in ci if x.get('stale')), 'as_of': cs.get('as_of', '')}
     # 데이터 건강
     dh = _call(api_data_health, '/api/data_health')
     out['health'] = {'overall': dh.get('overall', ''), 'summary': dh.get('summary', '')}
@@ -10902,8 +10939,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .vk-tag.both { background:linear-gradient(90deg,#ede9fe,#ffedd5); color:#7c3aed; }
 
   /* ── KPI 요약 띠 ── */
-  .kpi-strip { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:12px; margin:16px 24px 4px; }
-  .kpi-tile { position:relative; display:flex; align-items:center; gap:12px; min-width:0; cursor:pointer;
+  .kpi-strip { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:12px; margin:16px 24px 4px; }
+  .kpi-tile { position:relative; display:flex; align-items:center; gap:10px; min-width:0; cursor:pointer;
     background:#fff; border:1px solid #e6e9f0; border-radius:14px; padding:13px 14px 12px 14px; overflow:hidden;
     box-shadow:0 1px 2px rgba(15,23,42,.04); transition:transform .14s, box-shadow .14s; }
   .kpi-tile::before { content:''; position:absolute; left:0; top:0; right:0; height:3px; background:var(--kpi-bar,#94a3b8); }
@@ -10918,7 +10955,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .kpi-tile.lv-warn { --kpi-bar:linear-gradient(90deg,#d97706,#fbbf24); --kpi-soft:#fff7e6; --kpi-fg:#b45309; border-color:#f3e2b8; background:linear-gradient(180deg,#fff 0%,#fffbf2 100%); }
   .kpi-tile.lv-bad  { --kpi-bar:linear-gradient(90deg,#dc2626,#f87171); --kpi-soft:#fef1f1; --kpi-fg:#b91c1c; border-color:#f5cfcf; background:linear-gradient(180deg,#fff 0%,#fff7f7 100%); }
   .kpi-tile.lv-info { --kpi-bar:linear-gradient(90deg,#0891b2,#22d3ee); --kpi-soft:#ecfbfe; --kpi-fg:#0e7490; border-color:#c6ecf3; background:linear-gradient(180deg,#fff 0%,#f4fcfe 100%); }
-  @media (max-width:1300px) { .kpi-strip { grid-template-columns:repeat(3,minmax(0,1fr)); } }
+  @media (max-width:1300px) { .kpi-strip { grid-template-columns:repeat(4,minmax(0,1fr)); } }
   @media (max-width:900px) { .kpi-strip { grid-template-columns:repeat(2,minmax(0,1fr)); margin:10px 12px 0; gap:8px; }
     .kpi-tile { padding:10px 11px; gap:9px; } .kpi-tile .kpi-ic { flex-basis:32px; width:32px; height:32px; font-size:15px; border-radius:9px; } .kpi-tile .kpi-v { font-size:20px; } }
 
@@ -12217,6 +12254,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   <div class="kpi-tile" data-go=".reorder-panel" id="kpi-reorder"><div class="kpi-ic">🛒</div><div class="kpi-body"><div class="kpi-v">–</div><div class="kpi-l">지금 발주</div><div class="kpi-s"></div></div></div>
   <div class="kpi-tile" data-go=".po-inline" id="kpi-incoming"><div class="kpi-ic">🚚</div><div class="kpi-body"><div class="kpi-v">–</div><div class="kpi-l">입고 미정</div><div class="kpi-s"></div></div></div>
   <div class="kpi-tile" data-go=".plan-panel" id="kpi-supply"><div class="kpi-ic">🏭</div><div class="kpi-body"><div class="kpi-v">–</div><div class="kpi-l">완제품 품절·2주↓</div><div class="kpi-s"></div></div></div>
+  <div class="kpi-tile" data-go=".chstock-panel" id="kpi-channel"><div class="kpi-ic">🏪</div><div class="kpi-body"><div class="kpi-v">–</div><div class="kpi-l">채널 품절</div><div class="kpi-s"></div></div></div>
   <div class="kpi-tile" data-go=".price-span" id="kpi-price"><div class="kpi-ic">📈</div><div class="kpi-body"><div class="kpi-v">–</div><div class="kpi-l">단가 변동</div><div class="kpi-s"></div></div></div>
   <div class="kpi-tile" data-go="health" id="kpi-health"><div class="kpi-ic">🩺</div><div class="kpi-body"><div class="kpi-v">–</div><div class="kpi-l">데이터 상태</div><div class="kpi-s"></div></div></div>
 </section>
@@ -15712,6 +15750,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       set('kpi-reorder', ro.now || 0, '이번주 ' + (ro.soon || 0) + '건', ro.now > 0 ? 'bad' : (ro.soon > 0 ? 'warn' : 'ok'));
       set('kpi-incoming', inc.unknown || 0, '전체 ' + (inc.total || 0) + ' · 7일내 ' + (inc.week || 0) + (inc.overdue ? ' · 지연 ' + inc.overdue : ''), inc.overdue > 0 ? 'bad' : (inc.unknown > 0 ? 'warn' : 'ok'));
       set('kpi-supply', (su.out || 0) + (su.critical || 0), '품절 ' + (su.out || 0) + ' · 2주↓ ' + (su.critical || 0) + ' · 4주↓ ' + (su.warning || 0), su.out > 0 ? 'bad' : (su.critical > 0 ? 'warn' : 'ok'));
+      const ch = d.channel || {};
+      set('kpi-channel', ch.out || 0, '3일↓ ' + (ch.critical || 0) + ' · 7일↓ ' + (ch.warning || 0), ch.out > 0 ? 'bad' : (ch.critical > 0 ? 'warn' : 'ok'));
+      const kc = document.getElementById('kpi-channel');
+      if (kc) kc.title = '쿠팡 센터·마트 매장 재고 기준' + (ch.as_of ? ' (' + ch.as_of + ')' : '') + (ch.stale ? ' · 재고값이 멈춘 채널 ' + ch.stale + '건은 제외' : '');
       set('kpi-price', pr.total || 0, '인상 ' + (pr.up || 0) + ' · 인하 ' + ((pr.total || 0) - (pr.up || 0)) + ' (6개월)', pr.up > 0 ? 'warn' : 'info');
       const hv = he.overall === 'ok' ? '정상' : (he.overall === 'warn' ? '확인' : (he.overall === 'error' ? '이상' : '–'));
       set('kpi-health', hv, (he.summary || '') + (d.at ? ' · ' + d.at : ''), he.overall === 'ok' ? 'ok' : (he.overall === 'warn' ? 'warn' : (he.overall ? 'bad' : 'info')));
