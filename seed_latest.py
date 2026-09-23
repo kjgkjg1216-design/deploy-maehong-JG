@@ -14,7 +14,7 @@ PATTERNS = [
     '*_재고일지.csv', '*_단가.csv', '*_부자재규격.csv', '*_자사재고.csv',
     '*_발주정보.csv', '*_외주발주정보.csv', '*_생산실적.csv', '*_출하정보.csv',
     '*_출고정보.csv', '*_BOM.csv', '*_입고정보.csv', '*_현재고.csv',
-    '*_생산지시.csv', '*_monday.csv', '*_판매단가.csv',
+    '*_생산지시.csv', '*_monday.csv', '*_판매단가.csv', '*_판매일별.csv',
 ]
 
 def main():

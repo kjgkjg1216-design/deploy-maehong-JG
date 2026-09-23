@@ -69,7 +69,7 @@ client = OpenAI(
 import secrets as _secrets
 import requests as _oauth_req
 from urllib.parse import urlencode as _urlencode
-from flask import session, redirect
+from flask import session, redirect, Response
 
 app.secret_key = os.environ.get('FLASK_SECRET', 'maehong-dev-secret-change-me-please')
 from datetime import timedelta as _timedelta
@@ -727,8 +727,58 @@ BOM_DF = load_bom_data()
 RCV_DF = load_rcv_data()
 STOCK_DF = load_stock_data()
 
+SALES_SOURCE = {'kind': '', 'file': '', 'unmapped': []}   # 판매 자료 출처 (건강검진·패널 표기용)
+
+
+def _load_sales_from_daily():
+    """온라인팀 파트너 API 일자별 자료(data/*_판매일별.csv, fetch_partner_sales.py) → 월별 판매 집계 (2026-09-23).
+    - 수량 = delivery_qty(납품, 낱개 판매단위 — 기존 CSV의 판매박스수×박스당입수와 같은 단위, 7월 대조 확인)
+    - 품번 = SKU매핑_확정.csv에 있는 SKU는 검증된 확정품번×환산계수(세트→단품 환산·곤약밥 신품번 등) 우선,
+             없으면 API의 self_code(아마란스 품번) 그대로 (오프라인 EAN·신규 SKU 자동 편입)
+    - 매출액 = supply_amount(공급가 합계, VAT 제외) — 온라인+오프라인 전 채널
+    반환 DF [ym, code, ea, prefix, amt, pcls, ch] 또는 None."""
+    files = sorted(glob.glob(f'{DATA_DIR}/*_판매일별.csv'))
+    if not files:
+        return None
+    d = pd.read_csv(files[-1], dtype=str, encoding='utf-8-sig').fillna('')
+    d['dq'] = pd.to_numeric(d['delivery_qty'], errors='coerce').fillna(0)
+    d = d[d['dq'] > 0].copy()
+    if d.empty:
+        return None
+    mp = pd.DataFrame(columns=['SKU', '확정품번', '환산계수', '패널분류'])
+    mfile = f'{BASE_DIR}/SKU매핑_확정.csv'
+    if os.path.exists(mfile):
+        mp = pd.read_csv(mfile, dtype=str, encoding='utf-8-sig').fillna('')
+    mp = mp.drop_duplicates('SKU').set_index('SKU')
+    sku = d['sku'].astype(str).str.strip()
+    mcode = sku.map(mp['확정품번']).fillna('').str.strip().str.upper()
+    selfc = d['self_code'].astype(str).str.strip().str.upper()
+    selfc = selfc.where(selfc.str.match(r'^[A-Z]\d{4}$'), '')
+    d['code'] = mcode.where(mcode != '', selfc)
+    f = pd.to_numeric(sku.map(mp['환산계수']), errors='coerce')
+    d['f'] = f.where(mcode != '', 1.0).fillna(1.0)
+    SALES_SOURCE['unmapped'] = (d[d['code'] == ''].groupby(['sku', 'name'])['dq'].sum()
+                                .reset_index().sort_values('dq', ascending=False)
+                                .rename(columns={'sku': 'SKU', 'name': '판매제품명', 'dq': '납품수량'}).to_dict('records'))
+    d = d[d['code'] != ''].copy()
+    d['ea'] = d['dq'] * d['f']
+    d['amt'] = pd.to_numeric(d['supply_amount'], errors='coerce').fillna(0)
+    d['ym'] = d['date'].astype(str).str.replace('-', '').str[:6]
+    d['prefix'] = d['code'].str[:1]
+    _pfx = {'G': '자사', 'H': '유상사급', 'I': '상품매입'}
+    d['pcls'] = sku.loc[d.index].map(mp['패널분류']).fillna('').str.strip() if '패널분류' in mp.columns else ''
+    d.loc[d['pcls'] == '', 'pcls'] = d.loc[d['pcls'] == '', 'prefix'].map(_pfx).fillna('기타')
+    d['ch'] = d['channel_type'].astype(str)
+    out = (d.groupby(['ym', 'code', 'prefix', 'pcls', 'ch'], as_index=False)[['ea', 'amt']].sum())
+    SALES_SOURCE.update(kind='api', file=os.path.basename(files[-1]))
+    print(f"[판매데이터 로드] API 일자별 {os.path.basename(files[-1])} - {len(d)}행 -> {out['code'].nunique()}품번, "
+          f"{out['ym'].min()}~{out['ym'].max()}, 미매핑 SKU {len(SALES_SOURCE['unmapped'])}")
+    return out[['ym', 'code', 'ea', 'prefix', 'amt', 'pcls', 'ch']].reset_index(drop=True)
+
+
 def load_sales_data():
-    """월간 판매수량(+공급가) + SKU매핑 → 완제품 판매 집계.
+    """판매 집계 — ① 파트너 API 일자별 자료(있으면 우선, _load_sales_from_daily) ② 없으면 아래 월간 CSV.
+    월간 판매수량(+공급가) + SKU매핑 → 완제품 판매 집계.
     - 판매 CSV: '*판매수량*.csv'∪'*공급가*.csv' 중 **수정시각 최신** 파일
       (이름 우선이면 공급가 없는 새 달 파일이 옛 공급가 파일에 가려짐)
     - 최신 파일에 공급가 컬럼이 없으면, 공급가 있는 최신 파일에서 SKU별 최근 공급가를 보완
@@ -736,6 +786,13 @@ def load_sales_data():
     - 낱개 = 판매박스수 × 박스당입수 × 환산계수
     - 매출액(amt) = 낱개 × 공급가 (공급가=낱개당 공급단가, 컬럼 있을 때만)
     반환 DF: [ym, code, ea, prefix, amt]. amt는 공급가 없으면 0. 없으면 None."""
+    try:
+        api_df = _load_sales_from_daily()
+        if api_df is not None and not api_df.empty:
+            return api_df
+    except Exception as e:
+        print(f'[판매데이터] API 일자별 로드 실패 -> 월간 CSV로 대체: {e!r:.150}')
+    SALES_SOURCE.update(kind='csv', file='', unmapped=[])
     sfiles = sorted(set(glob.glob(f'{BASE_DIR}/*판매수량*.csv'))
                     | set(glob.glob(f'{BASE_DIR}/*공급가*.csv')),
                     key=os.path.getmtime)
@@ -784,6 +841,7 @@ def load_sales_data():
             s['pcls'] = ''
         s.loc[s['pcls'] == '', 'pcls'] = s.loc[s['pcls'] == '', 'prefix'].map(_pfx).fillna('기타')
         has_amt = (s['amt'] > 0).any()
+        SALES_SOURCE['file'] = os.path.basename(sfiles[-1])
         print(f"[판매데이터 로드] {os.path.basename(sfiles[-1])} - {len(s)}행, {s['code'].nunique()}품번"
               + (", 매출액 포함" if has_amt else ""))
         return s[['ym', 'code', 'ea', 'prefix', 'amt', 'pcls']].reset_index(drop=True)
@@ -810,9 +868,238 @@ def _sales_latest_file():
     return fs[-1] if fs else None
 
 
+_SKU_DECIDED_PREFIX = ('사용자확정', '수정(', '품번변경')
+
+
+def _sku_review_data():
+    """판매 SKU 품번 정리 대상 (2026-09-23, /sku_review 화면용).
+    ① mismatch: SKU매핑_확정의 확정품번 ≠ 판매 API self_code 이고 아직 결정 안 된 것
+       (결정됨 = 판정이 '사용자확정/수정(/품번변경'으로 시작, 또는 환산계수≠1 세트 환산)
+    ② unmapped: 매핑표에도 없고 API self_code도 없는 SKU
+    반환 {pending:[...], done:[...], codes:[{code,name,stock}], editable}"""
+    files = sorted(glob.glob(f'{DATA_DIR}/*_판매일별.csv'))
+    mfile = f'{BASE_DIR}/SKU매핑_확정.csv'
+    out = {'pending': [], 'done': [], 'codes': [], 'editable': os.path.exists('C:/Users/jgkim/OneDrive')}
+    if not files or not os.path.exists(mfile):
+        return out
+    d = pd.read_csv(files[-1], dtype=str, encoding='utf-8-sig').fillna('')
+    d['dq'] = pd.to_numeric(d['delivery_qty'], errors='coerce').fillna(0)
+    cut3 = (datetime.now() - _timedelta(days=92)).strftime('%Y-%m-%d')
+    g = d.groupby('sku').agg(api_code=('self_code', lambda s: next((x for x in s if x), '')),
+                             api_name=('name', 'first'), ch=('channel_name', lambda s: ', '.join(sorted(set(s))[:3])),
+                             total=('dq', 'sum'), last=('date', lambda s: max(s))).reset_index()
+    r3 = d[d['date'] >= cut3].groupby('sku')['dq'].sum()
+    g['recent3'] = g['sku'].map(r3).fillna(0)
+    g = g.set_index('sku')
+    names = _sales_name_map()
+    stock = {}
+    if STOCK_DF is not None and not STOCK_DF.empty and '품번' in STOCK_DF.columns:
+        for _, r in STOCK_DF.iterrows():
+            c = str(r.get('품번', '')).strip().upper()
+            stock[c] = stock.get(c, 0) + _num(r.get('현재고', 0))
+            if c and c not in names:
+                names[c] = str(r.get('품명', '')).strip()
+
+    def _info(c):
+        c = (c or '').strip().upper()
+        return {'code': c, 'name': names.get(c, ''), 'stock': int(stock.get(c, 0))} if c else None
+
+    mp = pd.read_csv(mfile, dtype=str, encoding='utf-8-sig').fillna('')
+    mp_skus = set(mp['SKU'].astype(str).str.strip())
+    for _, r in mp.iterrows():
+        sku = str(r['SKU']).strip()
+        if sku not in g.index:
+            continue
+        a = g.loc[sku]
+        mcode, acode = str(r['확정품번']).strip().upper(), str(a['api_code']).strip().upper()
+        if mcode == acode or not acode:      # API 품번이 비어 있으면 매핑표가 채워주는 것 — 충돌 아님
+            continue
+        rec = {'sku': sku, 'type': 'mismatch', 'sale_name': str(r.get('판매제품명', '')) or a['api_name'],
+               'api_name': a['api_name'], 'channels': a['ch'], 'recent3': int(a['recent3']), 'total': int(a['total']),
+               'last': a['last'], 'factor': str(r.get('환산계수', '')).strip() or '1',
+               'map': _info(mcode), 'api': _info(acode), 'decision': str(r.get('판정', ''))}
+        decided = rec['decision'].startswith(_SKU_DECIDED_PREFIX) or rec['factor'] not in ('1', '1.0', '')
+        (out['done'] if decided else out['pending']).append(rec)
+    for sku, a in g.iterrows():
+        if sku in mp_skus or str(a['api_code']).strip() or a['total'] <= 0:   # 납품 이력 없는 SKU는 계산 영향 없음
+            continue
+        out['pending'].append({'sku': sku, 'type': 'unmapped', 'sale_name': a['api_name'], 'api_name': a['api_name'],
+                               'channels': a['ch'], 'recent3': int(a['recent3']), 'total': int(a['total']), 'last': a['last'],
+                               'factor': '1', 'map': None, 'api': None, 'decision': ''})
+    out['pending'].sort(key=lambda x: (-x['recent3'], -x['total']))
+    out['codes'] = sorted(({'code': c, 'name': n, 'stock': int(stock.get(c, 0))} for c, n in names.items()
+                           if c[:1] in ('G', 'H', 'I') and n), key=lambda x: x['code'])
+    return out
+
+
+@app.route('/api/sku_review', methods=['GET'])
+def api_sku_review():
+    return jsonify(_sku_review_data())
+
+
+@app.route('/api/sku_review/resolve', methods=['POST'])
+def api_sku_review_resolve():
+    """body {sku, action: keep|api|custom, code}. 매핑표(SKU매핑_확정.csv)에 기록 → 판매 집계 즉시 재계산.
+    로컬(호스트)에서만 — 매핑표는 로컬→GCP 30분 동기화라 GCP에서 고치면 다음 동기화에 덮여 사라짐."""
+    if not os.path.exists('C:/Users/jgkim/OneDrive'):
+        return jsonify({'ok': False, 'error': '품번 정리는 호스트 대시보드(localhost:5000)에서 해주세요. GCP에서 고치면 다음 동기화에 덮어써집니다.'}), 400
+    b = request.get_json(silent=True) or {}
+    sku = str(b.get('sku', '')).strip()
+    action = str(b.get('action', '')).strip()
+    code = str(b.get('code', '')).strip().upper()
+    if not sku or action not in ('keep', 'api', 'custom'):
+        return jsonify({'ok': False, 'error': '잘못된 요청'}), 400
+    if action in ('api', 'custom') and not re.fullmatch(r'[A-Z]\d{4}', code):
+        return jsonify({'ok': False, 'error': f'품번 형식 오류: {code or "(빈 값)"}'}), 400
+    import shutil as _sh
+    mfile = f'{BASE_DIR}/SKU매핑_확정.csv'
+    bak = f'{mfile}.bak_review_{datetime.now():%Y%m%d}'
+    if not os.path.exists(bak):
+        _sh.copy2(mfile, bak)
+    mp = pd.read_csv(mfile, dtype=str, encoding='utf-8-sig').fillna('')
+    tag = f"사용자확정({datetime.now():%Y-%m-%d} {'매핑표 유지' if action == 'keep' else ('API 품번' if action == 'api' else '직접 입력')})"
+    sel = mp['SKU'].astype(str).str.strip() == sku
+    if sel.any():
+        if action != 'keep':
+            mp.loc[sel, '확정품번'] = code
+            mp.loc[sel, '환산계수'] = '1'
+            if '분류' in mp.columns:
+                mp.loc[sel, '분류'] = code[:1]
+        if '판정' not in mp.columns:
+            mp['판정'] = ''
+        mp.loc[sel, '판정'] = tag
+    else:
+        if action == 'keep':
+            return jsonify({'ok': False, 'error': '매핑표에 없는 SKU — 품번을 입력하세요'}), 400
+        files = sorted(glob.glob(f'{DATA_DIR}/*_판매일별.csv'))
+        nm = ''
+        if files:
+            d = pd.read_csv(files[-1], dtype=str, encoding='utf-8-sig').fillna('')
+            m = d[d['sku'].astype(str) == sku]
+            nm = m['name'].iloc[0] if len(m) else ''
+        row = {c: '' for c in mp.columns}
+        row.update({'SKU': sku, '판매제품명': nm, '확정품번': code, '환산계수': '1', '판정': tag})
+        if '분류' in mp.columns:
+            row['분류'] = code[:1]
+        mp = pd.concat([mp, pd.DataFrame([row])], ignore_index=True)
+    mp.to_csv(mfile, index=False, encoding='utf-8-sig')
+    globals()['SALES_DF'] = load_sales_data()
+    _API_CACHE.clear()
+    print(f'[SKU 품번 정리] {sku} -> {action} {code}')
+    return jsonify({'ok': True, 'sku': sku, 'action': action, 'code': code})
+
+
+@app.route('/sku_review', methods=['GET'])
+def sku_review_page():
+    return Response(SKU_REVIEW_TEMPLATE, mimetype='text/html')
+
+
+SKU_REVIEW_TEMPLATE = r'''<!DOCTYPE html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>판매 SKU 품번 정리</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#f4f6fb;--card:#fff;--bd:#e2e8f0;--tx:#0f172a;--t2:#475569;--t3:#94a3b8;--pri:#4f46e5;--ok:#047857;--warn:#b45309}
+*{box-sizing:border-box}body{margin:0;font-family:'Noto Sans KR',sans-serif;background:var(--bg);color:var(--tx)}
+.wrap{max-width:880px;margin:0 auto;padding:20px 16px 60px}
+h1{font-size:19px;margin:0 0 4px}.sub{font-size:12.5px;color:var(--t2);margin-bottom:14px;line-height:1.6}
+.bar{display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap}
+.prog{flex:1;min-width:160px;height:8px;background:#e2e8f0;border-radius:6px;overflow:hidden}.prog>i{display:block;height:100%;background:var(--pri)}
+.cnt{font-size:13px;font-weight:700}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:16px;margin-bottom:12px;box-shadow:0 1px 3px rgba(15,23,42,.05)}
+.card.cur{border-color:var(--pri);box-shadow:0 0 0 3px #e0e7ff}
+.hd{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+.nm{font-size:15px;font-weight:700;line-height:1.4}.meta{font-size:11.5px;color:var(--t3);margin-top:3px}
+.q{text-align:right;font-size:11px;color:var(--t2);white-space:nowrap}.q b{display:block;font-size:17px;color:var(--tx)}
+.opts{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
+.opt{border:1.5px solid var(--bd);border-radius:10px;padding:10px 12px;cursor:pointer;background:#fff;text-align:left;font:inherit;color:inherit}
+.opt:hover{border-color:var(--pri);background:#f5f7ff}.opt .lb{font-size:10.5px;font-weight:700;color:var(--t3)}
+.opt .cd{font-size:15px;font-weight:700;margin-top:2px}.opt .pn{font-size:12.5px;margin-top:2px;line-height:1.4}.opt .st{font-size:11px;color:var(--t2);margin-top:3px}
+.opt[disabled]{opacity:.45;cursor:not-allowed;background:#f8fafc}
+.cus{display:flex;gap:8px;margin-top:10px;align-items:center;flex-wrap:wrap}
+.cus input{flex:1;min-width:200px;padding:8px 10px;border:1px solid var(--bd);border-radius:8px;font:inherit;font-size:13px}
+.btn{padding:8px 14px;border-radius:8px;border:1px solid var(--pri);background:var(--pri);color:#fff;font-weight:700;font-size:12.5px;cursor:pointer}
+.btn.gh{background:#fff;color:var(--t2);border-color:var(--bd)}
+.tag{display:inline-block;font-size:10.5px;font-weight:700;padding:2px 7px;border-radius:6px;background:#fef3c7;color:var(--warn);margin-left:6px}
+.done{font-size:12px;color:var(--t2);border-top:1px solid var(--bd);padding:8px 2px;display:flex;justify-content:space-between;gap:8px}
+.note{background:#fffbeb;border:1px solid #fcd34d;color:#92400e;border-radius:10px;padding:10px 12px;font-size:12.5px;margin-bottom:12px}
+.empty{text-align:center;padding:40px 10px;color:var(--ok);font-weight:700}
+.msg{font-size:12px;margin-top:8px;color:#dc2626}
+details summary{cursor:pointer;font-size:13px;font-weight:700;color:var(--t2);margin:18px 0 6px}
+@media (max-width:600px){.opts{grid-template-columns:1fr}}
+</style></head><body><div class="wrap">
+<h1>🧩 판매 SKU 품번 정리</h1>
+<div class="sub">판매 자료(온라인팀 API)의 SKU가 어느 아마란스 품번인지 정합니다. 카드마다 <b>현재 매핑표 품번</b>과 <b>온라인팀이 준 품번</b>을 비교해 맞는 쪽을 누르세요. 맞는 게 없으면 품번을 직접 입력합니다. 누르는 즉시 매핑표에 저장되고 판매·재고 계산에 반영됩니다.</div>
+<div id="note"></div>
+<div class="bar"><span class="cnt" id="cnt"></span><div class="prog"><i id="pg" style="width:0"></i></div><button class="btn gh" onclick="load()">새로고침</button></div>
+<div id="list"></div>
+<details id="donebox"><summary id="donesum"></summary><div id="done"></div></details>
+<datalist id="codes"></datalist>
+</div>
+<script>
+let D = null, total0 = 0;
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function fmt(n){return Number(n||0).toLocaleString('ko-KR');}
+async function load(){
+  D = await (await fetch('/api/sku_review')).json();
+  if (!total0) total0 = D.pending.length + 0;
+  document.getElementById('note').innerHTML = D.editable ? '' :
+    '<div class="note">여기는 GCP 서버입니다. 품번 정리는 <b>호스트 대시보드(localhost:5000)</b>에서 해주세요. 여기서 고치면 다음 동기화에 덮어써집니다.</div>';
+  document.getElementById('codes').innerHTML = D.codes.map(c=>'<option value="'+esc(c.code)+'">'+esc(c.name)+' · 재고 '+fmt(c.stock)+'</option>').join('');
+  render();
+}
+function optHtml(label, info, sku, action){
+  if (!info) return '<button class="opt" disabled><div class="lb">'+label+'</div><div class="cd">없음</div><div class="pn">품번이 지정되지 않았습니다</div></button>';
+  return '<button class="opt" onclick="resolve(\''+esc(sku)+'\',\''+action+'\',\''+esc(info.code)+'\')">'
+    + '<div class="lb">'+label+'</div><div class="cd">'+esc(info.code)+'</div>'
+    + '<div class="pn">'+esc(info.name||'(아마란스 품명 없음)')+'</div><div class="st">아마란스 재고 '+fmt(info.stock)+'</div></button>';
+}
+function render(){
+  const P = D.pending, n = P.length, doneN = Math.max(total0 - n, 0);
+  document.getElementById('cnt').textContent = n ? ('남은 '+n+'건') : '모두 정리됨';
+  document.getElementById('pg').style.width = (total0 ? Math.round(doneN/total0*100) : 100) + '%';
+  const L = document.getElementById('list');
+  if (!n) { L.innerHTML = '<div class="card empty">✓ 확인할 SKU가 없습니다</div>'; }
+  else L.innerHTML = P.map((it,i)=>{
+    const um = it.type==='unmapped';
+    return '<div class="card'+(i===0?' cur':'')+'" id="c_'+esc(it.sku)+'">'
+      + '<div class="hd"><div><div class="nm">'+esc(it.sale_name)+(um?'<span class="tag">품번 없음</span>':'')+'</div>'
+      + '<div class="meta">SKU '+esc(it.sku)+' · '+esc(it.channels)+' · 최근 납품 '+esc(it.last)+'</div></div>'
+      + '<div class="q">최근 3개월 납품<b>'+fmt(it.recent3)+'</b>누적 '+fmt(it.total)+'</div></div>'
+      + '<div class="opts">'+optHtml('현재 매핑표', it.map, it.sku, 'keep')+optHtml('온라인팀 API', it.api, it.sku, 'api')+'</div>'
+      + '<div class="cus"><input list="codes" id="in_'+esc(it.sku)+'" placeholder="둘 다 아니면 품번 입력 (예: G0193) — 목록에서 선택 가능">'
+      + '<button class="btn" onclick="custom(\''+esc(it.sku)+'\')">이 품번으로 저장</button></div>'
+      + '<div class="msg" id="m_'+esc(it.sku)+'"></div></div>';
+  }).join('');
+  const DN = D.done;
+  document.getElementById('donesum').textContent = '정리 완료 · 의도된 차이 ('+DN.length+'건)';
+  document.getElementById('done').innerHTML = DN.map(it=>'<div class="done"><span>'+esc(it.sale_name)+' <span style="color:#94a3b8">SKU '+esc(it.sku)+'</span></span>'
+    + '<span><b>'+esc(it.map?it.map.code:'')+'</b> '+(it.factor!=='1'?'×'+esc(it.factor)+' ':'')+'<span style="color:#94a3b8">'+esc(it.decision||'세트 환산')+'</span></span></div>').join('');
+}
+async function resolve(sku, action, code){
+  const m = document.getElementById('m_'+sku);
+  try {
+    const r = await fetch('/api/sku_review/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sku,action,code})});
+    const d = await r.json();
+    if (!d.ok) { m.textContent = d.error || '저장 실패'; return; }
+    await load();
+  } catch(e){ m.textContent = '오류: '+e.message; }
+}
+function custom(sku){
+  const v = (document.getElementById('in_'+sku).value||'').trim().toUpperCase().split(/\s/)[0];
+  if (!/^[A-Z][0-9]{4}$/.test(v)) { document.getElementById('m_'+sku).textContent = '품번 형식이 아닙니다 (예: G0193)'; return; }
+  resolve(sku, 'custom', v);
+}
+load();
+</script></body></html>'''
+
+
 def _sales_unmapped(with_suggest=False):
     """최신 판매 CSV의 SKU 중 SKU매핑_확정.csv에 없는 것.
     with_suggest=True면 map_sku.py의 이름 유사도 매칭으로 추천 품번을 붙여 SALES_UNMAPPED_OUT에 저장(사람은 확정품번만 채우면 됨)."""
+    if SALES_SOURCE.get('kind') == 'api':
+        # API 자료는 self_code(아마란스 품번)가 있어 매핑표 없이도 연결됨 → 자사코드가 비어 있는 SKU만 미매핑
+        return list(SALES_SOURCE.get('unmapped') or [])
     sf, mfile = _sales_latest_file(), f'{BASE_DIR}/SKU매핑_확정.csv'
     if not sf or not os.path.exists(mfile):
         return []
@@ -910,6 +1197,49 @@ def _sales_drop_watcher():
         except Exception as e:
             print(f'[판매자료 감시] 오류: {e!r:.160}')
         threading.Event().wait(5 * 60)
+
+
+_PARTNER_SALES_STATUS = {'last_run': '', 'last_ok': '', 'message': ''}
+
+
+def _partner_sales_fetch_once():
+    """fetch_partner_sales.py 실행 → 성공 시 SALES_DF 리로드."""
+    import subprocess as _sp
+    r = _sp.run([sys.executable, os.path.join(BASE_DIR, 'fetch_partner_sales.py')], capture_output=True, text=True,
+                encoding='utf-8', errors='replace', timeout=900, cwd=BASE_DIR)
+    tail = ((r.stdout or '') + (r.stderr or '')).strip().splitlines()[-1:] or ['']
+    _PARTNER_SALES_STATUS.update(last_run=datetime.now().strftime('%Y-%m-%d %H:%M'), message=tail[0][:200])
+    if r.returncode == 0:
+        globals()['SALES_DF'] = load_sales_data()
+        _API_CACHE.clear()
+        _PARTNER_SALES_STATUS['last_ok'] = _PARTNER_SALES_STATUS['last_run']
+    print(f'[판매 API] {tail[0][:160]}')
+    return r.returncode == 0
+
+
+def _partner_sales_loop():
+    """하루 2회(09:10 이후 1회, 14:00 이후 1회) — 온라인팀 안내: 전날 자료는 09시 이후, 하루 1~2회 호출."""
+    threading.Event().wait(90)
+    while True:
+        try:
+            now = datetime.now()
+            today = now.strftime('%Y%m%d')
+            has_today = bool(glob.glob(f'{DATA_DIR}/{today}_판매일별.csv'))
+            last = _PARTNER_SALES_STATUS.get('last_ok') or ''
+            due = (now.hour * 60 + now.minute >= 9 * 60 + 10 and not has_today) or \
+                  (now.hour >= 14 and has_today and not (last.startswith(now.strftime('%Y-%m-%d')) and last[11:13] >= '14')
+                   and os.path.getmtime(glob.glob(f'{DATA_DIR}/{today}_판매일별.csv')[0]) < now.replace(hour=14, minute=0).timestamp())
+            if due:
+                _partner_sales_fetch_once()
+        except Exception as e:
+            print(f'[판매 API] 오류: {e!r:.160}')
+        threading.Event().wait(15 * 60)
+
+
+def _start_partner_sales_loop():
+    t = threading.Thread(target=_partner_sales_loop, daemon=True, name='partner-sales')
+    t.start()
+    print('[판매 API] 일자별 판매 수집 스케줄 시작 (09:10 이후·14:00 이후 하루 2회)')
 
 
 def _start_sales_drop_watcher():
@@ -6663,10 +6993,11 @@ def _calc_sales_consumption(scope):
     if SALES_DF is None or SALES_DF.empty:
         return {}
     cur_ym = datetime.now().strftime('%Y%m')
-    df = SALES_DF[SALES_DF['ym'] != cur_ym]          # 당월 부분치 제외
-    months = sorted(df['ym'].unique())
+    # 당월 부분치 제외 + 최근 완결 3개월만 (2026-09-23: 판매 API가 1월부터 제공 → 전체 평균이면 옛 달이 섞여 최근 흐름 희석)
+    months = sorted(y for y in SALES_DF['ym'].astype(str).unique() if y < cur_ym)[-3:]
     if not months:
         return {}
+    df = SALES_DF[SALES_DF['ym'].astype(str).isin(months)]
     bom_parents = set(_get_bom_index().keys())
     out = {}
     for _, r in df.iterrows():
@@ -12496,11 +12827,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         if (_ver === null) { _ver = d.version; return; }
         if (d.version !== _ver) {
           _ver = d.version;
-          const ae = document.activeElement;
-          const typing = ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA');
-          const modalOpen = document.querySelector('.modal-overlay.show, .modal.show');
-          if (typing || modalOpen) { showBanner(); }
-          else { location.reload(); }
+          // 2026-09-23: 자동 새로고침 제거 — 보던 화면이 갑자기 바뀌는 불편(사용자 요청). 항상 배너만 띄우고 클릭 시 새로고침.
+          showBanner();
         }
       } catch(e){}
     }
@@ -12511,6 +12839,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       b.textContent = '🔄 새 데이터 도착 — 클릭하여 새로고침';
       b.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#4f46e5;color:#fff;padding:10px 18px;border-radius:10px;font-size:13px;font-weight:700;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.25);z-index:9999';
       b.onclick = () => location.reload();
+      b.title = '클릭하면 최신 데이터로 새로고침됩니다';
       document.body.appendChild(b);
     }
     setInterval(check, 45000);
@@ -15130,6 +15459,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
               + '</div>';
           }).join('')
         + '</div>'
+        + '<a href="/sku_review" target="_blank" style="display:inline-block;margin-top:10px;padding:7px 12px;border:1px solid #6366f1;border-radius:8px;'
+        +   'font-size:12px;font-weight:700;color:#4f46e5;text-decoration:none;background:#eef2ff">🧩 판매 SKU 품번 정리 열기</a>'
         + (d.overall === 'error'
             ? '<div style="margin-top:10px;padding:10px 12px;background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;font-size:11.5px;color:#b91c1c">'
               + '<b>조치</b> — 해당 데이터만 타겟 재수집이 필요합니다. 전체 fetch_all은 시간이 오래 걸려 후반 단계가 잘릴 수 있으니, 문제 데이터만 다시 받는 것이 안전합니다.</div>'
@@ -19035,7 +19366,12 @@ def api_data_health():
 
     # 판매 CSV(수동, 월 1회): 최신 완결월이 전월이면 정상, 그 이전이면 갱신 필요
     try:
-        if SALES_DF is not None and not SALES_DF.empty and 'ym' in SALES_DF.columns:
+        if SALES_SOURCE.get('kind') == 'api':
+            # 판매 API(일자별): 파일 수집일 기준 — 전날 자료는 매일 09시 이후 수집 (주말·휴일 감안 3일/7일)
+            _sf = sorted(glob.glob(f'{DATA_DIR}/*_판매일별.csv'))
+            worst = max(worst, _aux('판매(API 일자별)', _mtime(_sf[-1]) if _sf else None, 3, 7,
+                                    f'온라인+오프라인 납품 · {SALES_SOURCE.get("file", "")}'))
+        elif SALES_DF is not None and not SALES_DF.empty and 'ym' in SALES_DF.columns:
             mx = str(SALES_DF['ym'].astype(str).max())
             prev = (now.replace(day=1) - _timedelta(days=1)).strftime('%Y%m')
             lag = (int(prev[:4]) * 12 + int(prev[4:6])) - (int(mx[:4]) * 12 + int(mx[4:6]))
@@ -19049,11 +19385,16 @@ def api_data_health():
     try:
         if SALES_DF is not None:
             um = _sales_unmapped()
+            if SALES_SOURCE.get('kind') == 'api':
+                # 품번 정리 화면(/sku_review)의 남은 건수 = 자사코드 없는 SKU + 매핑표↔API 품번 불일치 미결정
+                um = [{'SKU': x['sku'], '판매제품명': x['sale_name']} for x in _sku_review_data()['pending']]
             _mf = f'{BASE_DIR}/SKU매핑_확정.csv'
             items.append({'label': '판매 SKU매핑', 'date_col': '', 'rows': int(len(um)), 'months_behind': None,
                           'latest_ym': _dt.fromtimestamp(os.path.getmtime(_mf)).strftime('%Y-%m-%d') if os.path.exists(_mf) else '',
                           'status': 'warn' if um else 'ok',
-                          'msg': (f'미매핑 SKU {len(um)}건 · SKU매핑_미매핑_추천.csv 확인 후 SKU매핑_확정.csv에 추가' if um
+                          'msg': ((f'품번 확인 필요 SKU {len(um)}건 · 아래 [판매 SKU 품번 정리]에서 클릭으로 정리'
+                                   if SALES_SOURCE.get('kind') == 'api' else
+                                   f'미매핑 SKU {len(um)}건 · SKU매핑_미매핑_추천.csv 확인 후 SKU매핑_확정.csv에 추가') if um
                                   else '정상 · 판매 SKU 전부 매핑됨')})
             worst = max(worst, 1 if um else 0)
     except Exception:
@@ -19140,6 +19481,7 @@ if __name__ == '__main__':
         _start_price_watcher()
         _start_notify_scheduler()
         _start_sales_drop_watcher()   # 판매 CSV 드롭폴더 (2026-09-17)
+        _start_partner_sales_loop()   # 판매 일자별 API (2026-09-23)
         _start_closing_auto()         # 마감 자동 반영 (2026-09-17)
     else:
         print('[자동수집] ENABLE_AUTO_FETCH=0 → 스케줄러/워처 비활성화 (데이터는 /upload 또는 수동 리로드)')
