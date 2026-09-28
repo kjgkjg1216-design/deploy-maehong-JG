@@ -11580,8 +11580,13 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   }
 
   /* ───── Chart Panels ───── */
+  /* 화면 폭 (2026-09-28): 섹션 최대폭 1440px 고정을 없애고 모니터 가로에 맞춰 늘고 줄게. 좌우 여백 --pg는
+     오른쪽 섹션 내비(1101px↑에서 보임)를 가리지 않는 폭. KPI 띠·모든 섹션·하단 wrap이 같은 여백을 써서 가장자리가 한 줄로 맞음 */
+  :root { --pg: 24px; }
+  @media (min-width: 1101px) { :root { --pg: 32px; } }
+  @media (min-width: 1600px) { :root { --pg: 64px; } }
   .chart-grid {
-    max-width: 1440px; margin: 14px auto 0; padding: 0 32px;
+    max-width: none; margin: 14px auto 0; padding: 0 var(--pg);
     display: grid; grid-template-columns: repeat(30, 1fr); gap: 12px;
   }
   .chart-panel.po-inline     { grid-column: span 15; border-top: 3px solid #059669; }
@@ -11594,6 +11599,12 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .chart-panel.vendor-panel  { grid-column: span 10; border-top: 3px solid #7c3aed; }   /* 거래처 스코어 — 보라 */
   /* 3등분 폭에 맞춰 헤더 부제목은 한 줄 말줄임, 헤더 오른쪽 컨트롤은 줄바꿈 허용 */
   .plan-panel .chart-head, .chstock-panel .chart-head, .vendor-panel .chart-head { flex-wrap: wrap; row-gap: 6px; }
+  /* 줄 높이 맞춤 (2026-09-28): 같은 줄에서 한 패널 머리(검색창·요약)가 길면 옆 패널 목록 아래가 비던 것 → 목록이 남은 높이를 채움. 1열(모바일)은 기존대로 */
+  @media (min-width: 981px) {
+    .chart-grid > .chart-panel { display: flex; flex-direction: column; }
+    .chart-grid > .chart-panel > .alert-list { flex: 1 1 0; min-height: 310px; max-height: none; }
+    .chart-grid > .chart-panel > .po-inline-list { flex: 1 1 0; min-height: 260px; max-height: none; }
+  }
   .plan-panel .chart-sub, .chstock-panel .chart-sub, .vendor-panel .chart-sub { display: block; margin-left: 0; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
   .ch-tag { display:inline-block; font-size:10px; font-weight:700; padding:1px 6px; border-radius:5px; margin-left:4px; background:#fff7ed; color:#c2410c; vertical-align:1px; }
   .ch-tag.on { background:#eff6ff; color:#1d4ed8; }
@@ -11606,7 +11617,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .vk-tag.both { background:linear-gradient(90deg,#ede9fe,#ffedd5); color:#7c3aed; }
 
   /* ── KPI 요약 띠 ── */
-  .kpi-strip { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:12px; margin:16px 24px 4px; }
+  .kpi-strip { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:12px; margin:16px var(--pg) 4px; }
   .kpi-tile { position:relative; display:flex; align-items:center; gap:10px; min-width:0; cursor:pointer;
     background:#fff; border:1px solid #e6e9f0; border-radius:14px; padding:13px 14px 12px 14px; overflow:hidden;
     box-shadow:0 1px 2px rgba(15,23,42,.04); transition:transform .14s, box-shadow .14s; }
@@ -11635,7 +11646,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   @media (max-width:1100px) { .sec-nav { display:none; } }
 
   /* ── 회송 원가 역산 ── */
-  .return-strip { max-width: 1440px; margin: 12px auto 0; padding: 0 32px; }
+  .return-strip { max-width: none; margin: 12px auto 0; padding: 0 var(--pg); }
   .chart-panel.return-panel { border-top: 3px solid #db2777; }
   .rc-form { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:10px; }
   .rc-field { display:flex; align-items:center; gap:6px; }
@@ -11688,9 +11699,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .ck-row:hover, .ck-row.sel { background:var(--surface-2,#f8fafc) }
   .ck-row .cd { font-weight:800; color:#4f46e5; min-width:64px } .ck-row .tp { font-size:10.5px; color:var(--text-3); margin-left:auto; white-space:nowrap }
   .ck-hint { padding:8px 18px; font-size:11px; color:var(--text-3) }
-  .spec-strip { max-width: 1440px; margin: 12px auto 0; padding: 0 32px; }
+  .spec-strip { max-width: none; margin: 12px auto 0; padding: 0 var(--pg); }
   /* ───── 입수 테스트 (3D) ───── */
-  .ipsu-strip { max-width: 1440px; margin: 12px auto 0; padding: 0 32px; }
+  .ipsu-strip { max-width: none; margin: 12px auto 0; padding: 0 var(--pg); }
   .chart-panel.ipsu-panel { border-top: 3px solid #7c3aed; }
   .ipsu-block { border: 1px solid var(--border); border-radius: 9px; padding: 8px 10px; margin-bottom: 8px; }
   .ipsu-block .ib-t { font-size: 11px; font-weight: 700; color: #7c3aed; margin-bottom: 6px; }
@@ -11745,17 +11756,17 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   @media (max-width: 900px) { .ipsu-stages { grid-template-columns: 1fr; } }
   /* ───── 매출 현황 + NPD ───── */
   .sales-npd-strip {
-    max-width: 1440px; margin: 12px auto 0; padding: 0 32px;
+    max-width: none; margin: 12px auto 0; padding: 0 var(--pg);
     display: grid; grid-template-columns: 1.55fr 1fr; gap: 12px;
   }
   .chart-panel.sales-panel { border-top: 3px solid #0ea5e9; }
   .chart-panel.prod-panel { border-top: 3px solid #f59e0b; }
   .prod-chart-wrap { height: 240px; position: relative; }
   /* ───── 월 판매기반 자료 패널 ───── */
-  .salesbase-strip { max-width: 1440px; margin: 12px auto 0; padding: 0 32px; }
+  .salesbase-strip { max-width: none; margin: 12px auto 0; padding: 0 var(--pg); }
   .retired { display: none !important; }   /* 제거한 영역 (JS가 style.display를 바꿔도 숨김 유지) */
   /* ───── 판매 분석 (2026-09-23) ───── */
-  .lens-strip { max-width: 1440px; margin: 12px auto 0; padding: 0 32px; display: grid; grid-template-columns: 1.15fr 1.15fr 0.8fr; gap: 12px; }
+  .lens-strip { max-width: none; margin: 12px auto 0; padding: 0 var(--pg); display: grid; grid-template-columns: 1.15fr 1.15fr 0.8fr; gap: 12px; }
   .chart-panel.lens-gap { border-top: 3px solid #0d9488; }
   .chart-panel.lens-price { border-top: 3px solid #9333ea; }
   .chart-panel.lens-wd { border-top: 3px solid #64748b; }
@@ -12217,6 +12228,11 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     min-height: 28px; padding: 6px 8px; border-radius: 6px;
   }
 
+  /* 수급·채널품절·거래처 3등분은 좁은 화면(1250px↓)에서 칸이 모자라 넘침 → 2 + 1(거래처 전체 폭) */
+  @media (max-width: 1250px) and (min-width: 981px) {
+    .chart-panel.plan-panel, .chart-panel.chstock-panel { grid-column: span 15; }
+    .chart-panel.vendor-panel { grid-column: span 30; }
+  }
   @media (max-width: 980px) {
     .chart-grid { grid-template-columns: 1fr; padding: 0 16px; }
     .chart-panel.po-inline, .chart-panel.os-inline, .chart-panel.pcalc-panel, .chart-panel.alert-span, .chart-panel.price-span, .chart-panel.plan-panel, .chart-panel.chstock-panel, .chart-panel.vendor-panel { grid-column: auto; }
@@ -12290,7 +12306,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 
   /* ───── Layout ───── */
-  .wrap { max-width: 1440px; margin: 0 auto; padding: 32px 32px 140px; display: grid; grid-template-columns: 1fr; gap: 24px; }
+  .wrap { max-width: none; margin: 0 auto; padding: 32px var(--pg) 140px; display: grid; grid-template-columns: 1fr; gap: 24px; }
   .main-col { min-width: 0; }
   /* 캘린더 가로 스트립 (검색창 위) */
   .cal-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 20px; }
