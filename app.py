@@ -377,13 +377,28 @@ INVENTORY_PREFERRED_DIR = 'C:/Users/jgkim/OneDrive/바탕 화면/구매'
 _INVENTORY_NAME_RE = re.compile(
     r'원자재부자재 재고파악(\(\d+월\))?(\s*[-_]\s*(마감|최종본))?\.xlsx$')
 
+_GLOB_CACHE = {}
+
+
+def _glob_cached(pattern, ttl=600):
+    """OneDrive 전체 재귀 glob은 2~7초 걸림(건강검진·KPI가 매번 불러 첫 화면이 느려짐) → 파일 목록만 10분 캐시 (2026-09-28).
+    새 파일은 최대 10분 뒤 인식. 수정시각(getmtime)은 호출 때마다 새로 읽으므로 같은 파일 덮어쓰기는 바로 반영."""
+    now = time.time()
+    hit = _GLOB_CACHE.get(pattern)
+    if hit and now - hit[0] < ttl:
+        return list(hit[1])
+    res = glob.glob(pattern, recursive=True)
+    _GLOB_CACHE[pattern] = (now, res)
+    return list(res)
+
+
 def _find_inventory_xlsx():
     """OneDrive에서 외주재고 취합본 중 최신 파일 반환 (mtime 기준).
 
     ⚠️ '최종본' 고정 매칭 금지 — 파일명 관례가 '마감'으로 바뀌자 앱이 4월
     최종본을 계속 읽는 고착이 있었음(2026-09-01). 취합본 이름 규칙만 whitelist."""
     files = []
-    for f in glob.glob(INVENTORY_ONEDRIVE_PATTERN, recursive=True):
+    for f in _glob_cached(INVENTORY_ONEDRIVE_PATTERN):
         base = os.path.basename(f)
         if base.startswith('~$'):
             continue
@@ -563,7 +578,7 @@ def _find_jasa_xlsx():
     ]
     found = []
     for pat in patterns:
-        for p in glob.glob(pat, recursive=True):
+        for p in _glob_cached(pat):
             base = os.path.basename(p)
             if base.startswith('~$') or '복사본' in base:   # 엑셀 임시/복사본 제외
                 continue
@@ -771,6 +786,48 @@ def _vel_basis_label(vel):
     return f"최근 4주·3개월 납품 속도 (~{vel['end'][5:].replace('-', '/')})" if vel else ''
 
 
+HP_DELIV_FIX = True    # 홈플러스 납품 중복·배수 보정 (끄면 파트너 API 원본 그대로)
+HP_FAMILY = ('homeplus', 'homeplus_hyper', 'homeplus_express')
+
+
+def _hp_dedup_raw(d):
+    """홈플러스 납품 중복·배수 보정 (2026-09-23 검증 결과).
+    파트너 API의 'homeplus'(통합) 행과 하이퍼·익스프레스 행이 같은 날짜·SKU에 둘 다 납품을 가지면,
+    하위 채널 수량·금액이 통합의 k배(8/31 7배, 9/1 6배, 9/2 5배, 9/4 3배, 9/7·9/21 1배=단순 중복)로 들어옴.
+    점재고 변화(재고 증가 + 그날 POS)는 통합 행 수량과 일치 → 통합 수량이 실제 납품.
+    보정: 하위 채널 행을 통합/하위합 비율로 줄이고(하이퍼·익스프레스 분할은 유지), 통합 행의 납품·금액은 0 (POS·재고는 그대로).
+    한쪽만 있는 날은 손대지 않음. 반환 (d, {'keys', 'amt'}) 또는 (d, None)."""
+    if not HP_DELIV_FIX or 'channel' not in d.columns:
+        return d, None
+    fam = d['channel'].isin(HP_FAMILY)
+    if not fam.any():
+        return d, None
+    d = d.copy()
+    d['supply_amount'] = pd.to_numeric(d['supply_amount'], errors='coerce')
+    agg = fam & (d['channel'] == 'homeplus')
+    sub = fam & (d['channel'] != 'homeplus')
+    h = d[agg].groupby(['date', 'sku'])['dq'].sum()
+    s = d[sub].groupby(['date', 'sku'])['dq'].sum()
+    both = set(h[h > 0].index) & set(s[s > 0].index)
+    if not both:
+        return d, None
+    ratio = {k: float(h[k]) / float(s[k]) for k in both}
+    keys = list(zip(d['date'], d['sku']))
+    inb = pd.Series([k in ratio for k in keys], index=d.index)
+    before = float(d['supply_amount'].fillna(0).sum())
+    sm = sub & inb
+    r = pd.Series([ratio[k] for k, m in zip(keys, sm) if m], index=d.index[sm])
+    d.loc[sm, 'dq'] = d.loc[sm, 'dq'] * r
+    d.loc[sm, 'supply_amount'] = d.loc[sm, 'supply_amount'] * r
+    am = agg & inb
+    d.loc[am, 'dq'] = 0.0
+    d.loc[am, 'supply_amount'] = 0.0
+    fix = {'keys': len(both), 'amt': int(before - float(d['supply_amount'].fillna(0).sum())),
+           'dates': sorted({k[0] for k in both})}
+    print(f"[판매데이터] 홈플러스 납품 중복/배수 보정 {fix['keys']}건, 금액 -{fix['amt']:,}원 ({', '.join(fix['dates'])})")
+    return d, fix
+
+
 def _load_sales_from_daily():
     """온라인팀 파트너 API 일자별 자료(data/*_판매일별.csv, fetch_partner_sales.py) → 월별 판매 집계 (2026-09-23).
     - 수량 = delivery_qty(납품, 낱개 판매단위 — 기존 CSV의 판매박스수×박스당입수와 같은 단위, 7월 대조 확인)
@@ -783,6 +840,8 @@ def _load_sales_from_daily():
         return None
     d = pd.read_csv(files[-1], dtype=str, encoding='utf-8-sig').fillna('')
     d['dq'] = pd.to_numeric(d['delivery_qty'], errors='coerce').fillna(0)
+    d, hp_fix = _hp_dedup_raw(d)
+    SALES_SOURCE['hp_fix'] = hp_fix
     raw_all = d
     d = d[d['dq'] > 0].copy()
     if d.empty:
@@ -1635,7 +1694,7 @@ def _find_price_xlsx():
     """OneDrive 어디에 있든(구매팀월간/YY.N월 등) 단가 파일 중 연도(파일명 'NN년') 큰 것 → 최근 수정 순.
     연도를 먼저 보는 이유: 27년 파일이 생긴 뒤 26년 파일을 손봐도 27년이 유지되도록."""
     found = []
-    for f in glob.glob(PRICE_ONEDRIVE_PATTERN, recursive=True):
+    for f in _glob_cached(PRICE_ONEDRIVE_PATTERN):
         name = os.path.basename(f)
         m = _PRICE_NAME_RE.match(name)
         if not m or name.startswith('~$'):
@@ -8408,6 +8467,13 @@ def api_supply_plan():
                 x['ch_note'] = '채널 여유'
             elif x['level'] in ('ok', 'low') and cs['qty'] / weekly < 1:
                 x['ch_note'] = '채널 부족'
+    # 매출 ABC 등급 (2026-09-23) — 최근 90일 매출 누적 80%=A. A부터 안전재고 우선
+    try:
+        abc = (_sales_abc() or {}).get('by', {})
+    except Exception:
+        abc = {}
+    for x in items:
+        x['abc'] = abc.get(x['code'], {}).get('grade', '')
     order = {'out': 0, 'critical': 1, 'warning': 2, 'low': 3, 'ok': 4}
     items.sort(key=lambda x: (order[x['level']], x['cov_plan_weeks']))
     summary = {k: sum(1 for x in items if x['level'] == k) for k in order}
@@ -8510,12 +8576,12 @@ def api_sales_gap():
     end = pd.to_datetime(df['date'].max())
     start = end - pd.Timedelta(days=27)
     d = df[(pd.to_datetime(df['date']) >= start) & (df['code'] != '')].copy()
-    pdays = d.groupby(['channel', 'sku'])['pos'].apply(lambda s: int(s.notna().sum()))
-    ok = set(pdays[pdays >= 14].index)
-    d = d[[k in ok for k in zip(d['channel'], d['sku'])]]
+    # POS를 14일 이상 보고한 '채널' 기준 (쿠팡은 안 팔린 SKU를 빈칸으로 줌 → SKU별로 세면 느린 품목이 빠짐), 홈플러스 통합 POS 이중 계산 제거 (2026-09-23 검증 반영)
+    pdays = d[d['pos'].notna()].groupby('channel')['date'].nunique()
+    d = d[d['channel'].isin(set(pdays[pdays >= 14].index))]
     if d.empty:
         return jsonify({'items': []})
-    d['pos_ea'] = d['pos'].fillna(0) * d['f']
+    d['pos_ea'] = _pos_ea_dedup(d)
     names = _sales_name_map()
     stk = d[d['stock'].notna()].sort_values('date')
     items = []
@@ -8599,6 +8665,547 @@ def api_delivery_weekday():
                      'online': int(g[g['channel_type'] == 'online']['dq'].sum()), 'offline': int(g[g['channel_type'] == 'offline']['dq'].sum()),
                      'by_ch': {c: int(g[g['channel_name'] == c]['dq'].sum()) for c in top_ch}})
     return jsonify({'days': days, 'channels': top_ch, 'from': (end - pd.Timedelta(days=83)).strftime('%Y-%m-%d'), 'to': end.strftime('%Y-%m-%d')})
+
+
+_FG_STOCK_CACHE = {}
+
+
+def _our_fg_stock():
+    """우리 창고 완제품 재고 {품번: 현재고} (구품번은 신품번으로 합침). STOCK_DF가 바뀔 때만 다시 계산."""
+    _al = _goods_aliases()
+    key = (id(STOCK_DF), tuple(sorted(_al.items())))
+    if _FG_STOCK_CACHE.get('key') == key:
+        return dict(_FG_STOCK_CACHE['val'])
+    ours = {}
+    if STOCK_DF is not None and not STOCK_DF.empty and '품번' in STOCK_DF.columns:
+        for _, r in STOCK_DF.iterrows():
+            c = str(r.get('품번', '')).strip().upper()
+            c = _al.get(c, c)
+            ours[c] = ours.get(c, 0) + _num(r.get('현재고', 0))
+    _FG_STOCK_CACHE.update(key=key, val=ours)
+    return dict(ours)
+
+
+def _material_stock_map():
+    """부자재·원료(A~D) 재고 {코드: {'name', 'jasa', 'os', 'price'}} — 자사재고(JASA_DF) + 외주 재고일지(DF)."""
+    out = {}
+
+    def _add(code, name, qty, key):
+        if not code or code[:1] not in ('A', 'B', 'C', 'D'):
+            return
+        e = out.get(code)
+        if e is None:
+            pi = get_price_info(code, name)
+            e = out[code] = {'name': name, 'jasa': 0.0, 'os': 0.0, 'price': (pi.get('단가', 0) if pi else 0) or 0}
+        e[key] += qty
+    if JASA_DF is not None and not JASA_DF.empty:
+        c1, c5, c7 = JASA_DF.columns[1], JASA_DF.columns[5], JASA_DF.columns[7]
+        for _, r in JASA_DF.iterrows():
+            _add(str(r[c1]).strip().upper(), str(r[c5]).strip(), _num(r[c7]), 'jasa')
+    if DF is not None and not DF.empty:
+        for _, r in DF.iterrows():
+            _add(str(r[COL_품목]).strip().upper(), str(r[COL_품명]).strip(), _num(r[COL_재고량]), 'os')
+    return out
+
+
+@app.route('/api/dormant_items', methods=['GET'])
+@cached_api()
+def api_dormant_items():
+    """판매 중단 의심 (2026-09-23) — 판매 API에 납품 이력이 있는데 최근 60일 납품도 매장 판매(POS>0)도 없는 품번 + 그 품번들에만 쓰이는 부자재·원료 재고.
+    '전용' = BOM상 이 자재를 쓰는 완제품(G/H/I) 중 최근 60일 납품·매장 판매 또는 최근 60일 발주가 있는 것이 하나도 없음.
+    판매 API 채널 기준이라 홀세일·B2B 등 API 밖 채널로만 나가는 품목은 판단 못 함 → 화면에 안내."""
+    df = SALES_DAILY_DF
+    if df is None or df.empty:
+        return jsonify({'items': [], 'reason': '판매 API 자료 없음'})
+    days = 60
+    _al = _goods_aliases()
+    end = pd.to_datetime(df['date'].max())
+    cut = (end - pd.Timedelta(days=days - 1)).strftime('%Y-%m-%d')
+    d = df[df['code'] != ''].assign(code=lambda x: x['code'].map(lambda c: _al.get(c, c)))
+    dl = d[d['ea'] > 0]
+    last_dl = dl.groupby('code')['date'].max()
+    tot_dl = dl.groupby('code')['ea'].sum()
+    # 활동 = 납품 또는 매장 판매(POS>0). 홈플러스는 납품 자료가 일부 SKU만 있어 납품만 보면 G0184처럼 팔리는 품번이 '멈춤'으로 잡힘 (검증 반영)
+    last_sale = d[d['pos'].fillna(0) > 0].groupby('code')['date'].max()
+    last_act = pd.concat([last_dl, last_sale]).groupby(level=0).max()
+    active = set(last_act[last_act >= cut].index)
+    dormant = set(last_dl.index) - active
+    # 최근 발주(외주발주·구매발주) — 있으면 재개 가능성이 있어 '전용 자재' 판정에서 활성으로 취급
+    po_cut = cut.replace('-', '')
+    recent_po = {}
+    for src in (WP_ORDER_DF, ORDER_DF):
+        if src is None or src.empty or '품번' not in src.columns or '발주일자' not in src.columns:
+            continue
+        ds = src['발주일자'].astype(str).str.replace('-', '').str[:8]
+        s = src[ds >= po_cut]
+        for c, dt_ in zip(s['품번'].astype(str).str.strip().str.upper(), ds[ds >= po_cut]):
+            c = _al.get(c, c)
+            recent_po[c] = max(recent_po.get(c, ''), dt_)
+    live = active | set(recent_po)
+    # 자재 → 쓰는 완제품
+    users = {}
+    for p in _get_bom_index():
+        if p[:1] not in ('G', 'H', 'I'):
+            continue
+        for m in _explode_bom(p):
+            if m[:1] in ('A', 'B', 'C', 'D'):
+                users.setdefault(m, set()).add(_al.get(p, p))
+    mats = _material_stock_map()
+    seen_codes = set(d['code'])        # 판매자료에 한 번이라도 나온 품번 (납품 없이 POS·재고만 있어도)
+    by_prod = {}
+    for m, ps in users.items():
+        if ps & live or not (ps & dormant):
+            continue
+        st = mats.get(m)
+        if not st:
+            continue
+        qty = st['jasa'] + st['os']
+        if qty <= 0:
+            continue
+        rec = {'code': m, 'name': st['name'], 'qty': int(qty), 'jasa': int(st['jasa']), 'os': int(st['os']),
+               'value': int(qty * st['price']), 'shared': sorted(ps & dormant),
+               'unknown_users': len(ps - seen_codes)}   # 판매자료에 안 나오는 다른 완제품도 쓰는 자재
+        for p in ps & dormant:
+            by_prod.setdefault(p, []).append(rec)
+    ours = _our_fg_stock()
+    chs = _channel_stock_by_code()
+    w14 = d[pd.to_datetime(d['date']) >= end - pd.Timedelta(days=13)]
+    pos14 = (w14['pos'].fillna(0) * w14['f']).groupby(w14['code']).sum()
+    names = _sales_name_map()
+    items = []
+    for c in dormant:
+        ml = sorted(by_prod.get(c, []), key=lambda x: -x['value'])
+        o = int(ours.get(c, 0))
+        pi = get_price_info(c, names.get(c, ''))
+        unit = (pi.get('단가', 0) if pi else 0) or 0
+        o_src = '단가' if unit else ''
+        if not unit and o > 0 and c in _get_bom_index():
+            # 자사 완제품(G)은 단가표에 없음 → BOM 전개 원가(회송 원가와 같은 계산)로 대신 (검증 반영)
+            try:
+                with app.test_request_context(f'/api/return_cost?code={c}&qty=1'):
+                    rc = api_return_cost()
+                rc = rc[0] if isinstance(rc, tuple) else rc
+                unit = float((rc.get_json() or {}).get('unit_cost') or 0)
+                o_src = 'BOM원가' if unit else ''
+            except Exception:
+                unit = 0
+        o_val = int(max(o, 0) * unit)
+        p14 = float(pos14.get(c, 0))
+        chq = int(chs.get(c, {}).get('qty', 0))
+        status = ('po' if c in recent_po else ('selling' if p14 > 0 else 'stopped'))
+        if o <= 0 and not ml and status == 'po':
+            continue
+        items.append({'code': c, 'name': names.get(c, '') or str(dl[dl['code'] == c]['name'].iloc[-1]),
+                      'last_delivery': last_dl[c], 'days_since': int((end - pd.to_datetime(last_dl[c])).days),
+                      'last_sale': str(last_sale.get(c, '')),
+                      'total_delivery': int(tot_dl.get(c, 0)), 'ours': o, 'ours_value': o_val, 'ours_value_src': o_src,
+                      'pos14': int(p14), 'ch_stock': chq, 'recent_po': recent_po.get(c, ''), 'status': status,
+                      'materials': ml, 'mat_value': sum(x['value'] for x in ml if not x['unknown_users']),
+                      'mat_maybe_value': sum(x['value'] for x in ml if x['unknown_users'])})
+    items.sort(key=lambda x: (x['status'] == 'po', -(x['mat_value'] + x['ours_value']), -x['mat_maybe_value'], -x['ours']))
+    uniq = {}
+    for it in items:
+        if it['status'] != 'po':
+            for m in it['materials']:
+                uniq[m['code']] = m
+    sure = [m for m in uniq.values() if not m['unknown_users']]
+    maybe = [m for m in uniq.values() if m['unknown_users']]
+    return jsonify({'items': items, 'as_of': end.strftime('%Y-%m-%d'), 'days': days,
+                    'summary': {'count': sum(1 for x in items if x['status'] != 'po'), 'po': sum(1 for x in items if x['status'] == 'po'),
+                                'mat_count': len(sure), 'mat_value': int(sum(m['value'] for m in sure)),
+                                'mat_maybe_count': len(maybe), 'mat_maybe_value': int(sum(m['value'] for m in maybe)),
+                                'ours_value': int(sum(x['ours_value'] for x in items if x['status'] != 'po'))}})
+
+
+@app.route('/api/demand_shift', methods=['GET'])
+@cached_api()
+def api_demand_shift():
+    """수요 급변 (2026-09-23) — 품번별 매장 실판매(POS) 일평균: 최근 14일 vs 그 전 28일(15~42일 전).
+    |변화| ≥ 30% 이고 두 기간 중 큰 쪽이 하루 5개 이상. 판매속도(4주 70%+3개월 30%)가 늦게 따라가는 급변을 먼저 알림.
+    줄었는데 채널 재고가 옛 판매량 3일분도 안 되면 '품절로 못 판 것일 수 있음' 표시(수요 감소 아님).
+    (검증 반영 2026-09-23) 홈플러스 통합 POS 이중 계산 제거, 채널마다 자기 마지막 보고일 기준 창(롯데 하루 지연),
+    미보고일(이마트 채널 전체 빈 날)은 분모에서 제외, 두 창 모두 유효한 채널만 비교."""
+    p = _sales_daily_canon()
+    if p is None:
+        return jsonify({'items': []})
+    end = p['_dt'].max()
+    rep = _pos_report(p)
+    ra = _pos_rates(p, rep, 14, 0)
+    rb = _pos_rates(p, rep, 28, 14, min_days=10)
+    ok = set(ra['channel']) & set(rb['channel'])
+    ra, rb = ra[ra['channel'].isin(ok)], rb[rb['channel'].isin(ok)]
+    r14 = ra.groupby('code')['rate'].sum()
+    r28 = rb.groupby('code')['rate'].sum()
+    c14 = ra.groupby(['code', 'channel_name'])['rate'].sum()
+    c28 = rb.groupby(['code', 'channel_name'])['rate'].sum()
+    chs = _channel_stock_by_code()
+    vel = (_sales_velocity() or {}).get('by', {})
+    ours = _our_fg_stock()
+    names = _sales_name_map()
+    items = []
+    for c in set(r14.index) | set(r28.index):
+        x, y = float(r14.get(c, 0)), float(r28.get(c, 0))
+        if max(x, y) < 5:
+            continue
+        pct = (x - y) / y * 100 if y > 0 else None
+        if pct is not None and abs(pct) < 30:
+            continue
+        up = pct is None or pct > 0
+        # 변화가 가장 큰 채널
+        chg = {}
+        for (cc, ch), v in c14[c14.index.get_level_values(0) == c].items():
+            chg[ch] = [float(v), 0.0]
+        for (cc, ch), v in c28[c28.index.get_level_values(0) == c].items():
+            chg.setdefault(ch, [0.0, 0.0])[1] = float(v)
+        top = max(chg.items(), key=lambda kv: abs(kv[1][0] - kv[1][1])) if chg else None
+        chq = chs.get(c, {}).get('qty')
+        note = ''
+        if not up and chq is not None and chq < y * 3:
+            note = '채널 재고 부족 — 품절로 못 판 것일 수 있음'
+        v = vel.get(c, {}).get('v')
+        items.append({'code': c, 'name': names.get(c, '') or str(p[p['code'] == c]['name'].iloc[-1]),
+                      'r14': round(x, 1), 'r28': round(y, 1), 'pct': round(pct, 0) if pct is not None else None,
+                      'dir': 'up' if up else 'down', 'diff_d': round(x - y, 1),
+                      'top_channel': {'name': top[0], 'r14': round(top[1][0], 1), 'r28': round(top[1][1], 1)} if top else None,
+                      'ch_stock': int(chq) if chq is not None else None, 'vel': round(v, 1) if v is not None else None,
+                      'ours': int(ours.get(c, 0)), 'note': note})
+    items.sort(key=lambda x: -abs(x['diff_d']))
+    return jsonify({'items': items, 'as_of': end.strftime('%Y-%m-%d'),
+                    'excluded_channels': sorted({str(p[p['channel'] == c]['channel_name'].iloc[0]) for c in rep if c not in ok}),
+                    'summary': {'up': sum(1 for x in items if x['dir'] == 'up'), 'down': sum(1 for x in items if x['dir'] == 'down'),
+                                'stockout': sum(1 for x in items if x['note'])}})
+
+
+def _sales_daily_canon():
+    """SALES_DAILY_DF에서 품번 있는 행만, 구품번→신품번 통합 + _dt 컬럼 + pe(POS 낱개, 홈플러스 중복 제거). (없으면 None)"""
+    df = SALES_DAILY_DF
+    if df is None or df.empty:
+        return None
+    _al = _goods_aliases()
+    d = df[df['code'] != ''].copy()
+    d['code'] = d['code'].map(lambda c: _al.get(c, c))
+    d['_dt'] = pd.to_datetime(d['date'])
+    d['pe'] = _pos_ea_dedup(d)
+    return d
+
+
+def _pos_ea_dedup(d):
+    """POS 낱개(pos×f, 빈칸=0). 홈플러스 통합('homeplus') 행의 POS = 하이퍼+익스프레스 합계라,
+    같은 날짜·SKU에 하위 채널 POS가 있으면 통합 행은 0 (여러 채널 합산 시 이중 계산 방지).
+    채널 하나만 보는 곳(통합 행 점재고와 짝지어 보는 채널 품절·납품 끊김)은 원래 pos를 그대로 씀."""
+    sub = d[d['channel'].isin(('homeplus_hyper', 'homeplus_express')) & d['pos'].notna()]
+    keys = set(zip(sub['date'], sub['sku']))
+    dup = (d['channel'] == 'homeplus') & pd.Series([k in keys for k in zip(d['date'], d['sku'])], index=d.index)
+    return (d['pos'].fillna(0) * d['f']).where(~dup, 0.0)
+
+
+def _pos_report(d):
+    """채널별 POS 보고일 집합 {channel: set(Timestamp)} — 그날 그 채널에 POS 값이 하나라도 있으면 보고한 날.
+    (쿠팡 등은 안 팔린 SKU를 빈칸으로 줌 → 보고한 날의 빈칸은 0으로 봄. 이마트처럼 채널 전체가 빈 날은 '미보고')"""
+    return d[d['pos'].notna()].groupby('channel')['_dt'].agg(lambda s: set(s)).to_dict()
+
+
+def _pos_rates(d, rep, win, offset=0, min_days=5, stale_days=4):
+    """채널·품번별 매장 판매 일평균 — 창은 채널마다 '그 채널 마지막 POS 보고일'에서 끝남(롯데처럼 하루 늦게 오는 채널 보정).
+    창 = (e-offset-win, e-offset]. 분모 = 그 창에서 채널이 보고한 날 수(미보고일 제외),
+    단 채널이 창 중간에 새로 생겼으면 창 길이(생기기 전은 0). 보고일 min_days 미만·마지막 보고가 stale_days보다 오래된 채널은 제외.
+    반환 DataFrame [channel, channel_name, code, rate]."""
+    end = d['_dt'].max()
+    rows = []
+    for ch, g in d.groupby('channel'):
+        days_set = rep.get(ch)
+        if not days_set:
+            continue
+        e = max(days_set)
+        if (end - e).days > stale_days:
+            continue
+        hi = e - pd.Timedelta(days=offset)
+        lo = hi - pd.Timedelta(days=win)
+        n = sum(1 for t in days_set if lo < t <= hi)
+        if n < min_days:
+            continue
+        den = n if min(days_set) <= lo else win
+        w = g[(g['_dt'] > lo) & (g['_dt'] <= hi)]
+        s = w.groupby('code')['pe'].sum() / den
+        nm = str(g['channel_name'].iloc[0])
+        rows += [(ch, nm, c, float(v)) for c, v in s.items()]
+    return pd.DataFrame(rows, columns=['channel', 'channel_name', 'code', 'rate'])
+
+
+@app.route('/api/delivery_gaps', methods=['GET'])
+@cached_api()
+def api_delivery_gaps():
+    """채널별 납품 끊김 (2026-09-23) — 채널·품번별 납품일 간격 중앙값(최근 10회)을 평소 주기로 보고,
+    마지막 납품 후 경과일 > max(평소 주기 × 2.5, 7일) 이면 표시. 납품일 6회 이상·평소 주기 30일 이하인 조합만(가끔 나가는 건 주기 판단 불가).
+    경과 120일 넘은 건은 오래된 입점 종료로 보고 제외(건수만 summary.old).
+    판정 status:
+      our_out   = 우리 창고 재고가 평소 1회 납품분도 안 됨 → 발주는 왔는데 못 보냈을 가능성 (생산·입고 서둘러야)
+      all_stop  = 이 품번이 모든 채널에서 60일 납품 없음 (판매 중단 의심 패널과 같은 품번)
+      stocked   = 그 채널 매장 판매는 계속되지만 채널 재고가 14일분 이상 → 재고가 넉넉해 안 시킨 것일 수 있음
+      omission  = 그 채널 매장 판매 계속 + 채널 재고 14일분 미만 → 발주 누락·지연 의심 (먼저 확인)
+      delisted  = 그 채널 POS는 보고되는데 최근 14일 판매 0 → 입점 중단·매대 빠짐 의심
+      unknown   = 그 채널이 POS를 안 줌 → 담당자 확인 필요"""
+    d = _sales_daily_canon()
+    if d is None:
+        return jsonify({'items': [], 'reason': '판매 API 자료 없음'})
+    end = d['_dt'].max()
+    dl = d[d['ea'] > 0]
+    _r60 = d[d['_dt'] >= end - pd.Timedelta(days=59)]
+    any_recent = set(_r60[(_r60['ea'] > 0) | (_r60['pos'].fillna(0) > 0)]['code'])   # 판매 중단 의심 패널과 같은 기준(납품 또는 매장 판매)
+    w14 = d[d['_dt'] >= end - pd.Timedelta(days=13)]
+    # 채널이 POS를 보고한 날은 그 SKU 빈칸 = 0 판매 (쿠팡은 안 팔린 날을 빈칸으로 줌) → 분모 = 채널 보고일 수 (검증 반영)
+    ch_pos_days = w14[w14['pos'].notna()].groupby('channel')['date'].nunique()
+    pos14 = w14.assign(pe_raw=w14['pos'].fillna(0) * w14['f']).groupby(['channel', 'code'])['pe_raw'].sum()
+    st7 = d[d['stock'].notna() & (d['_dt'] >= end - pd.Timedelta(days=7))].sort_values('date')
+    ch_stock = {}
+    for (ch, sku), g in st7.groupby(['channel', 'sku']):
+        r = g.iloc[-1]
+        k = (ch, r['code'])
+        ch_stock[k] = ch_stock.get(k, 0.0) + max(float(r['stock']), 0.0) * float(r['f'] or 1)
+    recent30 = dl[dl['_dt'] >= end - pd.Timedelta(days=29)].groupby('code')['channel_name'].agg(lambda s: sorted(set(s)))
+    names = _sales_name_map()
+    ours = _our_fg_stock()
+    items, old = [], 0
+    for (ch, code), g in dl.groupby(['channel', 'code']):
+        days = g.groupby('_dt')['ea'].sum().sort_index()
+        if len(days) < 6:
+            continue
+        gaps = days.index.to_series().diff().dt.days.dropna().tail(10)
+        med = float(gaps.median())
+        if med > 30:
+            continue
+        last = days.index[-1]
+        since = int((end - last).days)
+        if since <= max(med * 2.5, 7):
+            continue
+        if since > 120:
+            old += 1
+            continue
+        avg_q = float(days.tail(5).mean())
+        missed = max(since / med - 1, 1.0) if med > 0 else 1.0
+        nd = int(ch_pos_days.get(ch, 0))
+        pos_d = float(pos14.get((ch, code), 0.0)) / nd if nd >= 5 else None
+        chq = ch_stock.get((ch, code))
+        o = float(ours.get(code, 0))
+        if code not in any_recent:
+            status = 'all_stop'
+        elif o < avg_q:
+            status = 'our_out'          # 우리 창고에 평소 1회 납품분도 없음 → 못 보낸 것
+        elif pos_d is None:
+            status = 'unknown'          # 채널 자체가 POS를 안 줌 (GS슈퍼 등)
+        elif pos_d <= 0:
+            # 판매 0인데 채널 재고도 바닥이면 품절로 못 판 것(발주 누락), 재고가 있는데 0이면 매대 빠짐
+            status = 'omission' if (chq is not None and chq <= avg_q) else 'delisted'
+        elif chq is not None and pos_d > 0 and chq / pos_d >= 14:
+            status = 'stocked'
+        else:
+            status = 'omission'
+        cn = str(g['channel_name'].iloc[-1])
+        others = [c for c in recent30.get(code, []) if c != cn]
+        items.append({'channel': ch, 'channel_name': cn, 'code': code,
+                      'name': names.get(code, '') or str(g['name'].iloc[-1]),
+                      'med_gap': round(med, 1), 'since': since, 'last_delivery': last.strftime('%Y-%m-%d'),
+                      'avg_qty': int(avg_q), 'lost_qty': int(avg_q * missed),
+                      'pos_d': round(pos_d, 1) if pos_d is not None else None,
+                      'ch_stock': int(chq) if chq is not None else None,
+                      'cover_days': round(chq / pos_d, 1) if (chq is not None and pos_d) else None,
+                      'ours': int(o), 'others': others, 'status': status})
+    order = {'our_out': 0, 'omission': 1, 'delisted': 2, 'unknown': 3, 'stocked': 4, 'all_stop': 5}
+    items.sort(key=lambda x: (order[x['status']], -x['lost_qty']))
+    return jsonify({'items': items, 'as_of': end.strftime('%Y-%m-%d'),
+                    'summary': {**{k: sum(1 for x in items if x['status'] == k) for k in order}, 'old': old}})
+
+
+@app.route('/api/new_products', methods=['GET'])
+@cached_api()
+def api_new_products():
+    """신제품 초기 판매 추적 (2026-09-23) — 판매 API에서 처음 보인 날(납품·매장판매·재고 중 첫 활동)이 최근 90일 안인 품번(구품번 alias 통합).
+    그 채널 자료 시작 후 30일 안에 보인 품번은 원래 있던 제품이라 제외.
+    kind: new(신제품) / restart(60일 넘게 납품 없다가 최근 90일 안에 다시 납품 — 재출시·재입점). 지표는 시작(재개)일 이후만.
+    소진율 = POS 보고 채널의 매장 판매 ÷ 같은 채널 납품 (1에 가까울수록 보낸 만큼 팔림). 이마트처럼 채널 전체 POS가 빠진 날은 보고일 평균으로 채움.
+    재개는 재개 전 30일 매장 판매가 재개 후 30일의 5%(최소 10개) 이하일 때만 (계속 팔리다 보충된 건 제외).
+    verdict: early(3주 미만) / good(소진율 70%↑ 또는 POS 없으면 재주문 2회↑) / slow(4주↑·소진율 40%↓) / fading(최근 2주 판매가 그 전 2주보다 40%↓) / watch."""
+    d = _sales_daily_canon()
+    if d is None:
+        return jsonify({'items': []})
+    end = d['_dt'].max()
+    # '처음 보인 날' = 납품·매장판매·재고 중 하나라도 생긴 첫날. 채널마다 자료 시작일이 달라(홈플러스 납품 6/29~, 홈플 익스프레스 8/20~)
+    # 그 채널 자료가 시작된 지 30일 안에 보인 품번은 '원래 있던 제품'으로 보고 제외.
+    act = d[(d['ea'] > 0) | (d['pos'].fillna(0) > 0) | (d['stock'].fillna(0) > 0)]
+    ch_start = act.groupby('channel')['_dt'].min()
+    cf = act.groupby(['code', 'channel'])['_dt'].min().reset_index()
+    new = {}
+    for code, g in cf.groupby('code'):
+        r0 = g.sort_values('_dt').iloc[0]
+        if r0['_dt'] >= end - pd.Timedelta(days=89) and r0['_dt'] >= ch_start[r0['channel']] + pd.Timedelta(days=30):
+            new[code] = r0['_dt']
+    starts = {c: (t, 'new') for c, t in new.items()}
+    # 재개: 60일 넘게 납품이 없다가(또는 자료상 첫 납품) 최근 90일 안에 다시 납품 시작. 그 채널 납품 자료가 60일 이상 앞서 있어야
+    # (홈플러스처럼 납품 자료 자체가 6/29부터인 채널의 '첫 납품'은 자료 시작일 뿐이라 제외)
+    dl_all = d[d['ea'] > 0]
+    ch_dl_start = dl_all.groupby('channel')['_dt'].min()
+    for code, g in dl_all.groupby('code'):
+        if code in starts:
+            continue
+        by_day = g.groupby('_dt')['channel'].agg(lambda s: set(s)).sort_index()
+        idx = list(by_day.index)
+        for i in range(len(idx) - 1, -1, -1):
+            t = idx[i]
+            if t < end - pd.Timedelta(days=89):
+                break
+            if i == 0 or (t - idx[i - 1]).days >= 60:
+                if min(ch_dl_start[c] for c in by_day.iloc[i]) <= t - pd.Timedelta(days=60):
+                    # 실제로 매대에서 빠져 있었는지: 재개 전 30일 매장 판매가 재개 후 30일의 5%(최소 10개) 이하여야 함
+                    # (I0040처럼 채널 재고로 계속 팔리다 보충된 건 재개가 아님 — 검증 반영)
+                    gg = d[(d['code'] == code) & d['channel'].isin(by_day.iloc[i])]
+                    pre = float(gg[(gg['_dt'] < t) & (gg['_dt'] >= t - pd.Timedelta(days=30))]['pe'].sum())
+                    post = float(gg[(gg['_dt'] >= t) & (gg['_dt'] < t + pd.Timedelta(days=30))]['pe'].sum())
+                    if pre <= max(10.0, 0.05 * post):
+                        starts[code] = (t, 'restart')
+                break
+    rep = _pos_report(d)
+    pos_chs = {c for c, s in rep.items() if len(s) >= 14}     # POS를 꾸준히 주는 채널
+    ra = _pos_rates(d, rep, 14, 0).groupby('code')['rate'].sum()
+    rb = _pos_rates(d, rep, 14, 14).groupby('code')['rate'].sum()
+    chs = _channel_stock_by_code()
+    ours = _our_fg_stock()
+    names = _sales_name_map()
+    wend = end - pd.Timedelta(days=end.dayofweek)             # 이번 주 월요일
+    items = []
+    for code, (f0, kind) in starts.items():
+        g = d[(d['code'] == code) & (d['_dt'] >= f0)]      # 출시(재개)일 이후만
+        gd = g[g['ea'] > 0]
+        if gd.empty:
+            continue
+        if kind == 'restart' and gd['ea'].sum() < 50 and g['pe'].sum() < 50:
+            continue                                        # 몇 개 수준의 재개는 소음
+        age = int((end - f0).days)
+        chn = sorted(set(gd['channel_name']))
+        order_days = gd.groupby('channel')['date'].nunique()
+        reorders = int((order_days - 1).clip(lower=0).sum())
+        # 소진율: POS 주는 채널의 매장 판매(미보고일은 보고일 평균으로 채움) ÷ 같은 채널 납품
+        gp = g[g['channel'].isin(pos_chs)]
+        pos_total = 0.0
+        for c, gc in gp.groupby('channel'):
+            lo, hi = max(f0, min(rep[c])), max(rep[c])
+            if hi < lo:
+                continue
+            nrep = sum(1 for t in rep[c] if lo <= t <= hi)
+            ps = float(gc[(gc['_dt'] >= lo) & (gc['_dt'] <= hi)]['pe'].sum())
+            pos_total += ps * ((hi - lo).days + 1) / max(nrep, 1)
+        dl_pos = float(gp['ea'].sum())
+        st = pos_total / dl_pos if dl_pos > 0 else None
+        x_a, x_b = float(ra.get(code, 0)), float(rb.get(code, 0))   # 최근 2주 / 그 전 2주 매장 판매 일평균
+        trend = round((x_a - x_b) / x_b * 100) if x_b > 0 and age >= 28 else None
+        o = float(ours.get(code, 0))
+        dl14 = float(gd[gd['_dt'] > end - pd.Timedelta(days=14)]['ea'].sum())
+        wk_use = max(x_a * 7, dl14 / 2)                       # 창고는 납품으로 빠짐 → 매장 판매와 납품 중 큰 쪽
+        our_weeks = round(o / wk_use, 1) if wk_use > 0 else None
+        # 주별 납품·판매 — 최근 주부터 거꾸로 최대 14주, 각 주의 실제 일수(days) 포함 (부분 주는 화면에서 흐리게)
+        wk = []
+        w0 = max(f0 - pd.Timedelta(days=f0.dayofweek), wend - pd.Timedelta(weeks=13))
+        nwk = int((wend - w0).days // 7) + 1
+        for i in range(nwk):
+            a = w0 + pd.Timedelta(days=7 * i)
+            b = min(a + pd.Timedelta(days=6), end)
+            s = g[(g['_dt'] >= a) & (g['_dt'] <= b)]
+            wk.append({'w': a.strftime('%m/%d'), 'dl': int(s['ea'].sum()), 'pos': int(s['pe'].sum()),
+                       'days': int((b - max(a, f0)).days) + 1})
+        if age < 21:
+            verdict = 'early'
+        elif trend is not None and trend <= -40:
+            verdict = 'fading'
+        elif st is not None and st < 0.4 and age >= 28:
+            verdict = 'slow'
+        elif (st is not None and st >= 0.7) or (st is None and reorders >= 2):
+            verdict = 'good'
+        else:
+            verdict = 'watch'
+        items.append({'code': code, 'name': names.get(code, '') or str(gd['name'].iloc[-1]), 'first': f0.strftime('%Y-%m-%d'),
+                      'kind': kind, 'age': age, 'channels': chn, 'delivery': int(gd['ea'].sum()), 'reorders': reorders,
+                      'pos': int(pos_total), 'sell_through': round(st, 2) if st is not None else None, 'pos_trend': trend,
+                      'ch_stock': int(chs[code]['qty']) if code in chs else None, 'ours': int(o), 'our_weeks': our_weeks,
+                      'short': bool(our_weeks is not None and our_weeks < 2 and verdict in ('good', 'watch', 'early')),
+                      'weeks': wk, 'verdict': verdict})
+    items.sort(key=lambda x: (x['kind'] != 'new', -pd.Timestamp(x['first']).value))   # 신제품 먼저, 최근 시작 순
+    return jsonify({'items': items, 'as_of': end.strftime('%Y-%m-%d'),
+                    'summary': {**{k: sum(1 for x in items if x['verdict'] == k) for k in ('good', 'watch', 'slow', 'fading', 'early')},
+                                'new': sum(1 for x in items if x['kind'] == 'new'), 'restart': sum(1 for x in items if x['kind'] == 'restart')}})
+
+
+_ABC_CACHE = {}
+
+
+def _sales_abc():
+    """최근 90일 공급가 매출 기준 품번 ABC — A=누적 80%까지, B=95%까지, C=나머지. {code: {...}} + 채널 비중. id(DF) 캐시."""
+    df = SALES_DAILY_DF
+    if df is None or df.empty or 'amt' not in df.columns:
+        return None
+    if _ABC_CACHE.get('key') == id(df):
+        return _ABC_CACHE['val']
+    d = _sales_daily_canon()
+    end = d['_dt'].max()
+    r = d[(d['_dt'] > end - pd.Timedelta(days=90)) & (d['amt'] > 0)]
+    tot = float(r['amt'].sum())
+    if tot <= 0:
+        return None
+    s = r.groupby('code')['amt'].sum().sort_values(ascending=False)
+    cum = s.cumsum() / tot
+    by = {}
+    prev = 0.0
+    for c, v in s.items():
+        # 누적 비중 '시작점'으로 등급 — 80% 경계를 걸치는 품번은 A
+        g = 'A' if prev < 0.80 else ('B' if prev < 0.95 else 'C')
+        by[c] = {'grade': g, 'amt': int(v), 'share': round(float(v) / tot * 100, 2), 'cum': round(float(cum[c]) * 100, 1)}
+        prev = float(cum[c])
+    # 홈플러스·하이퍼·익스프레스는 한 거래처로 묶어 의존도 계산 (통합 피드가 하위 채널과 겹침 — 검증 반영)
+    r = r.assign(retailer=r['channel_name'].where(~r['channel_name'].astype(str).str.startswith('홈플러스'), '홈플러스(계열)'))
+    cc = r.groupby(['code', 'retailer'])['amt'].sum()
+    for c in by:
+        x = cc.loc[c].sort_values(ascending=False)
+        by[c]['top_channel'] = str(x.index[0])
+        by[c]['top_share'] = round(float(x.iloc[0]) / float(x.sum()) * 100)
+        by[c]['n_channels'] = int((x > 0).sum())
+    # 시즌·일회성: 90일 동안 납품일 5일 이하 + 최근 14일 납품 없음 (명절 선물세트 등) → 우선관리 목록에서 제외
+    dl90 = d[(d['_dt'] > end - pd.Timedelta(days=90)) & (d['ea'] > 0)]
+    n90 = dl90.groupby('code')['date'].nunique()
+    rec14 = set(dl90[dl90['_dt'] > end - pd.Timedelta(days=14)]['code'])
+    for c in by:
+        by[c]['seasonal'] = bool(int(n90.get(c, 0)) <= 5 and c not in rec14)
+    chan = r.groupby('retailer')['amt'].sum().sort_values(ascending=False)
+    val = {'by': by, 'total': int(tot), 'from': (end - pd.Timedelta(days=89)).strftime('%Y-%m-%d'), 'to': end.strftime('%Y-%m-%d'),
+           'channels': [{'name': k, 'amt': int(v), 'share': round(float(v) / tot * 100, 1)} for k, v in chan.items()]}
+    _ABC_CACHE.update(key=id(df), val=val)
+    return val
+
+
+@app.route('/api/sales_abc', methods=['GET'])
+@cached_api()
+def api_sales_abc():
+    """매출 집중도 (2026-09-23) — 최근 90일 매출 ABC 등급 + 채널 비중 + 'A등급인데 창고 4주 미만'(수급 플래너 판정) 우선 관리 목록.
+    A 품번의 한 채널 의존도(top_share)도 표시 — 한 채널이 90% 이상이면 그 채널 발주 변동에 크게 흔들림."""
+    abc = _sales_abc()
+    if not abc:
+        return jsonify({'grades': {}, 'items': [], 'channels': []})
+    with app.test_request_context('/api/supply_plan'):
+        sp = api_supply_plan().get_json() or {}
+    plan = {x['code']: x for x in sp.get('items', [])}
+    names = _sales_name_map()
+    items = []
+    for c, v in abc['by'].items():
+        p = plan.get(c, {})
+        items.append({'code': c, 'name': names.get(c, '') or p.get('name', ''), **v,
+                      'level': p.get('level'), 'cov_weeks': p.get('cov_weeks'), 'stock': p.get('stock'),
+                      'ch_note': p.get('ch_note', ''), 'cov_ch_weeks': p.get('cov_ch_weeks')})
+    grades = {}
+    for g in ('A', 'B', 'C'):
+        xs = [x for x in items if x['grade'] == g]
+        grades[g] = {'n': len(xs), 'amt': sum(x['amt'] for x in xs), 'share': round(sum(x['amt'] for x in xs) / abc['total'] * 100, 1)}
+    risk = [x for x in items if x['grade'] == 'A' and x['level'] in ('out', 'critical', 'warning') and not x['seasonal']]
+    return jsonify({'grades': grades, 'items': items, 'risk': risk, 'channels': abc['channels'], 'total': abc['total'],
+                    'seasonal': [x['code'] for x in items if x['grade'] == 'A' and x['seasonal']],
+                    'from': abc['from'], 'to': abc['to'],
+                    'dependence': sum(1 for x in items if x['grade'] == 'A' and x['top_share'] >= 90)})
 
 
 @app.route('/api/vendor_scorecard', methods=['GET'])
@@ -10333,8 +10940,55 @@ def api_sales_summary():
     kpi = {'latest_month': latest, 'latest_amount': int(cur_amt), 'prev_amount': int(prev_amt),
            'mom_pct': round((cur_amt - prev_amt) / prev_amt * 100, 1) if prev_amt > 0 else 0,
            'avg_12m': int(sum(monthly[m] for m in months[-12:]) / max(len(months[-12:]), 1))}
+    # 이번 달 전망 (2026-09-23): 자료 최종일까지 누계 ÷ 경과일 × 월 일수 + 전월 같은 날짜까지 누계 비교
+    forecast = None
+    try:
+        import calendar as _cal
+        last_d = pd.to_datetime(df['date'].max())     # 매출 없는 날(일요일 등)도 경과일에 포함
+        ym_l = last_d.strftime('%Y-%m')
+        dim = _cal.monthrange(last_d.year, last_d.month)[1]
+        if last_d.day < dim:
+            # (검증 반영) 채널마다 자료가 들어온 마지막 날까지만 비교(롯데 하루·이마트 이틀 늦음),
+            # 전월 비교는 양쪽 다 매출 있던 채널끼리(홈플러스하이퍼처럼 이번 달 새로 잡힌 채널은 따로 표시), 비교 일수는 min(오늘, 전월 일수)
+            pm_first = (last_d.replace(day=1) - pd.Timedelta(days=1)).replace(day=1)
+            pym = pm_first.strftime('%Y-%m')
+            pdim = _cal.monthrange(pm_first.year, pm_first.month)[1]
+            dd = d.assign(_dt=pd.to_datetime(d['date']))
+            dd['_day'] = dd['_dt'].dt.day
+            freq = dd[dd['_dt'] > last_d - pd.Timedelta(days=28)].groupby('channel_name')['date'].nunique()
+            # 자료 도착일 = 그 채널 '행'이 있는 마지막 날 (납품 없는 주말도 POS·재고 행은 옴 → 매출 0인 날을 지연으로 오인하지 않게)
+            chlast = pd.to_datetime(df.groupby('channel_name')['date'].max())
+            cur, prv = dd[dd['ym'] == ym_l], dd[dd['ym'] == pym]
+            mtd = runrate = cur_same = prev_same = 0.0
+            lagging, new_ch = [], []
+            for ch in sorted(set(cur['channel_name']) | set(prv['channel_name'])):
+                cut_day = last_d.day
+                lc = chlast.get(ch)
+                if int(freq.get(ch, 0)) >= 14 and lc is not None and lc.strftime('%Y-%m') == ym_l and lc.day < last_d.day:
+                    cut_day = lc.day
+                    lagging.append(f'{ch} {lc.month}/{lc.day}')
+                gc, gp = cur[cur['channel_name'] == ch], prv[prv['channel_name'] == ch]
+                m = float(gc['amt'].sum())
+                nd = min(cut_day, pdim)
+                cs = float(gc[gc['_day'] <= nd]['amt'].sum())
+                ps = float(gp[gp['_day'] <= nd]['amt'].sum())
+                mtd += m
+                runrate += m / cut_day * dim
+                if ps > 0:
+                    cur_same += cs
+                    prev_same += ps
+                elif m > 0:
+                    new_ch.append({'name': ch, 'amount': int(m)})
+            new_ch.sort(key=lambda x: -x['amount'])
+            forecast = {'ym': ym_l, 'day': int(last_d.day), 'dim': dim, 'mtd': int(mtd), 'runrate': int(runrate),
+                        'prev_ym': pym, 'prev_total': int(monthly.get(pym, 0)), 'cmp_day': int(min(last_d.day, pdim)),
+                        'cur_same': int(cur_same), 'prev_same': int(prev_same),
+                        'vs_prev_same_pct': round((cur_same - prev_same) / prev_same * 100, 1) if prev_same > 0 else None,
+                        'new_channels': new_ch, 'lagging': lagging, 'hp_fix': SALES_SOURCE.get('hp_fix')}
+    except Exception as e:
+        print(f'[매출 전망] 계산 실패: {e!r:.100}')
     return jsonify({'monthly': [{'ym': m, 'amount': int(monthly[m])} for m in months], 'div_map': div_map,
-                    'latest_month': latest, 'kpi': kpi, 'as_of': str(d['date'].max()),
+                    'latest_month': latest, 'kpi': kpi, 'as_of': str(d['date'].max()), 'forecast': forecast,
                     'current_month': datetime.now().strftime('%Y-%m'),
                     'source': '온라인팀 판매자료 · 공급가(VAT 제외) · 온라인+오프라인'})
 
@@ -10547,8 +11201,21 @@ def api_sales_qty():
                     'avg_months': len(last3), 'has_amt': has_amt})
 
 
+_NAME_MAP_CACHE = {}
+
+
 def _sales_name_map():
-    """품번 → 표시명 (BOM 모품명 우선, 단가/현재고/출하 품명 보완). sales_qty와 동일 규칙."""
+    """품번 → 표시명 (BOM 모품명 우선, 단가/현재고/출하 품명 보완). sales_qty와 동일 규칙.
+    원천 DF가 바뀔 때만 다시 계산 (iterrows로 2~4초 걸려 여러 패널이 동시에 부르면 첫 화면이 1분 넘게 걸렸음 — 2026-09-28). 호출자가 고쳐 써도 되게 복사본 반환."""
+    key = (id(BOM_DF), id(PRICE_DF), id(STOCK_DF), id(SHIP_DF))
+    if _NAME_MAP_CACHE.get('key') == key:
+        return dict(_NAME_MAP_CACHE['val'])
+    val = _sales_name_map_build()
+    _NAME_MAP_CACHE.update(key=key, val=val)
+    return dict(val)
+
+
+def _sales_name_map_build():
     name_of = {}
     if BOM_DF is not None and not BOM_DF.empty:
         for _, r in BOM_DF.drop_duplicates('모품번').iterrows():
@@ -11104,7 +11771,32 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .wd-bar i { display: block; height: 100%; }
   .wd-row .n { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-2); }
   .wd-row .p { text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
-  @media (max-width: 900px) { .lens-strip { grid-template-columns: 1fr; padding: 0 12px; } }
+  .chart-panel.lens-shift { border-top: 3px solid #db2777; }
+  .chart-panel.lens-dormant { border-top: 3px solid #a16207; grid-column: span 2; }
+  .dorm-mats { font-size: 10.5px; color: var(--text-2); margin-top: 3px; line-height: 1.55; }
+  .dorm-mats .m { display: inline-block; margin-right: 8px; white-space: nowrap; }
+  .dorm-mats .m b { color: #92400e; }
+  .dorm-mats .warn { color: #b45309; font-weight: 600; }
+  .chart-panel.lens-gaps { border-top: 3px solid #b91c1c; }
+  .chart-panel.lens-new { border-top: 3px solid #16a34a; }
+  .chart-panel.lens-abc { border-top: 3px solid #7c3aed; }
+  .np-spark { display: block; margin-top: 4px; }
+  .np-kind { display: inline-block; font-size: 9.5px; font-weight: 700; padding: 0 5px; border-radius: 4px; margin-right: 4px; vertical-align: 1px; }
+  .np-kind.new { background: #dcfce7; color: #15803d; } .np-kind.restart { background: #e0f2fe; color: #0369a1; }
+  .abc-grades { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-bottom: 8px; }
+  .abc-grades div { border-radius: 8px; padding: 5px 8px; font-size: 10.5px; color: var(--text-2); background: #f8fafc; border: 1px solid var(--border); }
+  .abc-grades b { display: block; font-size: 15px; color: var(--text-1); }
+  .abc-grades .ga { background: #f5f3ff; border-color: #ddd6fe; } .abc-grades .ga b { color: #6d28d9; }
+  .abc-chbar { display: flex; height: 12px; border-radius: 6px; overflow: hidden; margin: 2px 0 4px; }
+  .abc-chbar i { display: block; height: 100%; }
+  .abc-legend { font-size: 10px; color: var(--text-3); line-height: 1.6; margin-bottom: 6px; }
+  .abc-legend span { white-space: nowrap; margin-right: 8px; }
+  .abc-legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 3px; vertical-align: 0; }
+  .abc-chip { display: inline-block; font-size: 9.5px; font-weight: 800; padding: 0 5px; border-radius: 4px; vertical-align: 1px; }
+  .abc-chip.A { background: #ede9fe; color: #6d28d9; } .abc-chip.B { background: #f1f5f9; color: #475569; }
+  .sb-forecast { font-size: 11.5px; color: #1f5f55; background: #eef8f6; border: 1px solid #cfe9e3; border-radius: 8px; padding: 6px 10px; margin: -2px 0 8px; line-height: 1.5; }
+  .sb-forecast b { color: #0f766e; }
+  @media (max-width: 900px) { .lens-strip { grid-template-columns: 1fr; padding: 0 12px; } .chart-panel.lens-dormant { grid-column: auto; } }
   .chart-panel.salesbase-panel { border-top: 3px solid #3f9e8f; }
   .salesbase-body { display: grid; grid-template-columns: 1fr 1.7fr; gap: 16px; align-items: start; }
   .salesbase-chart-wrap { height: 460px; position: relative; min-width: 0; }
@@ -12699,6 +13391,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         <div id="sb-kpi" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
       </div>
     </div>
+    <div id="sb-forecast" class="sb-forecast" style="display:none"></div>
     <div class="salesbase-body">
       <div class="salesbase-chart-wrap"><canvas id="salesBaseChart"></canvas></div>
       <div class="salesbase-side">
@@ -12746,6 +13439,51 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       <div><span class="chart-title">📅 납품 요일 패턴</span><span class="chart-sub" id="wd-sub">최근 12주</span></div>
     </div>
     <div id="wd-body"><div class="loading" style="padding:20px">로딩 중...</div></div>
+  </div>
+  <!-- 2026-09-23: 수요 급변 · 판매 중단 의심 -->
+  <div class="chart-panel lens-shift">
+    <div class="chart-head">
+      <div><span class="chart-title">⚡ 수요 급변</span><span class="chart-sub" id="shift-sub">매장 실판매 최근 2주 vs 그 전 4주 · ±30% 이상 · 클릭=상세</span></div>
+      <div id="shift-count" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
+    </div>
+    <div id="shift-summary" style="font-size:11px;color:var(--text-2);margin-bottom:6px"></div>
+    <div id="shift-list" class="alert-list"><div class="loading" style="padding:20px">로딩 중...</div></div>
+  </div>
+  <div class="chart-panel lens-dormant">
+    <div class="chart-head">
+      <div><span class="chart-title">💤 판매 중단 의심 · 전용 자재</span><span class="chart-sub" id="dorm-sub">최근 60일 납품 없는 품번 · 그 품번에만 쓰는 부자재·원료 재고 · 클릭=상세</span></div>
+      <div id="dorm-count" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
+    </div>
+    <div id="dorm-summary" style="font-size:11px;color:var(--text-2);margin-bottom:6px;line-height:1.55"></div>
+    <div id="dorm-list" class="alert-list"><div class="loading" style="padding:20px">로딩 중...</div></div>
+  </div>
+  <!-- 2026-09-23: 채널별 납품 끊김 · 신제품/재개 추적 · 매출 집중도(ABC) -->
+  <div class="chart-panel lens-gaps">
+    <div class="chart-head">
+      <div><span class="chart-title">⛔ 채널별 납품 끊김</span><span class="chart-sub">평소 주기의 2.5배 넘게 납품 없음 · 클릭=상세</span></div>
+      <div id="dgap-count" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
+    </div>
+    <div id="dgap-summary" style="font-size:11px;color:var(--text-2);margin-bottom:6px;line-height:1.55"></div>
+    <div id="dgap-list" class="alert-list"><div class="loading" style="padding:20px">로딩 중...</div></div>
+  </div>
+  <div class="chart-panel lens-new">
+    <div class="chart-head">
+      <div><span class="chart-title">🌱 신제품·재개 추적</span><span class="chart-sub">최근 90일 시작 · 매장 소진율 · 주별 납품/판매 · 클릭=상세</span></div>
+      <div id="newp-count" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
+    </div>
+    <div id="newp-summary" style="font-size:11px;color:var(--text-2);margin-bottom:6px;line-height:1.55"></div>
+    <div id="newp-list" class="alert-list"><div class="loading" style="padding:20px">로딩 중...</div></div>
+  </div>
+  <div class="chart-panel lens-abc">
+    <div class="chart-head">
+      <div><span class="chart-title">🎯 매출 집중도 (ABC)</span><span class="chart-sub" id="abc-sub">최근 90일 매출 · A=누적 80%</span></div>
+      <div class="vk-chips" id="abc-mode">
+        <button class="vk-chip on" data-m="risk" onclick="setAbcMode('risk',this)">A 수급 위험</button>
+        <button class="vk-chip" data-m="a" onclick="setAbcMode('a',this)">A 전체</button>
+      </div>
+    </div>
+    <div id="abc-head"></div>
+    <div id="abc-list" class="alert-list"><div class="loading" style="padding:20px">로딩 중...</div></div>
   </div>
 </section>
 
@@ -14595,7 +15333,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       return '<div class="alert-row" onclick="openItemModal(\\'' + x.code + '\\')">'
         + '<span class="alert-badge ' + cls + '">' + lb + '</span>'
         + '<div><div class="alert-name">' + escapeHtml(x.name || x.code) + '</div>'
-        + '<div class="alert-code">' + escapeHtml(x.code) + ' · ' + x.cls + ' · 월판매 ' + fmtInt(x.monthly) + tr + plus + '</div>'
+        + '<div class="alert-code">' + (x.abc === 'A' || x.abc === 'B' ? '<span class="abc-chip ' + x.abc + '" title="최근 90일 매출 ' + x.abc + '등급">' + x.abc + '</span> ' : '') + escapeHtml(x.code) + ' · ' + x.cls + ' · 월판매 ' + fmtInt(x.monthly) + tr + plus + '</div>'
         + (x.ch_stock != null ? '<div class="alert-code" style="margin-top:1px">채널재고 ' + fmtInt(x.ch_stock) + ' → 채널 포함 <b>' + x.cov_ch_weeks + '주</b>'
             + (x.ch_note ? ' <span class="ch-tag' + (x.ch_note === '채널 여유' ? ' on' : '') + '">' + x.ch_note + '</span>' : '') + '</div>' : '')
         + '</div>'
@@ -14656,6 +15394,202 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       }).join('');
     } catch (e) { list.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
   }
+  // ───── 수요 급변 (2026-09-23) ─────
+  async function loadDemandShift() {
+    const list = document.getElementById('shift-list');
+    try {
+      const d = await (await fetch('/api/demand_shift')).json();
+      const items = d.items || [], s = d.summary || {};
+      document.getElementById('shift-count').textContent = items.length + '건';
+      document.getElementById('shift-summary').innerHTML = '<b style="color:#be123c">급증 ' + (s.up || 0) + '</b> 자재·재고 부족 주의 · '
+        + '<b style="color:#1d4ed8">급감 ' + (s.down || 0) + '</b> 과잉 발주 주의' + (s.stockout ? ' (그중 ' + s.stockout + '건은 채널 품절 영향일 수 있음)' : '')
+        + '<br><span style="color:var(--text-3)">발주 계산의 판매속도는 4주·3개월 평균이라 이런 급변을 늦게 따라갑니다 · 채널마다 자기 마지막 자료일 기준'
+        + (d.excluded_channels && d.excluded_channels.length ? ' · 자료 부족 제외: ' + escapeHtml(d.excluded_channels.join(', ')) : '') + '</span>';
+      if (!items.length) { list.innerHTML = '<div class="alert-empty">큰 변화 없음 👍</div>'; return; }
+      list.innerHTML = items.slice(0, 40).map(x => {
+        const up = x.dir === 'up', so = !!x.note;
+        const col = up ? '#be123c' : '#1d4ed8';
+        const badge = so ? '<span class="alert-badge low" style="background:#f1f5f9;color:#475569">품절 영향?</span>'
+          : '<span class="alert-badge ' + (up ? 'out' : 'low') + '" style="' + (up ? '' : 'background:#dbeafe;color:#1d4ed8') + '">' + (up ? '수요 급증' : '수요 급감') + '</span>';
+        const R = v => fmtInt(Math.round(v));
+        // 변화 주도 채널: 품번 전체와 같은 흐름이면 채널명만, 여러 채널이면 그 채널 수치도
+        const tc = x.top_channel ? ' · ' + escapeHtml(x.top_channel.name) + (Math.round(x.top_channel.r14) === Math.round(x.r14) && Math.round(x.top_channel.r28) === Math.round(x.r28) ? ' 단독' : ' ' + R(x.top_channel.r28) + '→' + R(x.top_channel.r14)) : '';
+        const extra = (x.ch_stock != null ? ' · 채널재고 ' + fmtInt(x.ch_stock) : '') + (x.vel != null ? ' · 발주 계산 속도 하루 ' + R(x.vel) : '');
+        const big = x.pct == null ? '신규' : (x.pct > 0 ? '+' : '') + fmtInt(x.pct) + '%';
+        return '<div class="alert-row" onclick="openItemModal(&quot;' + x.code + '&quot;)">' + badge
+          + '<div><div class="alert-name">' + escapeHtml(x.name) + '</div>'
+          + '<div class="alert-code">' + escapeHtml(x.code) + ' · 하루 <b>' + R(x.r28) + '</b> → <b style="color:' + col + '">' + R(x.r14) + '</b>개' + tc + extra
+          + (so ? ' · <span style="color:#b45309">' + escapeHtml(x.note) + '</span>' : '') + '</div></div>'
+          + '<div class="alert-qty"></div>'
+          + '<div class="alert-days" style="text-align:right;line-height:1.25;color:' + (so ? '#64748b' : col) + '"><div>' + big + '</div><div style="font-size:10px;font-weight:600;color:var(--text-3);white-space:nowrap">하루 ' + (x.diff_d > 0 ? '+' : '') + R(x.diff_d) + '개</div></div></div>';
+      }).join('');
+    } catch (e) { list.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
+  }
+
+  // ───── 판매 중단 의심 · 전용 자재 (2026-09-23) ─────
+  async function loadDormant() {
+    const list = document.getElementById('dorm-list');
+    const won = v => v >= 1e8 ? (v / 1e8).toFixed(1) + '억' : (v >= 1e4 ? fmtInt(Math.round(v / 1e4)) + '만' : fmtInt(v));
+    try {
+      const d = await (await fetch('/api/dormant_items')).json();
+      const items = d.items || [], s = d.summary || {};
+      document.getElementById('dorm-count').textContent = (s.count || 0) + '품번' + (s.po ? ' (+발주 ' + s.po + ')' : '');
+      document.getElementById('dorm-summary').innerHTML = '최근 ' + (d.days || 60) + '일 납품도 매장 판매도 없는 품번 <b>' + (s.count || 0) + '개</b>'
+        + (s.po ? ' <span style="color:var(--text-3)">(+ 최근 발주가 있어 제외한 ' + s.po + '개는 목록 맨 아래)</span>' : '')
+        + ' · 그 품번에만 쓰는 부자재·원료 <b style="color:#92400e">' + (s.mat_count || 0) + '종 ' + won(s.mat_value || 0) + '원</b>'
+        + (s.mat_maybe_count ? ' <span style="color:var(--text-3)">(+ 판매자료에 없는 다른 완제품도 쓰는 자재 ' + s.mat_maybe_count + '종 ' + won(s.mat_maybe_value) + '원)</span>' : '')
+        + (s.ours_value ? ' · 창고 완제품 ' + won(s.ours_value) + '원' : '')
+        + '<br><span style="color:var(--text-3)">→ 이 자재는 추가 발주를 멈추고 남은 재고 처리를 검토하세요. ※ 온라인팀 판매자료 채널 기준이라 홀세일·B2B로만 나가는 품목은 따로 확인 필요</span>';
+      if (!items.length) { list.innerHTML = '<div class="alert-empty">판매 중단 의심 품번 없음 👍</div>'; return; }
+      const ST = { stopped: ['판매 멈춤', 'background:#fee2e2;color:#b91c1c'], selling: ['채널 재고로 판매 중', 'background:#fef3c7;color:#92400e'], po: ['최근 발주 있음', 'background:#dbeafe;color:#1d4ed8'] };
+      list.innerHTML = items.map(x => {
+        const st = ST[x.status] || ST.stopped;
+        const mats = (x.materials || []).map(m => '<span class="m">' + escapeHtml(m.code) + ' ' + escapeHtml((m.name || '').slice(0, 22)) + ' <b>' + fmtInt(m.qty) + '</b>'
+          + (m.value ? ' (' + won(m.value) + ')' : '') + (m.unknown_users ? ' <span class="warn" title="판매자료에 안 나오는 다른 완제품도 이 자재를 씀">⚠ 다른 제품 ' + m.unknown_users + '개도 사용</span>' : '')
+          + (m.shared && m.shared.length > 1 ? ' <span style="color:var(--text-3)">(' + escapeHtml(m.shared.join('·')) + ' 공용)</span>' : '') + '</span>').join('');
+        const tot = (x.mat_value || 0) + (x.ours_value || 0);   // ⚠ 다른 제품도 쓰는 자재는 합계에서 뺌
+        return '<div class="alert-row" onclick="openItemModal(&quot;' + x.code + '&quot;)">'
+          + '<span class="alert-badge" style="' + st[1] + '">' + st[0] + '</span>'
+          + '<div><div class="alert-name">' + escapeHtml(x.name) + '</div>'
+          + '<div class="alert-code">' + escapeHtml(x.code) + ' · 마지막 납품 ' + x.last_delivery.slice(5).replace('-', '/') + ' (' + x.days_since + '일 전) · 올해 납품 ' + fmtInt(x.total_delivery)
+          + (x.last_sale ? ' · 마지막 매장 판매 ' + x.last_sale.slice(5).replace('-', '/') : '')
+          + ' · 창고 <b>' + fmtInt(x.ours) + '</b>개' + (x.ours_value ? ' (' + won(x.ours_value) + (x.ours_value_src === 'BOM원가' ? ', BOM 원가' : '') + ')' : (x.ours > 0 ? ' (금액 미상)' : ''))
+          + (x.pos14 ? ' · 최근 2주 매장 판매 ' + fmtInt(x.pos14) + ' (채널재고 ' + fmtInt(x.ch_stock) + ')' : '')
+          + (x.recent_po ? ' · 발주 ' + x.recent_po.slice(4, 6) + '/' + x.recent_po.slice(6, 8) : '') + '</div>'
+          + (mats ? '<div class="dorm-mats">전용 자재 · ' + mats + '</div>' : '') + '</div>'
+          + '<div class="alert-qty"></div>'
+          + '<div class="alert-days" style="text-align:right;line-height:1.25;color:#92400e"><div>' + (tot ? won(tot) : '-') + '</div><div style="font-size:10px;font-weight:600;color:var(--text-3);white-space:nowrap">전용 자재+창고</div>'
+          + (x.mat_maybe_value ? '<div style="font-size:10px;font-weight:600;color:#b45309;white-space:nowrap">⚠ 공용 가능 ' + won(x.mat_maybe_value) + '</div>' : '') + '</div></div>';
+      }).join('');
+    } catch (e) { list.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
+  }
+
+  // ───── 채널별 납품 끊김 (2026-09-23) ─────
+  const DGAP_ST = {
+    our_out: ['우리 창고 부족', 'background:#fee2e2;color:#b91c1c', '창고에 평소 1회 납품분도 없어 못 보냈을 가능성 → 생산·입고 서두르기'],
+    omission: ['발주 누락 의심', 'background:#ffedd5;color:#c2410c', '매장에선 계속 팔리는데 채널 재고 2주분 미만 → 채널 담당자에게 발주 확인'],
+    delisted: ['입점 중단 의심', 'background:#fce7f3;color:#be185d', '그 채널 매장 판매가 최근 2주 0 → 매대 빠짐·입점 종료 확인'],
+    unknown: ['확인 필요', 'background:#f1f5f9;color:#475569', '그 채널이 매장 판매(POS)를 안 줘서 원인 판단 불가'],
+    stocked: ['채널 재고 충분', 'background:#dcfce7;color:#15803d', '채널 재고가 2주분 이상 → 안 시킨 게 정상일 수 있음'],
+    all_stop: ['전 채널 중단', 'background:#e5e7eb;color:#374151', '모든 채널 60일 납품·매장 판매 없음 → 판매 중단 의심 패널 참고'],
+  };
+  async function loadDeliveryGaps() {
+    const list = document.getElementById('dgap-list');
+    try {
+      const d = await (await fetch('/api/delivery_gaps')).json();
+      const items = d.items || [], s = d.summary || {};
+      const act = (s.our_out || 0) + (s.omission || 0) + (s.delisted || 0);
+      document.getElementById('dgap-count').textContent = items.length + '건';
+      document.getElementById('dgap-summary').innerHTML = ['our_out', 'omission', 'delisted', 'unknown', 'stocked', 'all_stop']
+          .filter(k => s[k]).map(k => '<span title="' + DGAP_ST[k][2] + '"><b style="' + DGAP_ST[k][1] + ';padding:0 5px;border-radius:4px">' + DGAP_ST[k][0] + ' ' + s[k] + '</b></span>').join(' ')
+        + '<br><span style="color:var(--text-3)">먼저 볼 것 ' + act + '건 (위쪽) · 평소 주기 = 최근 10회 납품 간격 중앙값' + (s.old ? ' · 120일 넘게 끊긴 ' + s.old + '건은 오래된 종료로 제외' : '') + '</span>';
+      if (!items.length) { list.innerHTML = '<div class="alert-empty">끊긴 납품 없음 👍</div>'; return; }
+      list.innerHTML = items.map(x => {
+        const st = DGAP_ST[x.status] || DGAP_ST.unknown;
+        const chInfo = (x.pos_d != null ? ' · 매장 하루 ' + fmtInt(Math.round(x.pos_d)) + '개' : '')
+          + (x.ch_stock != null ? ' · 채널재고 ' + fmtInt(x.ch_stock) + (x.cover_days != null ? ' (' + fmtInt(Math.round(x.cover_days)) + '일분)' : '') : '')
+          + ' · 창고 ' + fmtInt(x.ours);
+        return '<div class="alert-row" onclick="openItemModal(&quot;' + x.code + '&quot;)" title="' + st[2] + '">'
+          + '<span class="alert-badge" style="' + st[1] + '">' + st[0] + '</span>'
+          + '<div><div class="alert-name">' + escapeHtml(x.name) + '</div>'
+          + '<div class="alert-code">' + escapeHtml(x.code) + ' · <b>' + escapeHtml(x.channel_name) + '</b> · 평소 ' + x.med_gap + '일마다 ' + fmtInt(x.avg_qty) + '개 → 마지막 ' + x.last_delivery.slice(5).replace('-', '/') + chInfo + '</div>'
+          + (x.others && x.others.length ? '<div class="alert-code" style="margin-top:1px;color:#15803d">다른 채널은 납품 중: ' + escapeHtml(x.others.join(', ')) + '</div>' : '') + '</div>'
+          + '<div class="alert-qty"></div>'
+          + '<div class="alert-days" style="text-align:right;line-height:1.25;color:#b91c1c"><div>' + x.since + '일째</div><div style="font-size:10px;font-weight:600;color:var(--text-3);white-space:nowrap">평소 ' + x.med_gap + '일</div></div></div>';
+      }).join('');
+    } catch (e) { list.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
+  }
+
+  // ───── 신제품·재개 추적 (2026-09-23) ─────
+  const NP_V = { good: ['순항', 'background:#dcfce7;color:#15803d'], watch: ['지켜보기', 'background:#f1f5f9;color:#475569'],
+                 slow: ['재고 쌓임', 'background:#fef3c7;color:#92400e'], fading: ['판매 둔화', 'background:#dbeafe;color:#1d4ed8'],
+                 early: ['초기', 'background:#f3e8ff;color:#7e22ce'] };
+  function npSpark(weeks) {   // 주별 납품(연회색)·매장 판매(초록) 막대. 며칠치뿐인 주(출시 주·이번 주)는 7일 환산 높이 + 흐리게
+    if (!weeks || !weeks.length) return '';
+    const k = w => 7 / Math.max(1, Math.min(7, w.days || 7));
+    const mx = Math.max(1, ...weeks.map(w => Math.max(w.dl, w.pos * k(w))));
+    const bw = 9, gap = 3, h = 24, W = weeks.length * (bw + gap);
+    return '<svg class="np-spark" width="' + W + '" height="' + h + '" viewBox="0 0 ' + W + ' ' + h + '">'
+      + weeks.map((w, i) => {
+          const part = (w.days || 7) < 7, op = part ? ' fill-opacity="0.45"' : '';
+          const x = i * (bw + gap), hd = Math.min(h, Math.round(w.dl / mx * h)), hp = Math.min(h, Math.round(w.pos * k(w) / mx * h));
+          const tt = '<title>' + w.w + ' 주' + (part ? ' (' + w.days + '일치)' : '') + ' 납품 ' + w.dl + ' / 판매 ' + w.pos + '</title>';
+          return '<rect x="' + x + '" y="' + (h - hd) + '" width="' + bw + '" height="' + hd + '" fill="#cbd5e1"' + op + '>' + tt + '</rect>'
+            + '<rect x="' + (x + 2) + '" y="' + (h - hp) + '" width="' + (bw - 4) + '" height="' + hp + '" fill="#16a34a"' + op + '>' + tt + '</rect>';
+        }).join('') + '</svg>';
+  }
+  async function loadNewProducts() {
+    const list = document.getElementById('newp-list');
+    try {
+      const d = await (await fetch('/api/new_products')).json();
+      const items = d.items || [], s = d.summary || {};
+      document.getElementById('newp-count').textContent = items.length + '건';
+      document.getElementById('newp-summary').innerHTML = '<span class="np-kind new">신제품</span>' + (s.new || 0) + ' · <span class="np-kind restart">재개</span>' + (s.restart || 0)
+        + ' (60일 넘게 쉬었다 다시 납품) · ' + ['good', 'watch', 'slow', 'fading', 'early'].filter(k => s[k]).map(k => '<b style="' + NP_V[k][1] + ';padding:0 5px;border-radius:4px">' + NP_V[k][0] + ' ' + s[k] + '</b>').join(' ')
+        + '<br><span style="color:var(--text-3)">소진율 = 매장 판매 ÷ 납품 (매장 판매 자료 주는 채널만) · 막대: 회색 납품, 초록 매장 판매</span>';
+      if (!items.length) { list.innerHTML = '<div class="alert-empty">최근 90일 신제품·재개 품목 없음</div>'; return; }
+      list.innerHTML = items.map(x => {
+        const v = NP_V[x.verdict] || NP_V.watch;
+        const stt = x.sell_through != null ? Math.round(x.sell_through * 100) + '%' : '-';
+        const tr = x.pos_trend != null ? ' · 최근 2주 ' + (x.pos_trend > 0 ? '+' : '') + x.pos_trend + '%' : '';
+        return '<div class="alert-row" onclick="openItemModal(&quot;' + x.code + '&quot;)">'
+          + '<span class="alert-badge" style="' + v[1] + '">' + v[0] + '</span>'
+          + '<div><div class="alert-name"><span class="np-kind ' + x.kind + '">' + (x.kind === 'new' ? '신제품' : '재개') + '</span>' + escapeHtml(x.name) + '</div>'
+          + '<div class="alert-code">' + escapeHtml(x.code) + ' · ' + x.first.slice(5).replace('-', '/') + ' 시작 (' + x.age + '일) · ' + escapeHtml(x.channels.join(', '))
+          + ' · 납품 ' + fmtInt(x.delivery) + ' · 매장 판매 ' + fmtInt(x.pos) + ' · 재주문 ' + x.reorders + '회' + tr + '</div>'
+          + '<div class="alert-code" style="margin-top:1px">창고 ' + fmtInt(x.ours) + (x.our_weeks != null ? ' (' + x.our_weeks + '주분)' : '')
+          + (x.ch_stock != null ? ' · 채널재고 ' + fmtInt(x.ch_stock) : '') + (x.short ? ' · <b style="color:#dc2626">⚠ 잘 팔리는데 창고 2주분 미만</b>' : '') + '</div>'
+          + npSpark(x.weeks) + '</div>'
+          + '<div class="alert-qty"></div>'
+          + '<div class="alert-days" style="text-align:right;line-height:1.25;color:#15803d"><div>' + stt + '</div><div style="font-size:10px;font-weight:600;color:var(--text-3);white-space:nowrap">소진율</div></div></div>';
+      }).join('');
+    } catch (e) { list.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
+  }
+
+  // ───── 매출 집중도 ABC (2026-09-23) ─────
+  let _abc = null, _abcMode = 'risk';
+  const ABC_CH_COLORS = ['#7c3aed', '#2563eb', '#0891b2', '#16a34a', '#ca8a04', '#ea580c', '#94a3b8'];
+  function setAbcMode(m, el) {
+    _abcMode = m;
+    document.querySelectorAll('#abc-mode .vk-chip').forEach(b => b.classList.toggle('on', b.dataset.m === m));
+    renderAbc();
+  }
+  async function loadAbc() {
+    try { _abc = await (await fetch('/api/sales_abc')).json(); } catch (e) { _abc = { _err: e.message }; }
+    renderAbc();
+  }
+  function renderAbc() {
+    const list = document.getElementById('abc-list'), head = document.getElementById('abc-head');
+    const d = _abc || {};
+    if (d._err) { list.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(d._err) + '</div>'; return; }
+    const g = d.grades || {};
+    if (!g.A) { list.innerHTML = '<div class="alert-empty">판매 자료 없음</div>'; head.innerHTML = ''; return; }
+    if (d.from) document.getElementById('abc-sub').textContent = '최근 90일 매출 (' + d.from.slice(5).replace('-', '/') + '~' + d.to.slice(5).replace('-', '/') + ') · A=누적 80%';
+    const ch = d.channels || [];
+    const top = ch.slice(0, 6), etc = ch.slice(6).reduce((a, x) => a + x.share, 0);
+    const segs = top.map((x, i) => ({ n: x.name, s: x.share, c: ABC_CH_COLORS[i] })).concat(etc > 0 ? [{ n: '기타', s: Math.round(etc * 10) / 10, c: ABC_CH_COLORS[6] }] : []);
+    head.innerHTML = '<div class="abc-grades">'
+      + ['A', 'B', 'C'].map(k => '<div class="' + (k === 'A' ? 'ga' : '') + '"><b>' + k + ' ' + (g[k] ? g[k].n : 0) + '품번</b>매출 ' + (g[k] ? g[k].share : 0) + '% · ' + (g[k] ? fmtEok(g[k].amt) : '-') + '</div>').join('') + '</div>'
+      + '<div style="font-size:10.5px;color:var(--text-2)">채널 비중 · <b style="color:#6d28d9">A품번 ' + (d.dependence || 0) + '개</b>는 한 거래처가 90% 이상'
+      + (d.seasonal && d.seasonal.length ? ' · 시즌 품번 ' + escapeHtml(d.seasonal.join('·')) + '은 수급 위험에서 제외' : '') + '</div>'
+      + '<div class="abc-chbar">' + segs.map(x => '<i style="width:' + x.s + '%;background:' + x.c + '" title="' + escapeHtml(x.n) + ' ' + x.s + '%"></i>').join('') + '</div>'
+      + '<div class="abc-legend">' + segs.map(x => '<span><i style="background:' + x.c + '"></i>' + escapeHtml(x.n) + ' ' + x.s + '%</span>').join('') + '</div>';
+    const rows = _abcMode === 'risk' ? (d.risk || []) : (d.items || []).filter(x => x.grade === 'A');
+    const LV = { out: ['품절', 'out'], critical: ['2주↓', 'critical'], warning: ['4주↓', 'warning'], low: ['8주↓', 'low'], ok: ['여유', 'low'] };
+    if (!rows.length) { list.innerHTML = '<div class="alert-empty">' + (_abcMode === 'risk' ? 'A등급 중 창고 4주 미만 없음 👍' : '없음') + '</div>'; return; }
+    list.innerHTML = rows.map(x => {
+      const lv = x.seasonal ? ['시즌', 'low'] : (LV[x.level] || ['-', 'low']);
+      return '<div class="alert-row" onclick="openItemModal(&quot;' + x.code + '&quot;)"' + (x.seasonal ? ' title="90일 동안 납품 5일 이하·최근 2주 납품 없음 (명절 세트 등) — 보충 대상 아님"' : '') + '>'
+        + '<span class="alert-badge ' + lv[1] + '"' + (x.seasonal ? ' style="background:#f1f5f9;color:#64748b"' : '') + '>' + lv[0] + '</span>'
+        + '<div><div class="alert-name">' + escapeHtml(x.name || x.code) + '</div>'
+        + '<div class="alert-code"><span class="abc-chip A">A</span> ' + escapeHtml(x.code) + ' · 매출 ' + x.share + '% (누적 ' + x.cum + '%) · '
+        + escapeHtml(x.top_channel) + ' ' + x.top_share + '%' + (x.n_channels > 1 ? ' 외 ' + (x.n_channels - 1) + '곳' : ' 단독')
+        + (x.ch_note ? ' · <span class="ch-tag' + (x.ch_note === '채널 여유' ? ' on' : '') + '">' + escapeHtml(x.ch_note) + '</span>' : '') + '</div></div>'
+        + '<div class="alert-qty">' + (x.stock != null ? '창고 ' + fmtInt(x.stock) : '') + '</div>'
+        + '<div class="alert-days ' + lv[1] + '">' + (x.cov_weeks != null ? x.cov_weeks + '주' : '-') + '</div></div>';
+    }).join('');
+  }
+
   function wdSplit(on, off) {   // 요일별 온라인/오프라인 비중 줄
     const t = on + off, po = t ? Math.round(on / t * 100) : 0;
     return '<div class="wd-split"><span style="color:#2563eb">온라인 ' + fmtInt(on) + ' <b>' + po + '%</b></span>'
@@ -14737,7 +15671,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   const _fmtEok = a => a >= 1e8 ? (a / 1e8).toFixed(1) + '억' : Math.round(a / 1e4).toLocaleString() + '만';
   function setVendorKind(k, btn) {
     _vendorKind = k;
-    document.querySelectorAll('.vk-chip').forEach(b => b.classList.toggle('on', b.dataset.k === k));
+    // 거래처 칩만 (페이지 전체 .vk-chip을 건드리면 매출 추이·ABC 등 다른 패널 칩 선택 표시가 지워짐)
+    document.querySelectorAll('.vk-chip[data-k]').forEach(b => b.classList.toggle('on', b.dataset.k === k));
     renderVendors();
   }
   function renderVendors() {
@@ -15724,6 +16659,11 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   loadSalesGap();
   loadChannelPrice();
   loadWeekday();
+  loadDemandShift();
+  loadDormant();
+  loadDeliveryGaps();
+  loadNewProducts();
+  loadAbc();
   loadVendors();
   loadPoInline();
   loadOsInline();
@@ -16493,7 +17433,27 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       _sbProducts = d.products || [];
       _sbLatestMonth = d.latest_month || '';
       renderSbList();
-      try { const s = await (await fetch('/api/sales_summary')).json(); _sbChData = s.div_map || {}; } catch (e) { _sbChData = {}; }
+      try {
+        const s = await (await fetch('/api/sales_summary')).json(); _sbChData = s.div_map || {};
+        const f = s.forecast, box = document.getElementById('sb-forecast');
+        if (f && box) {   // 이번 달 전망 (2026-09-23)
+          const mo = m => parseInt(m.slice(5), 10) + '월';
+          const vs = f.vs_prev_same_pct;
+          const eok = v => (v / 1e8).toFixed(2) + '억';
+          const nc = f.new_channels || [], ncSum = nc.reduce((a, x) => a + x.amount, 0);
+          const notes = [];
+          if (nc.length) notes.push('이번 달 새로 잡힌 채널 ' + escapeHtml(nc.map(x => x.name).join('·')) + ' ' + eok(ncSum) + '은 전월 비교에서 뺌');
+          if (f.lagging && f.lagging.length) notes.push('자료 늦게 오는 채널은 그날까지만: ' + escapeHtml(f.lagging.join(', ')));
+          if (f.hp_fix && f.hp_fix.amt) notes.push('홈플러스 납품 중복·배수 보정 −' + eok(f.hp_fix.amt) + ' 반영');
+          box.innerHTML = '📈 <b>' + mo(f.ym) + ' 예상 약 ' + (f.runrate / 1e8).toFixed(1) + '억</b>'
+            + ' <span style="color:var(--text-3)">(' + f.day + '일까지 ' + eok(f.mtd) + ', 채널별 하루 평균 × ' + f.dim + '일)</span>'
+            + (f.prev_total ? ' · 같은 채널끼리 ' + mo(f.prev_ym) + ' ' + f.cmp_day + '일까지 ' + eok(f.prev_same) + ' → ' + eok(f.cur_same)
+                + (vs == null ? '' : ' <b style="color:' + (vs >= 0 ? '#15803d' : '#dc2626') + '">' + (vs >= 0 ? '▲' : '▼') + Math.abs(vs).toFixed(0) + '%</b>')
+                + ' · ' + mo(f.prev_ym) + ' 전체 ' + eok(f.prev_total) : '')
+            + (notes.length ? '<div style="font-size:10.5px;color:var(--text-3);margin-top:2px">' + notes.join(' · ') + '</div>' : '');
+          box.style.display = '';
+        }
+      } catch (e) { _sbChData = {}; }
       drawSbChart();
     } catch (e) {
       const el = document.getElementById('sb-top-list');
