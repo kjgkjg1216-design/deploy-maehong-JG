@@ -12118,6 +12118,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     overflow: hidden; text-overflow: ellipsis; transition: none;
   }
   .po-inline-dest.expanded { -webkit-line-clamp: unset; }
+  /* 칩 묶음: PC에선 display:contents라 기존 그리드 칸 그대로, 모바일에선 2번째 줄 가로 묶음 */
+  .po-inline-extra { display: contents; }
+  .nav-links .nav-menu-btn { display: none; }   /* .nav-refresh-btn의 display보다 우선 (모바일에서만 !important로 보임) */
   .po-inline-row + .po-inline-row { border-top: 1px dashed rgba(15,23,42,0.06); }
   .po-inline-row:hover { background: var(--surface-2); }
   .po-inline-code { font-weight: 700; color: #059669; font-size: 11px; letter-spacing: -0.01em; }
@@ -12784,13 +12787,19 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
 
   @media (max-width: 768px) {
     /* ───── Header ───── */
-    header { padding: 12px 14px; flex-direction: column; gap: 10px; align-items: stretch; }
-    header h1 { font-size: 15px; }
-    header h1::before { width: 26px; height: 26px; }
+    /* 모바일 머리글 한 줄 (2026-09-28): 제목 + 🔔알림 + ☰메뉴만, 나머지 버튼은 ☰로 펼침 (전엔 3줄로 쌓여 화면 1/3 차지) */
+    header { padding: 8px 12px; flex-direction: row; flex-wrap: wrap; gap: 8px; align-items: center; }
+    header > div:first-child { flex: 1; min-width: 0; }
+    header h1 { font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    header h1::before { width: 24px; height: 24px; }
     header .subtitle { display: none; }
-    .nav-links { gap: 4px; justify-content: flex-start; }
+    .nav-links { gap: 4px; justify-content: flex-end; }
     .nav-links a { padding: 6px 10px; font-size: 11.5px; }
     .nav-refresh-btn { padding: 5px 9px; font-size: 11px; }
+    .nav-menu-btn { display: inline-flex !important; }
+    header:not(.nav-open) .nav-links > :not(#notify-btn):not(.nav-menu-btn) { display: none !important; }
+    header.nav-open .nav-links { flex-basis: 100%; justify-content: flex-start; flex-wrap: wrap; padding-top: 4px; }
+    header.nav-open .nav-menu-btn { order: -1; }
 
     /* ───── Layout ───── */
     .wrap { padding: 14px 12px 80px; gap: 14px; }
@@ -12807,13 +12816,18 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     .cal-day { font-size: 10.5px; padding: 4px 0; }
 
     /* ───── PO / OS Inline Rows ───── */
+    /* 모바일 2줄 카드 (2026-09-28): 1줄 = 품번 · 품명 · 날짜, 2줄 = 수량·거래처·잔량 칩을 가로로 (전엔 칩마다 한 줄씩 5줄) */
     .po-inline-row {
-      grid-template-columns: 60px 1fr auto auto;
-      gap: 6px; padding: 7px 6px; font-size: 11px;
+      grid-template-columns: 58px minmax(0, 1fr) auto;
+      gap: 3px 6px; padding: 8px 6px; font-size: 11px;
     }
-    .po-inline-row > .po-inline-qty,
-    .po-inline-row > .po-inline-dest,
-    .po-inline-row > .po-inline-remain { grid-column: 2 / -1; justify-self: start; max-width: 100%; }
+    .po-inline-row > :first-child { grid-column: 1; grid-row: 1; }
+    .po-inline-row > :nth-child(2) { grid-column: 2; grid-row: 1; }
+    .po-inline-row > :last-child { grid-column: 3; grid-row: 1; justify-self: end; }
+    .po-inline-row > .po-inline-extra { grid-column: 2 / -1; grid-row: 2; display: flex; flex-wrap: wrap; gap: 4px; align-items: center; min-width: 0; }
+    .po-inline-extra > span:empty { display: none; }
+    .po-inline-extra .po-inline-dest { max-width: 100%; }
+    .po-inline-extra .po-inline-qty { max-width: 140px; }
     .po-inline-name { font-size: 11px; }
     /* 모바일 가로 넘침 방지(2026-09-04): 그리드 자식 min-width:auto 때문에 긴 품명이 1fr 칸을 밀어 화면 밖으로 나가던 문제 */
     .chart-panel, .chart-grid > *, .po-inline-row > *, .alert-row > *, .po-inline-list, .alert-list { min-width: 0; }
@@ -12935,6 +12949,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         padding:0 5px;border-radius:9px;background:#dc2626;color:#fff;font-size:10.5px;font-weight:800;
         line-height:18px;text-align:center"></span>
     </button>
+    <!-- 모바일 전용 메뉴 버튼 (768px↓에서만 보임) -->
+    <button type="button" class="nav-refresh-btn nav-menu-btn" onclick="toggleNavMenu(event)" aria-label="메뉴"
+            style="background:#f1f5f9;color:#475569;border-color:#cbd5e1"><span id="nav-menu-label">☰ 메뉴</span></button>
     <a href="/report/monthly" target="_blank" title="전월 월간 리포트 (인쇄→PDF)">📊 월간 리포트</a>
     <a href="#" onclick="openVendorLinks();return false;" title="더고은·정성·데이웰즈 담당자 입력 링크 · 입력 현황 · 마감 생성">📝 외주재고 입력</a>
     <a href="#" onclick="openHistory();return false;">채팅내역</a>
@@ -14931,7 +14948,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         return '<div class="po-inline-row' + typeCls + '" ' + clickFn + '>'
              + '<span class="po-inline-code">' + code + '</span>'
              + nameBlock
-             + qtyChip + destChip + remainChip + chip + '</div>';
+             + '<span class="po-inline-extra">' + qtyChip + destChip + remainChip + '</span>' + chip + '</div>';
       }).join('');
   }
 
@@ -16589,7 +16606,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
            + '</div>'
            + '<div><div class="po-inline-name" title="' + name + '">' + name + '</div>'
            + '<div class="po-inline-sub">' + vendor + '</div></div>'
-           + specBtn + qtyChip + destChip + chip + '</div>';
+           + '<span class="po-inline-extra">' + specBtn + qtyChip + destChip + '</span>' + chip + '</div>';
     }).join('');
   }
 
@@ -16715,6 +16732,23 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       set('kpi-health', hv, (he.summary || '') + (d.at ? ' · ' + d.at : ''), he.overall === 'ok' ? 'ok' : (he.overall === 'warn' ? 'warn' : (he.overall ? 'bad' : 'info')));
     } catch (e) { /* KPI는 부가 정보 — 실패해도 조용히 */ }
   }
+  // 모바일 ☰ 메뉴 (2026-09-28): 머리글 버튼들을 펼치고 접음. 메뉴 안 항목을 누르면 자동으로 접힘
+  function toggleNavMenu(ev) {
+    if (ev) ev.stopPropagation();
+    const h = document.querySelector('header');
+    const open = h.classList.toggle('nav-open');
+    const lb = document.getElementById('nav-menu-label');
+    if (lb) lb.textContent = open ? '✕ 닫기' : '☰ 메뉴';
+  }
+  (function () {
+    const nav = document.querySelector('header .nav-links');
+    if (!nav) return;
+    nav.addEventListener('click', e => {
+      const h = document.querySelector('header');
+      if (!h.classList.contains('nav-open') || e.target.closest('.nav-menu-btn')) return;
+      if (e.target.closest('a, button')) toggleNavMenu();
+    });
+  })();
   // 고정 헤더에 가리지 않도록 헤더 높이 + 여백만큼 위로 띄워 스크롤 (KPI 클릭·섹션 내비 공용)
   function scrollToPanel(el, highlight) {
     const hdr = document.querySelector('header');
