@@ -9133,6 +9133,78 @@ def api_new_products():
                                 'new': sum(1 for x in items if x['kind'] == 'new'), 'restart': sum(1 for x in items if x['kind'] == 'restart')}})
 
 
+@app.route('/api/new_product_detail', methods=['GET'])
+@cached_api()
+def api_new_product_detail():
+    """신제품·재개 추적 항목 상세 (2026-09-29, 사용자 "항목 클릭하면 차트 내용이 나오게") —
+    시작(재개)일부터 일별·주별 납품 / 매장 판매(POS, 홈플러스 중복 제거) / 채널 재고(채널·SKU 마지막 값 7일까지 이어붙여 합) + 채널별 표.
+    판정·요약 숫자는 /api/new_products 항목을 그대로 씀(목록과 같은 값)."""
+    code = (request.args.get('code') or '').strip().upper()
+    with app.test_request_context('/api/new_products'):
+        lst = api_new_products().get_json() or {}
+    it = next((x for x in lst.get('items', []) if x['code'] == code), None)
+    if not it:
+        return jsonify({'error': f'{code}: 신제품·재개 목록에 없음'}), 404
+    d = _sales_daily_canon()
+    end = d['_dt'].max()
+    f0 = pd.Timestamp(it['first'])
+    g = d[(d['code'] == code) & (d['_dt'] >= f0)]
+    rep = _pos_report(d)
+    chans = sorted(set(g['channel']))
+    days = pd.date_range(f0, end, freq='D')
+    dl = g.groupby('_dt')['ea'].sum().reindex(days, fill_value=0)
+    pe = g.groupby('_dt')['pe'].sum().reindex(days, fill_value=0)
+    reported = pd.Series([any(t in rep.get(c, ()) for c in chans) for t in days], index=days)   # 이 품번 채널 중 그날 POS 보고한 곳 있나
+    st = g[g['stock'].notna() & ~g['channel'].isin(CH_STOCK_SKIP)]
+    if len(st):
+        pv = (st.assign(sv=st['stock'].clip(lower=0) * st['f'])
+                .pivot_table(index='_dt', columns=['channel', 'sku'], values='sv', aggfunc='last'))
+        stock = pv.reindex(days).ffill(limit=7).sum(axis=1, min_count=1)
+    else:
+        stock = pd.Series([float('nan')] * len(days), index=days)
+    day_rows = [{'date': t.strftime('%Y-%m-%d'), 'd': t.strftime('%m/%d'), 'wd': '월화수목금토일'[t.dayofweek],
+                 'dl': int(dl[t]), 'pos': int(pe[t]) if reported[t] else None,
+                 'stock': None if pd.isna(stock[t]) else int(stock[t])} for t in days]
+    weeks, cdl, cpos = [], 0.0, 0.0
+    a = f0 - pd.Timedelta(days=f0.dayofweek)
+    while a <= end:
+        b = min(a + pd.Timedelta(days=6), end)
+        m = (days >= a) & (days <= b)
+        wd_, wp_ = float(dl[m].sum()), float(pe[m].sum())
+        cdl += wd_
+        cpos += wp_
+        sv = stock[m].dropna()
+        weeks.append({'w': a.strftime('%m/%d'), 'from': max(a, f0).strftime('%m/%d'), 'to': b.strftime('%m/%d'),
+                      'days': int(m.sum()), 'rep_days': int(reported[m].sum()), 'dl': int(wd_), 'pos': int(wp_),
+                      'cum_dl': int(cdl), 'cum_pos': int(cpos), 'stock': int(sv.iloc[-1]) if len(sv) else None})
+        a += pd.Timedelta(days=7)
+    ch_rows = []
+    for c, gc in g.groupby('channel'):
+        dlc, pc = float(gc['ea'].sum()), float(gc['pe'].sum())
+        last_st = None
+        if c not in CH_STOCK_SKIP:
+            s_ = gc[gc['stock'].notna()].sort_values('_dt').groupby('sku').tail(1)
+            if len(s_):
+                last_st = int((s_['stock'].clip(lower=0) * s_['f']).sum())
+        gdl = gc[gc['ea'] > 0]
+        # 목록 소진율과 같은 보정: 채널 전체 POS가 빠진 날(이마트 등)은 보고일 평균으로 채움
+        rs = rep.get(c, set())
+        miss, p_adj = 0, pc
+        if len(rs) >= 14:
+            lo, hi = max(f0, min(rs)), max(rs)
+            if hi >= lo:
+                span = (hi - lo).days + 1
+                nrep = sum(1 for t in rs if lo <= t <= hi)
+                miss = span - nrep
+                p_adj = pc * span / max(nrep, 1)
+        ch_rows.append({'name': str(gc['channel_name'].iloc[0]), 'dl': int(dlc), 'pos': int(pc), 'pos_adj': int(p_adj), 'miss_days': int(miss),
+                        'st': round(p_adj / dlc, 2) if dlc > 0 and len(rs) >= 14 else None,
+                        'pos_feed': len(rs) >= 14, 'stock': last_st,
+                        'orders': int(gdl['date'].nunique()), 'last_dl': str(gdl['date'].max()) if len(gdl) else ''})
+    ch_rows.sort(key=lambda x: -(x['dl'] + x['pos']))
+    return jsonify({'item': it, 'days': day_rows, 'weeks': weeks, 'channels': ch_rows, 'as_of': end.strftime('%Y-%m-%d')})
+
+
 _ABC_CACHE = {}
 
 
@@ -11792,11 +11864,25 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .chart-panel.lens-new { border-top: 3px solid #16a34a; }
   .chart-panel.lens-abc { border-top: 3px solid #7c3aed; }
   .np-spark { display: block; margin-top: 4px; }
+  /* 신제품·재개 상세 모달 */
+  .npd-kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; margin: 4px 0 12px; }
+  .npd-kpis div { background: #f8fafc; border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; font-size: 11px; color: var(--text-3); }
+  .npd-kpis b { display: block; font-size: 17px; color: var(--text); font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .npd-why { font-size: 12px; color: var(--text-2); background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 10px; padding: 8px 12px; margin-bottom: 12px; line-height: 1.6; }
+  .npd-chart-wrap { position: relative; height: 280px; margin-bottom: 6px; }
+  .npd-note { font-size: 10.5px; color: var(--text-3); margin-bottom: 12px; }
+  .npd-tbl { width: 100%; border-collapse: collapse; font-size: 11.5px; font-variant-numeric: tabular-nums; margin-bottom: 14px; }
+  .npd-tbl th { text-align: right; font-weight: 700; color: var(--text-3); font-size: 10.5px; padding: 5px 8px; border-bottom: 1px solid var(--border); background: #f8fafc; }
+  .npd-tbl td { text-align: right; padding: 5px 8px; border-bottom: 1px dashed rgba(15,23,42,0.07); }
+  .npd-tbl th:first-child, .npd-tbl td:first-child { text-align: left; }
+  .npd-tbl tr.part td { color: var(--text-3); }
+  .npd-sec { font-size: 12px; font-weight: 800; color: var(--text); margin: 4px 0 6px; }
+  @media (max-width: 768px) { .npd-kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); } .npd-chart-wrap { height: 220px; } .npd-tbl { font-size: 10.5px; } }
   .np-kind { display: inline-block; font-size: 9.5px; font-weight: 700; padding: 0 5px; border-radius: 4px; margin-right: 4px; vertical-align: 1px; }
   .np-kind.new { background: #dcfce7; color: #15803d; } .np-kind.restart { background: #e0f2fe; color: #0369a1; }
   .abc-grades { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-bottom: 8px; }
   .abc-grades div { border-radius: 8px; padding: 5px 8px; font-size: 10.5px; color: var(--text-2); background: #f8fafc; border: 1px solid var(--border); }
-  .abc-grades b { display: block; font-size: 15px; color: var(--text-1); }
+  .abc-grades b { display: block; font-size: 15px; color: var(--text); }
   .abc-grades .ga { background: #f5f3ff; border-color: #ddd6fe; } .abc-grades .ga b { color: #6d28d9; }
   .abc-chbar { display: flex; height: 12px; border-radius: 6px; overflow: hidden; margin: 2px 0 4px; }
   .abc-chbar i { display: block; height: 100%; }
@@ -13519,6 +13605,20 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     <div id="abc-list" class="alert-list"><div class="loading" style="padding:20px">로딩 중...</div></div>
   </div>
 </section>
+
+<!-- 신제품·재개 상세 모달 (2026-09-29) -->
+<div class="modal-overlay" id="np-modal" style="z-index:125" onclick="if (event.target === this) closeNpDetail()">
+  <div class="modal" style="max-width:980px">
+    <div class="modal-header">
+      <div>
+        <div class="code-badge" id="np-badge" style="background:#16a34a">🌱 신제품·재개</div>
+        <h2 id="np-title">로딩 중...</h2>
+      </div>
+      <button class="modal-close" onclick="closeNpDetail()">&times;</button>
+    </div>
+    <div class="modal-body" id="np-body"><div class="loading">로딩 중...</div></div>
+  </div>
+</div>
 
 <!-- 채팅내역 모달 -->
 <div class="modal-overlay" id="history-modal" style="z-index:120">
@@ -15565,7 +15665,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         const v = NP_V[x.verdict] || NP_V.watch;
         const stt = x.sell_through != null ? Math.round(x.sell_through * 100) + '%' : '-';
         const tr = x.pos_trend != null ? ' · 최근 2주 ' + (x.pos_trend > 0 ? '+' : '') + x.pos_trend + '%' : '';
-        return '<div class="alert-row" onclick="openItemModal(&quot;' + x.code + '&quot;)">'
+        return '<div class="alert-row" onclick="openNpDetail(&quot;' + x.code + '&quot;)" title="클릭 = 주별·일별 납품/판매/채널재고 상세">'
           + '<span class="alert-badge" style="' + v[1] + '">' + v[0] + '</span>'
           + '<div><div class="alert-name"><span class="np-kind ' + x.kind + '">' + (x.kind === 'new' ? '신제품' : '재개') + '</span>' + escapeHtml(x.name) + '</div>'
           + '<div class="alert-code">' + escapeHtml(x.code) + ' · ' + x.first.slice(5).replace('-', '/') + ' 시작 (' + x.age + '일) · ' + escapeHtml(x.channels.join(', '))
@@ -15577,6 +15677,112 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
           + '<div class="alert-days" style="text-align:right;line-height:1.25;color:#15803d"><div>' + stt + '</div><div style="font-size:10px;font-weight:600;color:var(--text-3);white-space:nowrap">소진율</div></div></div>';
       }).join('');
     } catch (e) { list.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
+  }
+
+  // ───── 신제품·재개 상세 모달 (2026-09-29) ─────
+  let _npd = null, _npdMode = 'w', _npdChart = null;
+  const NP_WHY = {
+    early: '시작한 지 3주가 안 돼 아직 판단하기 이릅니다.',
+    fading: '최근 2주 매장 판매가 그 전 2주보다 40% 이상 줄었습니다.',
+    slow: '4주가 지났는데 보낸 양의 40%도 안 팔려 채널에 재고가 쌓이고 있습니다.',
+    good: '보낸 양의 70% 이상이 매장에서 팔리고 있습니다 (POS 없는 채널은 재주문 2회 이상).',
+    watch: '소진율이 40~70% 사이라 조금 더 지켜볼 구간입니다.',
+  };
+  function closeNpDetail() {
+    document.getElementById('np-modal').classList.remove('show');
+    if (_npdChart) { _npdChart.destroy(); _npdChart = null; }
+  }
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && document.getElementById('np-modal').classList.contains('show')) closeNpDetail(); });
+  async function openNpDetail(code) {
+    const modal = document.getElementById('np-modal'), body = document.getElementById('np-body');
+    modal.classList.add('show');
+    document.getElementById('np-title').textContent = code;
+    body.innerHTML = '<div class="loading">로딩 중...</div>';
+    try {
+      const d = await (await fetch('/api/new_product_detail?code=' + encodeURIComponent(code))).json();
+      if (d.error) throw new Error(d.error);
+      _npd = d; _npdMode = 'w';
+      renderNpDetail();
+    } catch (e) { body.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
+  }
+  function setNpdMode(m) {
+    _npdMode = m;
+    document.querySelectorAll('#npd-mode .vk-chip').forEach(b => b.classList.toggle('on', b.dataset.m === m));
+    drawNpdChart();
+  }
+  function renderNpDetail() {
+    const d = _npd, x = d.item, v = NP_V[x.verdict] || NP_V.watch;
+    document.getElementById('np-title').textContent = x.name;
+    document.getElementById('np-badge').textContent = (x.kind === 'new' ? '🌱 신제품' : '🔁 재개') + ' · ' + x.code;
+    const pct = r => r == null ? '-' : Math.round(r * 100) + '%';
+    const kpi = (l, val, sub) => '<div>' + l + '<b>' + val + '</b>' + (sub ? '<span style="font-size:10px">' + sub + '</span>' : '') + '</div>';
+    let h = '<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:8px;font-size:12px;color:var(--text-2)">'
+      + '<span class="alert-badge" style="' + v[1] + '">' + v[0] + '</span>'
+      + '<span>' + x.first.slice(5).replace('-', '/') + ' ' + (x.kind === 'new' ? '출시' : '재개') + ' · ' + x.age + '일째 · ' + escapeHtml(x.channels.join(', ')) + '</span>'
+      + '<span style="margin-left:auto;color:var(--text-3)">자료 ~' + d.as_of.slice(5).replace('-', '/') + '</span></div>';
+    h += '<div class="npd-why"><b>' + v[0] + '</b> — ' + (NP_WHY[x.verdict] || '')
+      + (x.pos_trend != null ? ' 최근 2주 매장 판매 ' + (x.pos_trend > 0 ? '+' : '') + x.pos_trend + '%.' : '')
+      + (x.short ? ' <b style="color:#dc2626">⚠ ' + (x.our_weeks != null && x.our_weeks >= 0.5 ? '창고 재고가 ' + x.our_weeks + '주분뿐이라' : '창고 재고가 거의 없어') + ' 생산·입고를 서둘러야 합니다.</b>' : '') + '</div>';
+    h += '<div class="npd-kpis">'
+      + kpi('납품', fmtInt(x.delivery), '') + kpi('매장 판매', fmtInt(x.pos), '') + kpi('소진율', pct(x.sell_through), '판매÷납품')
+      + kpi('재주문', x.reorders + '회', '') + kpi('창고', fmtInt(x.ours), x.our_weeks != null ? x.our_weeks + '주분' : '')
+      + kpi('채널 재고', x.ch_stock != null ? fmtInt(x.ch_stock) : '-', '') + '</div>';
+    h += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><span class="npd-sec" style="margin:0">납품 · 매장 판매 · 채널 재고</span>'
+      + '<div class="vk-chips" id="npd-mode" style="margin-left:auto"><button class="vk-chip on" data-m="w" onclick="setNpdMode(&quot;w&quot;)">주별</button>'
+      + '<button class="vk-chip" data-m="d" onclick="setNpdMode(&quot;d&quot;)">일별</button></div></div>'
+      + '<div class="npd-chart-wrap"><canvas id="npdChart"></canvas></div>'
+      + '<div class="npd-note">막대: 회색 납품(우리가 보낸 양) · 초록 매장 판매(POS) · 선: 채널 재고(오른쪽 축). 며칠치뿐인 주는 * 표시, 일별에서 판매가 빈 날은 채널이 판매 자료를 안 준 날</div>';
+    // 주별 표
+    h += '<div class="npd-sec">주별 흐름</div><table class="npd-tbl"><thead><tr><th>주</th><th>납품</th><th>매장 판매</th><th>누적 납품</th><th>누적 판매</th><th>누적 소진율</th><th>채널 재고(주말)</th></tr></thead><tbody>'
+      + d.weeks.map(w => '<tr' + (w.days < 7 ? ' class="part"' : '') + '><td>' + w.from + '~' + w.to + (w.days < 7 ? ' *' : '')
+          + (w.rep_days < w.days ? ' <span style="color:#b45309;font-size:10px">판매자료 ' + w.rep_days + '/' + w.days + '일</span>' : '') + '</td>'
+          + '<td>' + fmtInt(w.dl) + '</td><td>' + fmtInt(w.pos) + '</td><td>' + fmtInt(w.cum_dl) + '</td><td>' + fmtInt(w.cum_pos) + '</td>'
+          + '<td>' + (w.cum_dl ? Math.round(w.cum_pos / w.cum_dl * 100) + '%' : '-') + '</td><td>' + (w.stock != null ? fmtInt(w.stock) : '-') + '</td></tr>').join('')
+      + '</tbody></table>';
+    // 채널별 표
+    h += '<div class="npd-sec">채널별</div><table class="npd-tbl"><thead><tr><th>채널</th><th>납품</th><th>납품 횟수</th><th>마지막 납품</th><th>매장 판매</th><th>소진율</th><th>채널 재고</th></tr></thead><tbody>'
+      + d.channels.map(c => '<tr><td>' + escapeHtml(c.name) + '</td><td>' + fmtInt(c.dl) + '</td><td>' + c.orders + '회</td><td>' + (c.last_dl ? c.last_dl.slice(5).replace('-', '/') : '-') + '</td>'
+          + '<td>' + (c.pos_feed ? fmtInt(c.pos) + (c.miss_days ? ' <span style="color:#b45309;font-size:10px">(판매자료 빠진 ' + c.miss_days + '일 → 보정 ' + fmtInt(c.pos_adj) + ')</span>' : '') : '<span style="color:var(--text-3)">자료 없음</span>') + '</td>'
+          + '<td>' + pct(c.st) + '</td><td>' + (c.stock != null ? fmtInt(c.stock) : '-') + '</td></tr>').join('')
+      + '</tbody></table>';
+    h += '<div style="text-align:right"><button class="vk-chip" style="padding:6px 12px" onclick="openItemModal(&quot;' + x.code + '&quot;)">📦 품목 정보(BOM·재고) 열기</button></div>';
+    document.getElementById('np-body').innerHTML = h;
+    drawNpdChart();
+  }
+  function drawNpdChart() {
+    const d = _npd; if (!d) return;
+    const cv = document.getElementById('npdChart'); if (!cv) return;
+    if (_npdChart) _npdChart.destroy();
+    const wk = _npdMode === 'w';
+    const rows = wk ? d.weeks : d.days;
+    const labels = wk ? rows.map(w => w.from + (w.days < 7 ? '*' : '')) : rows.map(r => r.d + '(' + r.wd + ')');
+    _npdChart = new Chart(cv, {
+      data: {
+        labels,
+        datasets: [
+          { type: 'bar', label: '납품', data: rows.map(r => r.dl), backgroundColor: '#cbd5e1', borderRadius: 3, order: 2 },
+          { type: 'bar', label: '매장 판매', data: rows.map(r => r.pos), backgroundColor: '#16a34a', borderRadius: 3, order: 2 },
+          { type: 'line', label: '채널 재고', data: rows.map(r => r.stock), yAxisID: 'y2', borderColor: '#f59e0b', backgroundColor: '#f59e0b',
+            borderWidth: 2, pointRadius: wk ? 3 : 1.5, tension: 0.25, spanGaps: true, order: 1 },
+        ]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: { duration: 250 },
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { labels: { boxWidth: 11, font: { size: 10.5 } } },
+          tooltip: { callbacks: {
+            title: items => wk ? (rows[items[0].dataIndex].from + '~' + rows[items[0].dataIndex].to + ' (' + rows[items[0].dataIndex].days + '일)') : rows[items[0].dataIndex].date,
+            label: c => c.dataset.label + ': ' + (c.parsed.y == null ? '자료 없음' : fmtInt(c.parsed.y) + '개'),
+          } }
+        },
+        scales: {
+          x: { ticks: { font: { size: 10 }, maxRotation: 0, autoSkip: true }, grid: { display: false } },
+          y: { beginAtZero: true, ticks: { font: { size: 10 }, callback: v => fmtInt(v) }, grid: { color: '#eef2f7' }, title: { display: true, text: '납품·판매', font: { size: 10 } } },
+          y2: { position: 'right', beginAtZero: true, ticks: { font: { size: 10 }, callback: v => fmtInt(v) }, grid: { display: false }, title: { display: true, text: '채널 재고', font: { size: 10 } } }
+        }
+      }
+    });
   }
 
   // ───── 매출 집중도 ABC (2026-09-23) ─────
@@ -15640,7 +15846,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         + '<span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#2563eb;margin-right:3px"></i>온라인</span>'
         + '<span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#f59e0b;margin-right:3px"></i>오프라인</span></div>'
         + days.map(x => '<div class="wd-row" title="' + escapeHtml(Object.entries(x.by_ch).map(([k, v]) => k + ' ' + v.toLocaleString()).join(' / ')) + '">'
-          + '<span style="font-weight:700;color:' + (x.wd === '일' ? '#dc2626' : (x.wd === '토' ? '#2563eb' : 'var(--text-1)')) + '">' + x.wd + '</span>'
+          + '<span style="font-weight:700;color:' + (x.wd === '일' ? '#dc2626' : (x.wd === '토' ? '#2563eb' : 'var(--text)')) + '">' + x.wd + '</span>'
           + '<div class="wd-bar"><i style="width:' + (x.online / mx * 100) + '%;background:#2563eb"></i><i style="width:' + (x.offline / mx * 100) + '%;background:#f59e0b"></i></div>'
           + '<span class="n">' + fmtInt(x.qty) + '</span><span class="p">' + x.share + '%</span>'
           + wdSplit(x.online, x.offline) + '</div>').join('')
