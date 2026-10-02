@@ -78,6 +78,26 @@ app.permanent_session_lifetime = _timedelta(days=30)
 OAUTH_CLIENT_ID = os.environ.get('GOOGLE_OAUTH_CLIENT_ID', '')
 OAUTH_CLIENT_SECRET = os.environ.get('GOOGLE_OAUTH_CLIENT_SECRET', '')
 OAUTH_REDIRECT_URI = os.environ.get('OAUTH_REDIRECT_URI', 'https://8.235.41.127.sslip.io/auth/callback')
+# 공개 주소 (2026-09-30): IP로 시작하는 sslip 주소는 카카오톡 등에서 링크로 안 잡혀 → 일반 도메인(예: buy.maehong.top)을 붙일 수 있게.
+# PUBLIC_BASE_URL = 카톡 알림 버튼·거래처 입력 링크에 쓰는 대표 주소. 옛 sslip 주소도 계속 접속·로그인 가능.
+PUBLIC_BASE_URL = os.environ.get('PUBLIC_BASE_URL', 'https://8.235.41.127.sslip.io').rstrip('/')
+# 구글 로그인을 '들어온 주소 그대로' 처리할 호스트 — Google Cloud 콘솔 OAuth 클라이언트에 그 주소의 /auth/callback이
+# 등록된 것만 넣을 것(미등록이면 redirect_uri_mismatch). 목록에 없으면 기본 콜백(sslip)으로 로그인 후 그 주소에서 사용.
+# 새 주소 등록 후: env OAUTH_EXTRA_HOSTS=buy.maehong.top
+_OAUTH_HOSTS = {'8.235.41.127.sslip.io'} | {
+    h.strip() for h in os.environ.get('OAUTH_EXTRA_HOSTS', '').split(',') if h.strip()}
+
+
+def _oauth_redirect_uri():
+    """로그인 후 돌아올 주소 = 사용자가 들어온 공개 주소(세션 쿠키가 같은 도메인에 있어야 로그인 유지).
+    등록 안 된 호스트(로컬·콘솔 미등록 새 주소)는 기본값(OAUTH_REDIRECT_URI)."""
+    try:
+        host = (request.host or '').split(':')[0]
+        if host in _OAUTH_HOSTS:
+            return f'https://{host}/auth/callback'
+    except Exception:
+        pass
+    return OAUTH_REDIRECT_URI
 
 # 방문이력 등 관리자 페이지 열람 허용 이메일 (쉼표구분 env로 추가 가능)
 _ADMIN_EMAILS = set(filter(None, ['kjgkjg1216@gmail.com'] + [
@@ -103,6 +123,7 @@ def _log_visit(kind='login'):
             'name': u.get('name', ''),
             'uid': u.get('uid', ''),
             'path': request.path,
+            'host': (request.host or '').split(':')[0],   # 접속 주소 (buy.maehong.top / sslip 구분, 2026-10-02)
             'ip': (request.headers.get('X-Forwarded-For', request.remote_addr) or '').split(',')[0].strip(),
             'ua': request.headers.get('User-Agent', '')[:200],
             'ts': fs_admin.SERVER_TIMESTAMP,
@@ -175,11 +196,18 @@ def login_page():
 def auth_google():
     if not OAUTH_CLIENT_ID:
         return 'OAuth 미설정 (GOOGLE_OAUTH_CLIENT_ID 없음)', 500
+    # 콘솔에 콜백이 등록 안 된 공개 주소(새 도메인)로 들어왔으면 → 기본 주소에서 로그인 시작
+    # (state를 같은 도메인 세션에 저장해야 콜백 검증이 통과하므로)
+    _base = OAUTH_REDIRECT_URI.rsplit('/auth/', 1)[0]
+    _host = (request.host or '').split(':')[0]
+    if (_base.startswith('https://') and _host not in _OAUTH_HOSTS and _host != _base.split('://', 1)[-1]
+            and _host not in ('localhost', '127.0.0.1')):
+        return redirect(_base + '/auth/google')
     state = _secrets.token_urlsafe(24)
     session['oauth_state'] = state
     params = {
         'client_id': OAUTH_CLIENT_ID,
-        'redirect_uri': OAUTH_REDIRECT_URI,
+        'redirect_uri': _oauth_redirect_uri(),
         'response_type': 'code',
         'scope': 'openid email profile',
         'state': state,
@@ -201,7 +229,7 @@ def auth_callback():
             'code': code,
             'client_id': OAUTH_CLIENT_ID,
             'client_secret': OAUTH_CLIENT_SECRET,
-            'redirect_uri': OAUTH_REDIRECT_URI,
+            'redirect_uri': _oauth_redirect_uri(),
             'grant_type': 'authorization_code',
         }, timeout=15).json()
         access = tok.get('access_token')
@@ -2229,7 +2257,7 @@ def api_vendor_links():
         last = max(mine, key=lambda e: float(e.get('ts', 0))) if mine else None
         month = [e for e in mine if datetime.fromtimestamp(float(e.get('ts', 0))).strftime('%Y-%m') == ym and e.get('kind', 'set') == 'set']
         tok = _vendor_token(v)
-        out.append({'vendor': v, 'token': tok, 'url': f'{_VENDOR_CLOUD}/v/{tok}', 'items': len(_vendor_items(v)),
+        out.append({'vendor': v, 'token': tok, 'url': f'{PUBLIC_BASE_URL}/v/{tok}', 'items': len(_vendor_items(v)),
                     'last_at': datetime.fromtimestamp(float(last['ts'])).strftime('%Y-%m-%d %H:%M') if last else '',
                     'last_by': last.get('name', '') if last else '', 'month_count': len(month),
                     'month_codes': len({e.get('code') for e in month})})
@@ -7821,8 +7849,8 @@ def _send_kakao(text, st):
     import requests as _rq
     tok = _kakao_access_token(st)
     tpl = {'object_type': 'text', 'text': text[:1000],
-           'link': {'web_url': 'https://8.235.41.127.sslip.io',
-                    'mobile_web_url': 'https://8.235.41.127.sslip.io'}}
+           'link': {'web_url': PUBLIC_BASE_URL,
+                    'mobile_web_url': PUBLIC_BASE_URL}}
     r = _rq.post('https://kapi.kakao.com/v2/api/talk/memo/default/send',
                  headers={'Authorization': 'Bearer ' + tok},
                  data={'template_object': json.dumps(tpl, ensure_ascii=False)}, timeout=15)
@@ -8614,10 +8642,7 @@ def api_channel_price_changes():
     files = sorted(glob.glob(f'{DATA_DIR}/*_판매일별.csv'))
     if not files:
         return jsonify({'items': []})
-    raw = pd.read_csv(files[-1], dtype=str, encoding='utf-8-sig', usecols=['date', 'channel', 'channel_name', 'sku', 'name', 'self_code',
-                                                                          'delivery_qty', 'unit_supply_price']).fillna('')
-    raw['p'] = pd.to_numeric(raw['unit_supply_price'], errors='coerce')
-    raw['q'] = pd.to_numeric(raw['delivery_qty'], errors='coerce').fillna(0)
+    raw = _channel_price_raw(files[-1])
     end = pd.to_datetime(raw['date'].max())
     raw = raw[pd.to_datetime(raw['date']) >= end - pd.Timedelta(days=365)]   # 2026-09-23 6개월→12개월
     code_of = dict(zip(df['sku'].astype(str), df['code']))
@@ -8628,21 +8653,124 @@ def api_channel_price_changes():
         ps = list(g['p'].round(0)); ds = list(g['date'])
         if len(ps) < 3:
             continue
-        cur = ps[-1]; i = len(ps) - 1
-        while i > 0 and ps[i - 1] == cur:
-            i -= 1
-        if len(ps) - i < 2 or i == 0:        # 현재가가 1회뿐(단발) 이거나 변동 없음
+        # 같은 단가 연속 구간 [단가, 시작 위치, 관측 수]
+        segs = []
+        for j, pv in enumerate(ps):
+            if segs and segs[-1][0] == pv:
+                segs[-1][2] += 1
+            else:
+                segs.append([pv, j, 1])
+        cur, i, cn = segs[-1]
+        if len(segs) < 2 or cn < 2:          # 변동 없음 / 현재가가 1회뿐(단발)
             continue
-        prev = ps[i - 1]
+        # 이전가 = 직전 '안정' 구간(2회 이상 관측)의 단가 — 하루만 나온 행사·오기 단가는 건너뜀 (2026-09-29:
+        # 이마트 G0181이 5,000 → 7,811(4/1 하루) → 5,000 인데 '7,811→5,000 −36%'로 1위에 뜨던 오탐 수정)
+        k = len(segs) - 2
+        while k >= 0 and segs[k][2] < 2:
+            k -= 1
+        if k < 0 or segs[k][0] == cur:
+            continue
+        prev = segs[k][0]                     # 변경 시작일(since) = 현재 구간 첫 관측일 (i)
         pct = (cur - prev) / prev * 100
         # 2026-09-23 기준 없음 — 변동 전체(단발 제외 규칙만 유지)
         q90 =float(raw[(raw['channel'] == ch) & (raw['sku'] == sku) & (raw['date'] >= cut90)]['q'].sum())
         code = code_of.get(str(sku), '') or str(g['self_code'].iloc[-1])
-        items.append({'channel_name': str(g['channel_name'].iloc[-1]), 'sku': sku, 'code': code,
+        items.append({'channel': ch, 'channel_name': str(g['channel_name'].iloc[-1]), 'sku': sku, 'code': code,
                       'name': names.get(code, '') or str(g['name'].iloc[-1]), 'prev': int(prev), 'cur': int(cur),
                       'pct': round(pct, 1), 'since': ds[i], 'impact': int((cur - prev) * q90 / 3)})
     items.sort(key=lambda x: -abs(x['impact']))
     return jsonify({'items': items, 'to': end.strftime('%Y-%m-%d')})
+
+
+_CPR_CACHE = {}
+
+
+def _channel_price_raw(path):
+    """판매일별 원본에서 단가·납품만 (채널 공급단가 변동/상세 공용). 홈플러스 하위 채널 배수 납품은 매출과 같은 규칙으로 보정. 파일 mtime 캐시."""
+    key = (path, os.path.getmtime(path))
+    if _CPR_CACHE.get('key') == key:
+        return _CPR_CACHE['val']
+    raw = pd.read_csv(path, dtype=str, encoding='utf-8-sig', usecols=['date', 'channel', 'channel_name', 'sku', 'name', 'self_code',
+                                                                     'delivery_qty', 'unit_supply_price', 'supply_amount', 'pos_qty']).fillna('')
+    raw['dq'] = pd.to_numeric(raw['delivery_qty'], errors='coerce').fillna(0)
+    raw, _ = _hp_dedup_raw(raw)
+    raw['p'] = pd.to_numeric(raw['unit_supply_price'], errors='coerce')
+    raw['q'] = raw['dq']
+    raw['pos'] = pd.to_numeric(raw['pos_qty'], errors='coerce')
+    _CPR_CACHE.update(key=key, val=raw)
+    return raw
+
+
+@app.route('/api/channel_price_detail', methods=['GET'])
+@cached_api()
+def api_channel_price_detail():
+    """채널 공급단가 변동 상세 (2026-09-29, 사용자 "품번 정보 말고 해당 내역 상세") — 한 채널·SKU의
+    단가 흐름(관측일별 단가 + 납품 수량), 같은 단가 구간·변경 이력(1회만 나온 가격 = 단발/행사), 이번 변경 전후 납품·매장 판매 비교,
+    월 영향액 계산 근거, 같은 품번의 다른 채널 최신 단가."""
+    ch = (request.args.get('channel') or '').strip()
+    sku = (request.args.get('sku') or '').strip()
+    files = sorted(glob.glob(f'{DATA_DIR}/*_판매일별.csv'))
+    if not files or not ch or not sku:
+        return jsonify({'error': '채널·SKU 필요'}), 400
+    with app.test_request_context('/api/channel_price_changes'):
+        lst = api_channel_price_changes().get_json() or {}
+    it = next((x for x in lst.get('items', []) if x.get('channel') == ch and str(x.get('sku')) == sku), None)
+    raw = _channel_price_raw(files[-1])
+    end = pd.to_datetime(raw['date'].max())
+    g = raw[(raw['channel'] == ch) & (raw['sku'] == sku)].sort_values('date')
+    if g.empty:
+        return jsonify({'error': f'{ch}/{sku}: 자료 없음'}), 404
+    obs = g[g['p'].notna() & (g['p'] > 0)]
+    points = [{'date': r['date'], 'price': int(round(r['p'])), 'q': int(r['q'])} for _, r in obs.iterrows()]
+    # 같은 단가 연속 구간
+    segs = []
+    for pt in points:
+        if segs and segs[-1]['price'] == pt['price']:
+            s_ = segs[-1]
+            s_['to'] = pt['date']; s_['n'] += 1; s_['q'] += pt['q']
+        else:
+            segs.append({'from': pt['date'], 'to': pt['date'], 'price': pt['price'], 'n': 1, 'q': pt['q']})
+    for s_ in segs:
+        s_['oneoff'] = s_['n'] == 1 and s_ is not segs[-1]
+    changes = []
+    for a, b in zip(segs, segs[1:]):
+        changes.append({'date': b['from'], 'before': a['price'], 'after': b['price'],
+                        'pct': round((b['price'] - a['price']) / a['price'] * 100, 1) if a['price'] else None,
+                        'oneoff': b['oneoff'] or a['oneoff']})
+    # 이번 변경 전후 비교 (변경일 기준 앞뒤 최대 60일, 일평균)
+    cmp_ = None
+    if it:
+        t0 = pd.Timestamp(it['since'])
+        gd = g.assign(_dt=pd.to_datetime(g['date']))
+        after_days = max(1, min(60, int((end - t0).days) + 1))
+        bef = gd[(gd['_dt'] < t0) & (gd['_dt'] >= t0 - pd.Timedelta(days=after_days))]
+        aft = gd[(gd['_dt'] >= t0) & (gd['_dt'] < t0 + pd.Timedelta(days=after_days))]
+        cmp_ = {'days': after_days,
+                'q_before': round(float(bef['q'].sum()) / after_days, 1), 'q_after': round(float(aft['q'].sum()) / after_days, 1),
+                'pos_before': round(float(bef['pos'].fillna(0).sum()) / after_days, 1) if bef['pos'].notna().any() else None,
+                'pos_after': round(float(aft['pos'].fillna(0).sum()) / after_days, 1) if aft['pos'].notna().any() else None}
+    cut90 = (end - pd.Timedelta(days=89)).strftime('%Y-%m-%d')
+    q90 = float(g[g['date'] >= cut90]['q'].sum())
+    amt90 = float(pd.to_numeric(g[g['date'] >= cut90]['supply_amount'], errors='coerce').fillna(0).sum())
+    # 같은 품번 다른 채널 최신 단가
+    df = SALES_DAILY_DF
+    code_of = dict(zip(df['sku'].astype(str), df['code'])) if df is not None else {}
+    code = (it or {}).get('code') or code_of.get(sku, '') or str(g['self_code'].iloc[-1])
+    others = []
+    if code:
+        rc = raw[[(code_of.get(s_, '') or sc) == code for s_, sc in zip(raw['sku'], raw['self_code'])]]
+        rc = rc[rc['p'].notna() & (rc['p'] > 0)].sort_values('date')
+        for (c2, s2), g2 in rc.groupby(['channel', 'sku']):
+            last = g2.iloc[-1]
+            others.append({'channel_name': str(last['channel_name']), 'sku': s2, 'price': int(round(last['p'])), 'date': last['date'],
+                           'self': c2 == ch and s2 == sku, 'name': str(last['name'])})
+        others.sort(key=lambda x: (not x['self'], x['price']))
+    names = _sales_name_map()
+    meta = it or {'channel': ch, 'channel_name': str(g['channel_name'].iloc[-1]), 'sku': sku, 'code': code,
+                  'name': names.get(code, '') or str(g['name'].iloc[-1])}
+    meta['sku_name'] = str(g['name'].iloc[-1])
+    return jsonify({'item': meta, 'points': points, 'segments': segs, 'changes': changes, 'compare': cmp_,
+                    'q90': int(q90), 'amt90': int(amt90), 'others': others, 'as_of': end.strftime('%Y-%m-%d')})
 
 
 @app.route('/api/delivery_weekday', methods=['GET'])
@@ -9278,6 +9406,68 @@ def api_sales_abc():
                     'seasonal': [x['code'] for x in items if x['grade'] == 'A' and x['seasonal']],
                     'from': abc['from'], 'to': abc['to'],
                     'dependence': sum(1 for x in items if x['grade'] == 'A' and x['top_share'] >= 90)})
+
+
+@app.route('/api/abc_detail', methods=['GET'])
+@cached_api()
+def api_abc_detail():
+    """매출 집중도(ABC) 품번 상세 (2026-09-29, 사용자 "ABC도 클릭하면 상세") —
+    등급·순위·비중, 월별 매출(거래처별, 자료 시작부터), 최근 13주 매출·납품·매장 판매, 최근 90일 거래처별 표, 수급 상태(수급 플래너 값 그대로)."""
+    code = (request.args.get('code') or '').strip().upper()
+    abc = _sales_abc()
+    if not abc or code not in abc['by']:
+        return jsonify({'error': f'{code}: 최근 90일 매출 없음'}), 404
+    v = abc['by'][code]
+    ranked = sorted(abc['by'].items(), key=lambda kv: -kv[1]['amt'])
+    rank = next(i for i, (c, _) in enumerate(ranked, 1) if c == code)
+    d = _sales_daily_canon()
+    end = d['_dt'].max()
+    g = d[d['code'] == code].copy()
+    g['retailer'] = g['channel_name'].where(~g['channel_name'].astype(str).str.startswith('홈플러스'), '홈플러스(계열)')
+    g['ym'] = g['date'].astype(str).str[:7]
+    # 월별 매출 — 거래처 상위 5곳 + 기타 (90일 매출 순서로 고정)
+    r90 = g[g['_dt'] > end - pd.Timedelta(days=90)]
+    top = list(r90.groupby('retailer')['amt'].sum().sort_values(ascending=False).head(5).index)
+    months = sorted(set(d['date'].astype(str).str[:7]))
+    mrows = []
+    for ym in months:
+        gm = g[g['ym'] == ym]
+        by = {t: int(gm[gm['retailer'] == t]['amt'].sum()) for t in top}
+        by['기타'] = int(gm[~gm['retailer'].isin(top)]['amt'].sum())
+        mrows.append({'ym': ym, 'amt': int(gm['amt'].sum()), 'ea': int(gm['ea'].sum()), 'by': by,
+                      'partial': ym == end.strftime('%Y-%m')})
+    # 최근 13주 (월요일 시작, 이번 주는 며칠치)
+    wend = end - pd.Timedelta(days=end.dayofweek)
+    wrows = []
+    for i in range(12, -1, -1):
+        a = wend - pd.Timedelta(weeks=i)
+        b = min(a + pd.Timedelta(days=6), end)
+        gw = g[(g['_dt'] >= a) & (g['_dt'] <= b)]
+        wrows.append({'w': a.strftime('%m/%d'), 'to': b.strftime('%m/%d'), 'days': int((b - a).days) + 1,
+                      'amt': int(gw['amt'].sum()), 'ea': int(gw['ea'].sum()), 'pos': int(gw['pe'].sum())})
+    # 거래처별 (최근 90일)
+    tot90 = float(r90['amt'].sum()) or 1.0
+    crows = []
+    for t, gc in r90.groupby('retailer'):
+        a_, e_ = float(gc['amt'].sum()), float(gc['ea'].sum())
+        if a_ <= 0 and e_ <= 0:
+            continue
+        gdl = gc[gc['ea'] > 0]
+        crows.append({'name': t, 'amt': int(a_), 'share': round(a_ / tot90 * 100, 1), 'ea': int(e_),
+                      'unit': round(a_ / e_) if e_ > 0 else None, 'orders': int(gdl['date'].nunique()),
+                      'last_dl': str(gdl['date'].max()) if len(gdl) else ''})
+    crows.sort(key=lambda x: -x['amt'])
+    # 수급 상태 — 수급 플래너와 같은 값
+    with app.test_request_context('/api/supply_plan'):
+        sp = api_supply_plan().get_json() or {}
+    p = next((x for x in sp.get('items', []) if x['code'] == code), None)
+    vel = (_sales_velocity() or {}).get('by', {}).get(code)
+    names = _sales_name_map()
+    item = {'code': code, 'name': names.get(code, '') or (p or {}).get('name', '') or str(g['name'].iloc[-1]),
+            **v, 'rank': rank, 'n_items': len(ranked)}
+    return jsonify({'item': item, 'months': mrows, 'top': top, 'weeks': wrows, 'channels': crows,
+                    'supply': p, 'vel': {'v28': round(vel['v28'], 1), 'v90': round(vel['v90'], 1), 'trend': vel['trend']} if vel else None,
+                    'from': abc['from'], 'to': abc['to'], 'total': abc['total']})
 
 
 @app.route('/api/vendor_scorecard', methods=['GET'])
@@ -11890,7 +12080,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .abc-legend span { white-space: nowrap; margin-right: 8px; }
   .abc-legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 3px; vertical-align: 0; }
   .abc-chip { display: inline-block; font-size: 9.5px; font-weight: 800; padding: 0 5px; border-radius: 4px; vertical-align: 1px; }
-  .abc-chip.A { background: #ede9fe; color: #6d28d9; } .abc-chip.B { background: #f1f5f9; color: #475569; }
+  .abc-chip.A { background: #ede9fe; color: #6d28d9; } .abc-chip.B { background: #f1f5f9; color: #475569; } .abc-chip.C { background: #fafafa; color: #94a3b8; border: 1px solid #e2e8f0; }
+  .abc-grades div { cursor: pointer; transition: box-shadow .12s; }
+  .abc-grades div:hover { box-shadow: 0 0 0 2px #c4b5fd; }
+  .abc-grades div.sel { box-shadow: 0 0 0 2px #7c3aed; }
   .sb-forecast { font-size: 11.5px; color: #1f5f55; background: #eef8f6; border: 1px solid #cfe9e3; border-radius: 8px; padding: 6px 10px; margin: -2px 0 8px; line-height: 1.5; }
   .sb-forecast b { color: #0f766e; }
   @media (max-width: 900px) { .lens-strip { grid-template-columns: 1fr; padding: 0 12px; } .chart-panel.lens-dormant { grid-column: auto; } }
@@ -13598,7 +13791,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       <div><span class="chart-title">🎯 매출 집중도 (ABC)</span><span class="chart-sub" id="abc-sub">최근 90일 매출 · A=누적 80%</span></div>
       <div class="vk-chips" id="abc-mode">
         <button class="vk-chip on" data-m="risk" onclick="setAbcMode('risk',this)">A 수급 위험</button>
-        <button class="vk-chip" data-m="a" onclick="setAbcMode('a',this)">A 전체</button>
+        <button class="vk-chip" data-m="A" onclick="setAbcMode('A',this)">A 전체</button>
       </div>
     </div>
     <div id="abc-head"></div>
@@ -13617,6 +13810,34 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       <button class="modal-close" onclick="closeNpDetail()">&times;</button>
     </div>
     <div class="modal-body" id="np-body"><div class="loading">로딩 중...</div></div>
+  </div>
+</div>
+
+<!-- 채널 공급단가 변동 상세 모달 (2026-09-29) -->
+<div class="modal-overlay" id="cpc-modal" style="z-index:125" onclick="if (event.target === this) closeCpcDetail()">
+  <div class="modal" style="max-width:980px">
+    <div class="modal-header">
+      <div>
+        <div class="code-badge" id="cpcd-badge" style="background:#9333ea">🏷 채널 공급단가</div>
+        <h2 id="cpcd-title">로딩 중...</h2>
+      </div>
+      <button class="modal-close" onclick="closeCpcDetail()">&times;</button>
+    </div>
+    <div class="modal-body" id="cpcd-body"><div class="loading">로딩 중...</div></div>
+  </div>
+</div>
+
+<!-- 매출 집중도(ABC) 품번 상세 모달 (2026-09-29) -->
+<div class="modal-overlay" id="abc-modal" style="z-index:125" onclick="if (event.target === this) closeAbcDetail()">
+  <div class="modal" style="max-width:980px">
+    <div class="modal-header">
+      <div>
+        <div class="code-badge" id="abcd-badge" style="background:#7c3aed">🎯 매출 집중도</div>
+        <h2 id="abcd-title">로딩 중...</h2>
+      </div>
+      <button class="modal-close" onclick="closeAbcDetail()">&times;</button>
+    </div>
+    <div class="modal-body" id="abcd-body"><div class="loading">로딩 중...</div></div>
   </div>
 </div>
 
@@ -15514,10 +15735,11 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       const d = await (await fetch('/api/channel_price_changes')).json();
       const items = d.items || [];
       document.getElementById('cpc-count').textContent = items.length + '건';
-      if (!items.length) { list.innerHTML = '<div class="alert-empty">최근 6개월 공급단가 변동이 없습니다</div>'; return; }
+      if (!items.length) { list.innerHTML = '<div class="alert-empty">최근 12개월 공급단가 변동이 없습니다</div>'; return; }
       list.innerHTML = items.slice(0, 40).map(x => {
         const up = x.pct > 0;
-        const click = x.code ? ' onclick="openItemModal(&quot;' + x.code + '&quot;)"' : '';
+        // 클릭 = 이 채널·SKU 단가 상세 (2026-09-29: 품번 정보 대신)
+        const click = ' data-ch="' + escapeHtml(x.channel || '') + '" data-sku="' + escapeHtml(String(x.sku)) + '" onclick="openCpcDetail(this.dataset.ch, this.dataset.sku)" title="클릭 = 단가 흐름·변경 이력·전후 비교"';
         return '<div class="alert-row"' + click + '>'
           + '<span class="alert-badge ' + (up ? 'low' : 'out') + '">' + (up ? '▲' : '▼') + ' ' + Math.abs(x.pct) + '%</span>'
           + '<div><div class="alert-name">' + escapeHtml(x.name) + '<span class="ch-tag">' + escapeHtml(x.channel_name) + '</span></div>'
@@ -15527,6 +15749,97 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       }).join('');
     } catch (e) { list.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
   }
+  // ───── 채널 공급단가 상세 모달 (2026-09-29) ─────
+  let _cpcd = null, _cpcdChart = null;
+  function closeCpcDetail() {
+    document.getElementById('cpc-modal').classList.remove('show');
+    if (_cpcdChart) { _cpcdChart.destroy(); _cpcdChart = null; }
+  }
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && document.getElementById('cpc-modal').classList.contains('show')) closeCpcDetail(); });
+  async function openCpcDetail(ch, sku) {
+    document.getElementById('cpc-modal').classList.add('show');
+    document.getElementById('cpcd-title').textContent = '로딩 중...';
+    const body = document.getElementById('cpcd-body');
+    body.innerHTML = '<div class="loading">로딩 중...</div>';
+    try {
+      const d = await (await fetch('/api/channel_price_detail?channel=' + encodeURIComponent(ch) + '&sku=' + encodeURIComponent(sku))).json();
+      if (d.error) throw new Error(d.error);
+      _cpcd = d;
+      renderCpcDetail();
+    } catch (e) { body.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
+  }
+  function renderCpcDetail() {
+    const d = _cpcd, x = d.item, c = d.compare;
+    const won = v => Math.abs(v) >= 1e8 ? (v / 1e8).toFixed(2) + '억' : (Math.abs(v) >= 1e4 ? fmtInt(Math.round(v / 1e4)) + '만' : fmtInt(v));
+    const md = s => s ? s.slice(5).replace('-', '/') : '-';
+    document.getElementById('cpcd-title').textContent = x.name;
+    document.getElementById('cpcd-badge').textContent = '🏷 ' + x.channel_name + ' · ' + (x.code || 'SKU ' + x.sku);
+    const has = x.prev != null && x.cur != null;
+    const up = has && x.cur > x.prev;
+    let why = '';
+    if (has) {
+      why = '<b>' + md(x.since) + '부터</b> ' + escapeHtml(x.channel_name) + ' 공급단가가 <b>' + fmtInt(x.prev) + '원 → ' + fmtInt(x.cur) + '원</b>'
+        + ' (<b style="color:' + (up ? '#047857' : '#dc2626') + '">' + (up ? '▲' : '▼') + Math.abs(x.pct) + '%</b>, 개당 ' + (up ? '+' : '−') + fmtInt(Math.abs(x.cur - x.prev)) + '원).'
+        + '<br>월 영향 = 단가 차이 ' + (up ? '+' : '−') + fmtInt(Math.abs(x.cur - x.prev)) + '원 × 최근 90일 납품 ' + fmtInt(d.q90) + '개 ÷ 3개월 = <b style="color:' + (x.impact >= 0 ? '#047857' : '#dc2626') + '">'
+        + (x.impact >= 0 ? '+' : '−') + won(Math.abs(x.impact)) + '원/월</b>'
+        + (up ? ' (우리 매출 증가)' : ' (우리 매출 감소 — 마진 압박)') + '.';
+      if (c) {
+        const qd = c.q_before ? Math.round((c.q_after - c.q_before) / c.q_before * 100) : null;
+        const pd = c.pos_before ? Math.round((c.pos_after - c.pos_before) / c.pos_before * 100) : null;
+        why += '<br>변경 전후 ' + c.days + '일 비교 — 납품 하루 ' + fmtInt(Math.round(c.q_before)) + ' → ' + fmtInt(Math.round(c.q_after)) + '개' + (qd != null ? ' (' + (qd > 0 ? '+' : '') + qd + '%)' : '')
+          + (c.pos_before != null ? ', 매장 판매 하루 ' + fmtInt(Math.round(c.pos_before)) + ' → ' + fmtInt(Math.round(c.pos_after)) + '개' + (pd != null ? ' (' + (pd > 0 ? '+' : '') + pd + '%)' : '') : '') + '.';
+      }
+    } else {
+      why = '이 채널·SKU는 현재 단가 변동 목록 기준(안정 가격 2회 이상 관측)에 해당하지 않습니다. 아래 단가 흐름을 참고하세요.';
+    }
+    const oneoffs = d.segments.filter(s => s.oneoff).length;
+    if (oneoffs) why += '<br><span style="color:var(--text-3)">하루만 나온 단가 ' + oneoffs + '건은 행사·일시 가격으로 보고 변동 판단에서 뺐습니다(표에 "단발" 표시).</span>';
+    let h = '<div class="npd-why" style="background:#faf5ff;border-color:#e9d5ff">' + why + '</div>';
+    const kpi = (l, val, sub) => '<div>' + l + '<b>' + val + '</b>' + (sub ? '<span style="font-size:10px">' + sub + '</span>' : '') + '</div>';
+    h += '<div class="npd-kpis">'
+      + kpi('이전 단가', has ? fmtInt(x.prev) + '원' : '-', '') + kpi('현재 단가', has ? fmtInt(x.cur) + '원' : '-', has ? md(x.since) + '부터' : '')
+      + kpi('변동률', has ? (up ? '+' : '−') + Math.abs(x.pct) + '%' : '-', '') + kpi('월 영향', has ? (x.impact >= 0 ? '+' : '−') + won(Math.abs(x.impact)) : '-', '')
+      + kpi('90일 납품', fmtInt(d.q90) + '개', '') + kpi('90일 매출', won(d.amt90), '') + '</div>';
+    h += '<div class="npd-sec">단가 흐름 · 납품 수량</div><div class="npd-chart-wrap"><canvas id="cpcdChart"></canvas></div>'
+      + '<div class="npd-note">보라 선: 공급단가(왼쪽 축, 단가가 기록된 날만) · 회색 막대: 그날 납품 수량(오른쪽 축) · 빨간 점: 하루만 나온 단발 단가</div>';
+    h += '<div class="npd-sec">단가 구간</div><table class="npd-tbl"><thead><tr><th>기간</th><th>단가</th><th>관측</th><th>납품 수량</th><th>구분</th></tr></thead><tbody>'
+      + d.segments.slice().reverse().map(s => '<tr' + (s.oneoff ? ' class="part"' : '') + '><td>' + md(s.from) + (s.to !== s.from ? '~' + md(s.to) : '') + '</td><td>' + fmtInt(s.price) + '원</td><td>' + s.n + '회</td><td>' + fmtInt(s.q) + '</td><td>'
+          + (s.oneoff ? '<span style="color:#dc2626">단발</span>' : (s === d.segments[d.segments.length - 1] ? '<b>현재</b>' : '안정')) + '</td></tr>').join('')
+      + '</tbody></table>';
+    if (d.others && d.others.length > 1) {
+      h += '<div class="npd-sec">같은 품번 다른 채널 단가 (최신)</div><table class="npd-tbl"><thead><tr><th>채널</th><th>단가</th><th>마지막 기록</th><th>SKU</th></tr></thead><tbody>'
+        + d.others.map(o => '<tr' + (o.self ? ' style="font-weight:700"' : '') + '><td>' + escapeHtml(o.channel_name) + (o.self ? ' (이 항목)' : '') + '</td><td>' + fmtInt(o.price) + '원</td><td>' + md(o.date) + '</td><td>' + escapeHtml(String(o.sku)) + '</td></tr>').join('')
+        + '</tbody></table>';
+    }
+    h += '<div style="display:flex;justify-content:space-between;align-items:center;font-size:10.5px;color:var(--text-3)"><span>판매 SKU: ' + escapeHtml(x.sku_name || '') + ' (' + escapeHtml(String(x.sku)) + ') · 자료 ~' + md(d.as_of) + '</span>'
+      + (x.code ? '<button class="vk-chip" style="padding:6px 12px" onclick="openItemModal(&quot;' + x.code + '&quot;)">📦 품목 정보(BOM·재고) 열기</button>' : '') + '</div>';
+    document.getElementById('cpcd-body').innerHTML = h;
+    drawCpcdChart();
+  }
+  function drawCpcdChart() {
+    const d = _cpcd; const cv = document.getElementById('cpcdChart'); if (!d || !cv) return;
+    if (_cpcdChart) _cpcdChart.destroy();
+    const pts = d.points;
+    const oneoffDates = new Set(d.segments.filter(s => s.oneoff).map(s => s.from));
+    _cpcdChart = new Chart(cv, {
+      data: {
+        labels: pts.map(p => p.date.slice(5).replace('-', '/')),
+        datasets: [
+          { type: 'line', label: '공급단가', data: pts.map(p => p.price), borderColor: '#9333ea', backgroundColor: '#9333ea', stepped: 'before', borderWidth: 2,
+            pointRadius: pts.map(p => oneoffDates.has(p.date) ? 4 : 1.5), pointBackgroundColor: pts.map(p => oneoffDates.has(p.date) ? '#dc2626' : '#9333ea'), order: 1 },
+          { type: 'bar', label: '납품 수량', data: pts.map(p => p.q), yAxisID: 'y2', backgroundColor: '#cbd5e1', borderRadius: 2, order: 2 },
+        ]
+      },
+      options: { responsive: true, maintainAspectRatio: false, animation: { duration: 250 }, interaction: { mode: 'index', intersect: false },
+        plugins: { legend: { labels: { boxWidth: 11, font: { size: 10.5 } } },
+                   tooltip: { callbacks: { title: it => pts[it[0].dataIndex].date + (oneoffDates.has(pts[it[0].dataIndex].date) ? ' (단발)' : ''),
+                                           label: c => c.dataset.label + ': ' + fmtInt(c.parsed.y) + (c.dataset.yAxisID === 'y2' ? '개' : '원') } } },
+        scales: { x: { grid: { display: false }, ticks: { font: { size: 10 }, maxRotation: 0, autoSkip: true, maxTicksLimit: 14 } },
+                  y: { ticks: { font: { size: 10 }, callback: v => fmtInt(v) + '원' }, grid: { color: '#eef2f7' }, title: { display: true, text: '공급단가', font: { size: 10 } } },
+                  y2: { position: 'right', beginAtZero: true, ticks: { font: { size: 10 }, callback: v => fmtInt(v) }, grid: { display: false }, title: { display: true, text: '납품 수량', font: { size: 10 } } } } }
+    });
+  }
+
   // ───── 수요 급변 (2026-09-23) ─────
   async function loadDemandShift() {
     const list = document.getElementById('shift-list');
@@ -15808,25 +16121,137 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const top = ch.slice(0, 6), etc = ch.slice(6).reduce((a, x) => a + x.share, 0);
     const segs = top.map((x, i) => ({ n: x.name, s: x.share, c: ABC_CH_COLORS[i] })).concat(etc > 0 ? [{ n: '기타', s: Math.round(etc * 10) / 10, c: ABC_CH_COLORS[6] }] : []);
     head.innerHTML = '<div class="abc-grades">'
-      + ['A', 'B', 'C'].map(k => '<div class="' + (k === 'A' ? 'ga' : '') + '"><b>' + k + ' ' + (g[k] ? g[k].n : 0) + '품번</b>매출 ' + (g[k] ? g[k].share : 0) + '% · ' + (g[k] ? fmtEok(g[k].amt) : '-') + '</div>').join('') + '</div>'
+      + ['A', 'B', 'C'].map(k => '<div class="' + (k === 'A' ? 'ga' : '') + (_abcMode === k ? ' sel' : '') + '" onclick="setAbcMode(&quot;' + k + '&quot;)" title="클릭 = ' + k + '등급 품번 목록">'
+          + '<b>' + k + ' ' + (g[k] ? g[k].n : 0) + '품번</b>매출 ' + (g[k] ? g[k].share : 0) + '% · ' + (g[k] ? fmtEok(g[k].amt) : '-') + '</div>').join('') + '</div>'
       + '<div style="font-size:10.5px;color:var(--text-2)">채널 비중 · <b style="color:#6d28d9">A품번 ' + (d.dependence || 0) + '개</b>는 한 거래처가 90% 이상'
       + (d.seasonal && d.seasonal.length ? ' · 시즌 품번 ' + escapeHtml(d.seasonal.join('·')) + '은 수급 위험에서 제외' : '') + '</div>'
       + '<div class="abc-chbar">' + segs.map(x => '<i style="width:' + x.s + '%;background:' + x.c + '" title="' + escapeHtml(x.n) + ' ' + x.s + '%"></i>').join('') + '</div>'
       + '<div class="abc-legend">' + segs.map(x => '<span><i style="background:' + x.c + '"></i>' + escapeHtml(x.n) + ' ' + x.s + '%</span>').join('') + '</div>';
-    const rows = _abcMode === 'risk' ? (d.risk || []) : (d.items || []).filter(x => x.grade === 'A');
+    const rows = _abcMode === 'risk' ? (d.risk || []) : (d.items || []).filter(x => x.grade === _abcMode);
     const LV = { out: ['품절', 'out'], critical: ['2주↓', 'critical'], warning: ['4주↓', 'warning'], low: ['8주↓', 'low'], ok: ['여유', 'low'] };
     if (!rows.length) { list.innerHTML = '<div class="alert-empty">' + (_abcMode === 'risk' ? 'A등급 중 창고 4주 미만 없음 👍' : '없음') + '</div>'; return; }
     list.innerHTML = rows.map(x => {
       const lv = x.seasonal ? ['시즌', 'low'] : (LV[x.level] || ['-', 'low']);
-      return '<div class="alert-row" onclick="openItemModal(&quot;' + x.code + '&quot;)"' + (x.seasonal ? ' title="90일 동안 납품 5일 이하·최근 2주 납품 없음 (명절 세트 등) — 보충 대상 아님"' : '') + '>'
+      return '<div class="alert-row" onclick="openAbcDetail(&quot;' + x.code + '&quot;)" title="' + (x.seasonal ? '90일 동안 납품 5일 이하·최근 2주 납품 없음 (명절 세트 등) — 보충 대상 아님 · ' : '') + '클릭 = 월별·주별 매출·거래처·수급 상세">'
         + '<span class="alert-badge ' + lv[1] + '"' + (x.seasonal ? ' style="background:#f1f5f9;color:#64748b"' : '') + '>' + lv[0] + '</span>'
         + '<div><div class="alert-name">' + escapeHtml(x.name || x.code) + '</div>'
-        + '<div class="alert-code"><span class="abc-chip A">A</span> ' + escapeHtml(x.code) + ' · 매출 ' + x.share + '% (누적 ' + x.cum + '%) · '
+        + '<div class="alert-code"><span class="abc-chip ' + x.grade + '">' + x.grade + '</span> ' + escapeHtml(x.code) + ' · 매출 ' + x.share + '% (누적 ' + x.cum + '%) · '
         + escapeHtml(x.top_channel) + ' ' + x.top_share + '%' + (x.n_channels > 1 ? ' 외 ' + (x.n_channels - 1) + '곳' : ' 단독')
         + (x.ch_note ? ' · <span class="ch-tag' + (x.ch_note === '채널 여유' ? ' on' : '') + '">' + escapeHtml(x.ch_note) + '</span>' : '') + '</div></div>'
         + '<div class="alert-qty">' + (x.stock != null ? '창고 ' + fmtInt(x.stock) : '') + '</div>'
         + '<div class="alert-days ' + lv[1] + '">' + (x.cov_weeks != null ? x.cov_weeks + '주' : '-') + '</div></div>';
     }).join('');
+  }
+
+  // ───── 매출 집중도 품번 상세 모달 (2026-09-29) ─────
+  let _abcd = null, _abcdMode = 'm', _abcdChart = null;
+  const ABCD_LV = { out: ['창고 품절', '#dc2626'], critical: ['창고 2주분 미만', '#ea580c'], warning: ['창고 4주분 미만', '#ca8a04'], low: ['창고 8주분 미만', '#0891b2'], ok: ['창고 여유', '#16a34a'] };
+  function closeAbcDetail() {
+    document.getElementById('abc-modal').classList.remove('show');
+    if (_abcdChart) { _abcdChart.destroy(); _abcdChart = null; }
+  }
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && document.getElementById('abc-modal').classList.contains('show')) closeAbcDetail(); });
+  async function openAbcDetail(code) {
+    document.getElementById('abc-modal').classList.add('show');
+    document.getElementById('abcd-title').textContent = code;
+    const body = document.getElementById('abcd-body');
+    body.innerHTML = '<div class="loading">로딩 중...</div>';
+    try {
+      const d = await (await fetch('/api/abc_detail?code=' + encodeURIComponent(code))).json();
+      if (d.error) throw new Error(d.error);
+      _abcd = d; _abcdMode = 'm';
+      renderAbcDetail();
+    } catch (e) { body.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
+  }
+  function setAbcdMode(m) {
+    _abcdMode = m;
+    document.querySelectorAll('#abcd-mode .vk-chip').forEach(b => b.classList.toggle('on', b.dataset.m === m));
+    drawAbcdChart();
+  }
+  function renderAbcDetail() {
+    const d = _abcd, x = d.item, s = d.supply || {}, vel = d.vel;
+    const won = v => v >= 1e8 ? (v / 1e8).toFixed(2) + '억' : (v >= 1e4 ? fmtInt(Math.round(v / 1e4)) + '만' : fmtInt(v));
+    document.getElementById('abcd-title').textContent = x.name;
+    document.getElementById('abcd-badge').textContent = '🎯 ' + x.grade + '등급 · ' + x.code;
+    const lv = ABCD_LV[s.level] || ['수급 정보 없음', '#64748b'];
+    // 해석 문장
+    let why = '최근 90일 매출 <b>' + won(x.amt) + '</b>으로 ' + x.n_items + '개 품번 중 <b>' + x.rank + '위</b>(전체의 ' + x.share + '%). '
+      + '1위부터 이 품번까지 누적 ' + x.cum + '% → <b>' + x.grade + '등급</b>'
+      + (x.grade === 'A' ? ' (매출 상위 80%를 만드는 핵심 품번 — 안전재고 우선)' : x.grade === 'B' ? ' (80~95% 구간)' : ' (하위 5% 구간)') + '.';
+    if (x.top_share >= 90) why += '<br>매출의 <b>' + x.top_share + '%가 ' + escapeHtml(x.top_channel) + ' 한 곳</b> — 그 거래처 발주 변화에 크게 흔들립니다.';
+    if (vel) why += '<br>최근 4주 납품 속도 하루 ' + fmtInt(Math.round(vel.v28)) + '개 = 3개월 평균(' + fmtInt(Math.round(vel.v90)) + '개)의 <b>' + vel.trend + '배</b>'
+      + (vel.trend >= 1.15 ? ' — 늘어나는 중' : vel.trend <= 0.85 ? ' — 줄어드는 중' : '') + '.';
+    if (x.seasonal) why += '<br><b>시즌 품번</b>(90일 납품 5일 이하·최근 2주 납품 없음) — 보충 대상 아님.';
+    if (s.level) why += '<br>수급: <b style="color:' + lv[1] + '">' + lv[0] + '</b> — 월 판매 ' + fmtInt(s.monthly) + '개 기준 창고 ' + fmtInt(s.stock) + '개 = ' + s.cov_weeks + '주분'
+      + (s.cov_ch_weeks != null ? ', 채널 재고 ' + fmtInt(s.ch_stock) + '개까지 합치면 ' + s.cov_ch_weeks + '주분' : '')
+      + ((s.plan || s.incoming) ? ', 생산계획·입고예정 ' + fmtInt((s.plan || 0) + (s.incoming || 0)) + '개 반영 시 ' + s.cov_plan_weeks + '주분' : '') + '.';
+    const kpi = (l, val, sub) => '<div>' + l + '<b>' + val + '</b>' + (sub ? '<span style="font-size:10px">' + sub + '</span>' : '') + '</div>';
+    let h = '<div class="npd-why" style="background:#f5f3ff;border-color:#ddd6fe">' + why + '</div>';
+    h += '<div class="npd-kpis">'
+      + kpi('등급 · 순위', x.grade + ' · ' + x.rank + '위', '/ ' + x.n_items + '개')
+      + kpi('90일 매출', won(x.amt), d.from.slice(5).replace('-', '/') + '~' + d.to.slice(5).replace('-', '/'))
+      + kpi('매출 비중', x.share + '%', '누적 ' + x.cum + '%')
+      + kpi('주 거래처', escapeHtml(x.top_channel), x.top_share + '%' + (x.n_channels > 1 ? ' · 외 ' + (x.n_channels - 1) + '곳' : ' 단독'))
+      + kpi('창고 재고', s.stock != null ? fmtInt(s.stock) : '-', s.cov_weeks != null ? s.cov_weeks + '주분' : '')
+      + kpi('채널 재고', s.ch_stock != null ? fmtInt(s.ch_stock) : '-', s.cov_ch_weeks != null ? '합계 ' + s.cov_ch_weeks + '주분' : '') + '</div>';
+    h += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><span class="npd-sec" style="margin:0">매출 추이</span>'
+      + '<div class="vk-chips" id="abcd-mode" style="margin-left:auto"><button class="vk-chip on" data-m="m" onclick="setAbcdMode(&quot;m&quot;)">월별(거래처별)</button>'
+      + '<button class="vk-chip" data-m="w" onclick="setAbcdMode(&quot;w&quot;)">최근 13주</button></div></div>'
+      + '<div class="npd-chart-wrap"><canvas id="abcdChart"></canvas></div>'
+      + '<div class="npd-note" id="abcd-note"></div>';
+    // 거래처별 표 (최근 90일)
+    h += '<div class="npd-sec">거래처별 (최근 90일)</div><table class="npd-tbl"><thead><tr><th>거래처</th><th>매출</th><th>비중</th><th>납품 수량</th><th>개당 공급가</th><th>납품 횟수</th><th>마지막 납품</th></tr></thead><tbody>'
+      + d.channels.map(c => '<tr><td>' + escapeHtml(c.name) + '</td><td>' + won(c.amt) + '</td><td>' + c.share + '%</td><td>' + fmtInt(c.ea) + '</td><td>'
+          + (c.unit != null ? fmtInt(c.unit) + '원' : '-') + '</td><td>' + c.orders + '회</td><td>' + (c.last_dl ? c.last_dl.slice(5).replace('-', '/') : '-') + '</td></tr>').join('')
+      + '</tbody></table>';
+    // 월별 표
+    h += '<div class="npd-sec">월별</div><table class="npd-tbl"><thead><tr><th>월</th><th>매출</th><th>납품 수량</th>'
+      + d.top.map(t => '<th>' + escapeHtml(t) + '</th>').join('') + '<th>기타</th></tr></thead><tbody>'
+      + d.months.slice().reverse().map(m => '<tr' + (m.partial ? ' class="part"' : '') + '><td>' + m.ym.slice(2).replace('-', '/') + (m.partial ? ' (진행 중)' : '') + '</td><td>' + won(m.amt) + '</td><td>' + fmtInt(m.ea) + '</td>'
+          + d.top.map(t => '<td>' + (m.by[t] ? won(m.by[t]) : '-') + '</td>').join('') + '<td>' + (m.by['기타'] ? won(m.by['기타']) : '-') + '</td></tr>').join('')
+      + '</tbody></table>';
+    h += '<div style="text-align:right"><button class="vk-chip" style="padding:6px 12px" onclick="openItemModal(&quot;' + x.code + '&quot;)">📦 품목 정보(BOM·재고) 열기</button></div>';
+    document.getElementById('abcd-body').innerHTML = h;
+    drawAbcdChart();
+  }
+  function drawAbcdChart() {
+    const d = _abcd; if (!d) return;
+    const cv = document.getElementById('abcdChart'); if (!cv) return;
+    if (_abcdChart) _abcdChart.destroy();
+    const note = document.getElementById('abcd-note');
+    const mv = v => Math.round(v / 1e4);   // 만원
+    if (_abcdMode === 'm') {
+      const keys = d.top.concat(['기타']);
+      _abcdChart = new Chart(cv, {
+        type: 'bar',
+        data: { labels: d.months.map(m => m.ym.slice(2).replace('-', '/') + (m.partial ? '*' : '')),
+                datasets: keys.map((k, i) => ({ label: k, data: d.months.map(m => mv(m.by[k] || 0)), backgroundColor: ABC_CH_COLORS[k === '기타' ? 6 : i], borderRadius: 3 })) },
+        options: { responsive: true, maintainAspectRatio: false, animation: { duration: 250 }, interaction: { mode: 'index', intersect: false },
+          plugins: { legend: { labels: { boxWidth: 11, font: { size: 10.5 } } },
+                     tooltip: { callbacks: { label: c => c.dataset.label + ': ' + fmtInt(c.parsed.y) + '만원', footer: it => '합계 ' + fmtInt(it.reduce((a, i) => a + i.parsed.y, 0)) + '만원' } } },
+          scales: { x: { stacked: true, grid: { display: false }, ticks: { font: { size: 10 } } },
+                    y: { stacked: true, beginAtZero: true, ticks: { font: { size: 10 }, callback: v => fmtInt(v) + '만' }, grid: { color: '#eef2f7' } } } }
+      });
+      note.textContent = '월별 매출(공급가, 만원)을 거래처별로 쌓은 막대 · * 는 진행 중인 달';
+    } else {
+      const w = d.weeks;
+      _abcdChart = new Chart(cv, {
+        data: { labels: w.map(x => x.w + (x.days < 7 ? '*' : '')),
+                datasets: [
+                  { type: 'bar', label: '매출(만원)', data: w.map(x => mv(x.amt)), backgroundColor: '#7c3aed', borderRadius: 3, order: 2 },
+                  { type: 'line', label: '납품 수량', data: w.map(x => x.ea), yAxisID: 'y2', borderColor: '#94a3b8', backgroundColor: '#94a3b8', borderWidth: 2, pointRadius: 2.5, tension: 0.25, order: 1 },
+                  { type: 'line', label: '매장 판매', data: w.map(x => x.pos), yAxisID: 'y2', borderColor: '#16a34a', backgroundColor: '#16a34a', borderWidth: 2, pointRadius: 2.5, tension: 0.25, order: 1 },
+                ] },
+        options: { responsive: true, maintainAspectRatio: false, animation: { duration: 250 }, interaction: { mode: 'index', intersect: false },
+          plugins: { legend: { labels: { boxWidth: 11, font: { size: 10.5 } } },
+                     tooltip: { callbacks: { title: it => w[it[0].dataIndex].w + '~' + w[it[0].dataIndex].to + ' (' + w[it[0].dataIndex].days + '일)',
+                                             label: c => c.dataset.label + ': ' + fmtInt(c.parsed.y) + (c.dataset.yAxisID === 'y2' ? '개' : '만원') } } },
+          scales: { x: { grid: { display: false }, ticks: { font: { size: 10 } } },
+                    y: { beginAtZero: true, ticks: { font: { size: 10 }, callback: v => fmtInt(v) + '만' }, grid: { color: '#eef2f7' }, title: { display: true, text: '매출', font: { size: 10 } } },
+                    y2: { position: 'right', beginAtZero: true, ticks: { font: { size: 10 }, callback: v => fmtInt(v) }, grid: { display: false }, title: { display: true, text: '수량', font: { size: 10 } } } } }
+      });
+      note.textContent = '막대: 주별 매출(만원) · 회색 선: 우리가 납품한 수량 · 초록 선: 매장 판매(POS) · * 는 며칠치뿐인 주';
+    }
   }
 
   function wdSplit(on, off) {   // 요일별 온라인/오프라인 비중 줄
