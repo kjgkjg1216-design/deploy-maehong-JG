@@ -13,6 +13,24 @@ XL_UP = -4162
 XL_OPENXML = 51
 
 
+def _last_row(ws, col):
+    """col 열의 마지막 값 있는 행 — 필터로 숨긴 행이 있어도 정확히 (2026-10-08).
+    End(xlUp)은 숨긴 행을 건너뛰어, 구매팀이 필터(예: 더고은만)를 걸어 둔 파일에선 아래 거래처 행을 못 찾고
+    입고일지는 숨은 기존 행 위에 덮어쓸 위험이 있었음."""
+    ur = ws.UsedRange
+    last = ur.Row + ur.Rows.Count - 1
+    if last < 1:
+        return 0
+    vals = ws.Range(ws.Cells(1, col), ws.Cells(last, col)).Value
+    if not isinstance(vals, (tuple, list)):
+        return 1 if vals not in (None, '') else 0
+    for i in range(len(vals) - 1, -1, -1):
+        v = vals[i][0] if isinstance(vals[i], (tuple, list)) else vals[i]
+        if v not in (None, ''):
+            return i + 1
+    return 0
+
+
 def main(spec_path):
     spec = json.load(open(spec_path, encoding='utf-8'))
     import pythoncom, win32com.client as w32
@@ -29,19 +47,27 @@ def main(spec_path):
         if not hdr.startswith(f"{spec['mon']}월"):
             out['error'] = f'기준 파일 일별 열 헤더가 {spec["mon"]}월이 아님: {hdr}'
             wb.Close(False); print(json.dumps(out, ensure_ascii=False)); return
-        last = ws.Cells(ws.Rows.Count, 2).End(XL_UP).Row
+        last = _last_row(ws, 2)
         vals = ws.Range(ws.Cells(7, 1), ws.Cells(max(last, 7), 5)).Value
         if not isinstance(vals[0], (tuple, list)):
             vals = (vals,)
-        rowmap = {}
+        rowmap, rowmap2, occ = {}, {}, {}
         for i, v in enumerate(vals):
             code = str(v[1] or '').strip().upper(); sp = str(v[2] or '').strip(); vendor = str(v[4] or '').strip()
             if code and (vendor, code, sp) not in rowmap:
                 rowmap[(vendor, code, sp)] = 7 + i
+            # 같은 품번+규격이 여러 행(반제품 제품별·공용 자재 제품 블록별) → 납품처(A)+품명(D)+몇 번째로 행 특정 (2026-10-08, app._row_rks와 같은 규칙)
+            if code:
+                k2 = (vendor, code, sp, str(v[0] or '').strip(), str(v[3] or '').strip())
+                n = occ.get(k2, 0); occ[k2] = n + 1
+                rowmap2[k2 + (n,)] = 7 + i
         for d in spec.get('days', []):
-            r = rowmap.get((d['vendor'], d['code'].upper(), d['spec']))
+            if d.get('name') is not None:
+                r = rowmap2.get((d['vendor'], d['code'].upper(), d['spec'], d.get('dest', ''), d['name'], int(d.get('occ', 0))))
+            else:
+                r = rowmap.get((d['vendor'], d['code'].upper(), d['spec']))
             if not r:
-                out['missing'].append(f"{d['vendor']}/{d['code']}/{d['spec']}"); continue
+                out['missing'].append(f"{d['vendor']}/{d['code']}/{d['spec']}" + (f"/{d.get('dest', '')} {d['name'][:20]}" if d.get('name') is not None else '')); continue
             c = ws.Cells(r, 10 + int(d['day']))
             if d.get('val') is None:
                 c.ClearContents()
@@ -49,7 +75,7 @@ def main(spec_path):
                 c.Value = d['val']
             out['written'] += 1
         wi = wb.Worksheets('daily_원부자재 입고일지')
-        li = wi.Cells(wi.Rows.Count, 2).End(XL_UP).Row
+        li = _last_row(wi, 2)
         if li < 2:
             li = 2
         # 기존 마감에 덧붙일 때는 이미 같은 (일자, 품번, 수량, 거래처) 행이 있으면 건너뜀 (재생성 시 중복 방지)

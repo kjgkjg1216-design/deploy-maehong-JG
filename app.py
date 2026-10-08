@@ -142,7 +142,7 @@ def _require_login():
     if p == '/login' or any(p.startswith(x) for x in _PUBLIC_PREFIXES):
         return None
     # 로컬 갱신/감지 스크립트용 토큰 우회
-    if p in ('/api/reload_dfs', '/api/monday_dirty', '/api/monday_dirty/clear', '/api/vendor_entries'):
+    if p in ('/api/reload_dfs', '/api/monday_dirty', '/api/monday_dirty/clear', '/api/vendor_entries', '/api/vendor_upload'):
         _tok = os.environ.get('RELOAD_TOKEN', '')
         if _tok and request.args.get('token') == _tok:
             return None
@@ -488,6 +488,16 @@ def _parse_inventory_excel(xlsx_path):
     df = df[df[first_col].notna()]
     return df.fillna('')
 
+_INV_FULL = {}   # {'id': id(DF), 'df': 중복 제거 전 전체 행} — _inv_full_df()
+
+
+def _inv_full_df():
+    """재고일지 원본 행 전체(중복 제거 전) — 거래처 화면·엑셀 업로드용 (2026-10-08).
+    공용 자재(흡수제·RRP 박스·화덕고구마 등)는 제품 블록마다 같은 재고로 반복돼 DF에선 한 행만 남기지만(재고 합계 중복 방지),
+    일별 사용량은 제품 블록 행마다 따로 적으므로 거래처 화면은 엑셀과 같은 모든 행이 필요."""
+    return _INV_FULL['df'] if _INV_FULL.get('id') == id(DF) and _INV_FULL.get('df') is not None else DF
+
+
 def load_inventory_data():
     """재고 로드 — OneDrive 최종본 Excel 직접 읽기 (CSV fallback)."""
     import datetime as _dt
@@ -498,8 +508,10 @@ def load_inventory_data():
         try:
             df = _parse_inventory_excel(xlsx_path)
             raw_n = len(df)
+            full = df.reset_index(drop=True)
             if '품번' in df.columns and '외주업체' in df.columns and '현재고량' in df.columns:
                 df = df.drop_duplicates(subset=['품번', '외주업체', '현재고량'], keep='first').reset_index(drop=True)
+            _INV_FULL.update(id=id(df), df=full)
             dropped = raw_n - len(df)
             mtime_str = _dt.datetime.fromtimestamp(os.path.getmtime(xlsx_path)).strftime('%Y-%m-%d %H:%M')
             print(f"[재고일지] OneDrive 직접 로드: {xlsx_path}")
@@ -516,8 +528,10 @@ def load_inventory_data():
     print(f"[재고 로드] CSV fallback: {latest_csv}")
     df = pd.read_csv(latest_csv, encoding='utf-8-sig', dtype=str).fillna('')
     raw_n = len(df)
+    full = df.reset_index(drop=True)
     if '품번' in df.columns and '외주업체' in df.columns and '현재고량' in df.columns:
         df = df.drop_duplicates(subset=['품번', '외주업체', '현재고량'], keep='first').reset_index(drop=True)
+    _INV_FULL.update(id=id(df), df=full)
     dropped = raw_n - len(df)
     if dropped:
         print(f"[재고 중복 제거] {dropped}행 제거")
@@ -2074,7 +2088,8 @@ def _vendor_overlay_apply():
             flows.setdefault(k, []).append((ts, float(e.get('qty', 0) or 0)))
         elif kind == 'day' and e.get('type') == 'use':
             # 같은 (날짜) 항목은 최신 입력이 대체 → 여기선 최신만 남기기 위해 date 키로 정리
-            flows.setdefault(k, []).append((ts, -float(e.get('qty', 0) or 0), e.get('date'), 'day'))
+            # (행 rk, 날짜)별 최신 — 같은 자재가 납품처마다 행이 있으면 같은 날 두 행 값이 서로 덮지 않게
+            flows.setdefault(k, []).append((ts, -float(e.get('qty', 0) or 0), (e.get('rk', ''), e.get('date')), 'day'))
     keys = set(latest_set) | set(flows)
     if not keys:
         return 0
@@ -2171,7 +2186,7 @@ def api_vendor_portal_submit(token):
     ip = request.headers.get('X-Forwarded-For', request.remote_addr or '').split(',')[0].strip()
     now = time.time()
     valid = {x['code'].upper() for x in _vendor_items(vendor)}
-    rows_all = {(r['code'].upper(), r['spec']): r for r in _vendor_rows(vendor)}
+    rows_all = {(r['code'].upper(), r['spec'], r['rk']): r for r in _vendor_rows(vendor)}
     recs = []
     for it in body.get('items') or []:
         c = str(it.get('code', '')).strip().upper()
@@ -2188,13 +2203,17 @@ def api_vendor_portal_submit(token):
             recs.append({'ts': now, 'vendor': vendor, 'code': c, 'qty': q, 'name': name, 'ip': ip, 'kind': 'set'})
         elif kind == 'day':
             spec = str(it.get('spec', '') or '').strip(); date = str(it.get('date', '') or '')[:10]
-            r = rows_all.get((c, spec))
+            rk = str(it.get('rk', '') or '')
+            r = rows_all.get((c, spec, rk))
             if not r or not re.match(r'^\d{4}-\d{2}-\d{2}$', date):
                 continue
             if r['type'] != 'delta' and q < 0:
                 continue
-            recs.append({'ts': now, 'vendor': vendor, 'code': c, 'spec': spec, 'date': date, 'qty': q,
-                         'type': r['type'], 'name': name, 'ip': ip, 'kind': 'day'})
+            rec = {'ts': now, 'vendor': vendor, 'code': c, 'spec': spec, 'date': date, 'qty': q,
+                   'type': r['type'], 'name': name, 'ip': ip, 'kind': 'day'}
+            if rk:
+                rec['rk'] = rk          # 같은 품번+규격 여러 행 중 어느 행인지 (납품처|품명)
+            recs.append(rec)
         elif kind == 'in':
             date = str(it.get('date', '') or '')[:10]; unit = str(it.get('unit', '') or '').strip()[:10]
             exp = str(it.get('exp', '') or '').strip()[:10]
@@ -2227,9 +2246,21 @@ def api_vendor_portal_history(token):
     es = [e for e in _vendor_entries_read() if e.get('vendor') == vendor]
     es.sort(key=lambda e: -float(e.get('ts', 0)))
     names = {x['code'].upper(): x['name'] for x in _vendor_items(vendor)}
-    return jsonify({'items': [{'at': datetime.fromtimestamp(e['ts']).strftime('%m-%d %H:%M'), 'code': e.get('code', ''),
-                               'name': names.get(str(e.get('code', '')).upper(), ''), 'qty': e.get('qty'), 'date': e.get('date', ''),
-                               'by': e.get('name', ''), 'kind': e.get('kind', 'set')} for e in es[:40]]})
+    out, grp = [], {}
+    for e in es:
+        if e.get('src') == 'xlsx':      # 엑셀 업로드는 한 번에 수백 칸 → 파일 단위 한 줄로
+            k = (e.get('file', ''), e.get('name', ''), int(float(e.get('ts', 0))) // 10)
+            if k in grp:
+                grp[k]['n'] += 1
+                continue
+            grp[k] = {'at': datetime.fromtimestamp(e['ts']).strftime('%m-%d %H:%M'), 'kind': 'xlsx', 'file': e.get('file', ''),
+                      'by': e.get('name', ''), 'n': 1, 'code': '', 'name': '', 'qty': None, 'date': ''}
+            out.append(grp[k])
+        else:
+            out.append({'at': datetime.fromtimestamp(e['ts']).strftime('%m-%d %H:%M'), 'code': e.get('code', ''),
+                        'name': names.get(str(e.get('code', '')).upper(), ''), 'qty': e.get('qty'), 'date': e.get('date', ''),
+                        'by': e.get('name', ''), 'kind': e.get('kind', 'set')})
+    return jsonify({'items': out[:40]})
 
 
 @app.route('/api/vendor_entries', methods=['GET'])
@@ -2239,8 +2270,12 @@ def api_vendor_entries():
         after = float(request.args.get('after', 0) or 0)
     except ValueError:
         after = 0.0
-    es = [e for e in _vendor_entries_read() if float(e.get('ts', 0)) > after]
-    return jsonify({'items': es[-2000:], 'server_time': time.time()})
+    # 오래된 것부터 5000건씩 (엑셀 업로드는 한 번에 수백~수천 건 — 예전 '최근 2000건'은 그보다 많으면 앞부분이 빠졌음)
+    es = sorted((e for e in _vendor_entries_read() if float(e.get('ts', 0)) > after), key=lambda e: float(e.get('ts', 0)))
+    cut = min(len(es), 5000)
+    while 0 < cut < len(es) and float(es[cut]['ts']) == float(es[cut - 1]['ts']):
+        cut += 1                     # 같은 시각 묶음은 자르지 않음
+    return jsonify({'items': es[:cut], 'more': cut < len(es), 'server_time': time.time()})
 
 
 @app.route('/api/vendor_links', methods=['GET'])
@@ -2255,12 +2290,17 @@ def api_vendor_links():
             continue
         mine = [e for e in es if e.get('vendor') == v]
         last = max(mine, key=lambda e: float(e.get('ts', 0))) if mine else None
-        month = [e for e in mine if datetime.fromtimestamp(float(e.get('ts', 0))).strftime('%Y-%m') == ym and e.get('kind', 'set') == 'set']
+        # 이번 달 = 실사(set)는 입력 시각, 일별·입고는 해당 날짜 기준 — 지금 유효한 칸 수 (엑셀 업로드 포함, 2026-10-08)
+        sets = [e for e in mine if e.get('kind', 'set') == 'set' and datetime.fromtimestamp(float(e.get('ts', 0))).strftime('%Y-%m') == ym]
+        day, ins = _vendor_month_entries(v, ym.replace('-', ''))
+        day_on = [k for k, e in day.items() if float(e.get('qty', 0) or 0)]
         tok = _vendor_token(v)
         out.append({'vendor': v, 'token': tok, 'url': f'{PUBLIC_BASE_URL}/v/{tok}', 'items': len(_vendor_items(v)),
                     'last_at': datetime.fromtimestamp(float(last['ts'])).strftime('%Y-%m-%d %H:%M') if last else '',
-                    'last_by': last.get('name', '') if last else '', 'month_count': len(month),
-                    'month_codes': len({e.get('code') for e in month})})
+                    'last_by': (last.get('name', '') + (' (엑셀)' if last.get('src') == 'xlsx' else '')) if last else '',
+                    'month_count': len(sets) + len(day_on) + len(ins),
+                    'month_codes': len({e.get('code') for e in sets} | {k[0] for k in day_on} | {str(e.get('code')).upper() for e in ins}),
+                    'month_days': len(day_on), 'month_in': len(ins), 'month_sets': len(sets)})
     return jsonify({'items': out, 'total': len(out), 'pull': _VENDOR_PULL_STATE})
 
 
@@ -2276,19 +2316,53 @@ def _row_type(code, spec):
     return 'delta', '증감', 1
 
 
-def _vendor_rows(vendor):
-    """일별 입력용: 해당 거래처의 재고일지 행 전부 (품번+규격 키, 유형 포함)."""
-    rows = DF[DF[COL_원산지].astype(str).str.strip() == vendor] if DF is not None else None
+def _row_rks(items):
+    """[(code, spec, dest, name)] (파일 순서) → 행마다 rk. 같은 품번+규격이 한 행뿐이면 '',
+    여러 행이면 '납품처|품명|n' (n = 같은 품번·규격·납품처·품명 중 몇 번째 — 로켓배송 RRP 박스처럼 제품 블록마다 똑같은 행이 반복됨).
+    거래처 화면·엑셀 업로드·마감 기입이 모두 같은 규칙으로 엑셀의 '그 행'을 가리킨다 (2026-10-08)."""
+    cnt, occ, out = {}, {}, []
+    for c, s, _, _ in items:
+        cnt[(c.upper(), s)] = cnt.get((c.upper(), s), 0) + 1
+    for c, s, d, n in items:
+        if cnt[(c.upper(), s)] > 1:
+            k = (c.upper(), s, d, n)
+            i = occ.get(k, 0)
+            occ[k] = i + 1
+            out.append(f'{d}|{n}|{i}')
+        else:
+            out.append('')
+    return out
+
+
+def _rk_parts(rk):
+    """'납품처|품명|n' → (납품처, 품명, n)."""
+    d, rest = rk.split('|', 1)
+    name, n = rest.rsplit('|', 1)
+    return d, name, int(n)
+
+
+def _vendor_row_list(vendor):
+    """거래처 재고일지 행 [(행, code, spec, rk)] — 엑셀과 같은 순서·같은 행 수(중복 제거 전 원본 행).
+    예전엔 (품번, 규격) 첫 행만 보여 반제품(제품별)·공용 자재(제품 블록별) 행이 빠졌음."""
+    full = _inv_full_df()
+    rows = full[full[COL_원산지].astype(str).str.strip() == vendor] if full is not None else None
     if rows is None or rows.empty:
         return []
-    out, seen = [], set()
+    items = []
     for _, r in rows.iterrows():
-        code = str(r.get(COL_품목, '')).strip(); spec = str(r.get(COL_규격, '')).strip()
-        if not code or (code.upper(), spec) in seen:
-            continue
-        seen.add((code.upper(), spec))
+        code = str(r.get(COL_품목, '')).strip()
+        if code and code.lower() != 'nan':
+            items.append((r, code, str(r.get(COL_규격, '')).strip(), str(r.get(COL_납품처, '')).strip(), str(r.get(COL_품명, '')).strip()))
+    rks = _row_rks([(c, s, d, n) for _, c, s, d, n in items])
+    return [(r, c, s, rk) for (r, c, s, _, _), rk in zip(items, rks)]
+
+
+def _vendor_rows(vendor):
+    """일별 입력용: 해당 거래처의 재고일지 행 전부 (품번+규격(+rk) 키, 유형 포함)."""
+    out = []
+    for r, code, spec, rk in _vendor_row_list(vendor):
         t, label, sign = _row_type(code, spec)
-        out.append({'code': code, 'spec': spec, 'name': str(r.get(COL_품명, '')).strip(), 'type': t, 'label': label, 'sign': sign,
+        out.append({'code': code, 'spec': spec, 'rk': rk, 'name': str(r.get(COL_품명, '')).strip(), 'type': t, 'label': label, 'sign': sign,
                     'dest': str(r.get(COL_납품처, '')).strip(), 'unit': 'kg' if code.upper().startswith('A') else 'ea'})
     # 엑셀 양식과 같은 순서(재고일지 행 순서) 유지 — 거래처가 보던 시트와 동일하게 (2026-09-16)
     for i, r in enumerate(out):
@@ -2328,34 +2402,30 @@ def api_vendor_portal_sheet(token):
     dcols, file_mon = _daily_col_map()
     file_is_month = (file_mon == mo)
     day, ins = _vendor_month_entries(vendor, ym)
-    rows = DF[DF[COL_원산지].astype(str).str.strip() == vendor] if DF is not None else None
     out = []
-    if rows is not None:
-        seen = set()
-        for _, r in rows.iterrows():
-            code = str(r.get(COL_품목, '')).strip(); spec = str(r.get(COL_규격, '')).strip()
-            if not code or (code.upper(), spec) in seen:
-                continue
-            seen.add((code.upper(), spec))
+    if DF is not None:
+        for r, code, spec, rk in _vendor_row_list(vendor):
             t, label, sign = _row_type(code, spec)
             daily_file = {}
             if file_is_month:
                 for d, c in dcols.items():
-                    v = _num(r.get(c, 0))
+                    v = _xnum(r.get(c, 0))
                     if v:
                         daily_file[d] = v
-            daily_entry, entry_by = {}, {}
-            for (c2, s2, dstr), e in day.items():
-                if c2 == code.upper() and s2 == spec:
+            daily_entry, entry_by, entry_src = {}, {}, {}
+            for (c2, s2, rk2, dstr), e in day.items():
+                if c2 == code.upper() and s2 == spec and rk2 == rk:
                     d = int(dstr[8:10]); daily_entry[d] = float(e.get('qty', 0) or 0) * sign; entry_by[d] = e.get('name', '')
-            out.append({'dest': str(r.get(COL_납품처, '')).strip(), 'code': code, 'spec': spec, 'name': str(r.get(COL_품명, '')).strip(),
+                    if e.get('src') == 'xlsx':
+                        entry_src[d] = 'xlsx'; entry_by[d] = '엑셀 업로드 · ' + str(e.get('file', '')) + ' · ' + e.get('name', '')
+            out.append({'dest': str(r.get(COL_납품처, '')).strip(), 'code': code, 'spec': spec, 'rk': rk, 'name': str(r.get(COL_품명, '')).strip(),
                         'ipsu': str(r.get(COL_입수량, '')).strip(), 'type': t, 'label': label, 'sign': sign,
                         'unit': 'kg' if code.upper().startswith('A') else 'ea',
-                        'base': _num(r.get(DF.columns[7], 0)), 'inb_file': _num(r.get(DF.columns[8], 0)),
-                        'cur_file': _num(r.get('현재고량_일지', r.get(COL_재고량, 0))),
-                        'daily_file': daily_file, 'daily_entry': daily_entry, 'entry_by': entry_by})
+                        'base': _xnum(r.get(DF.columns[7], 0)), 'inb_file': _xnum(r.get(DF.columns[8], 0)),
+                        'cur_file': _xnum(r.get('현재고량_일지', r.get(COL_재고량, 0))),
+                        'daily_file': daily_file, 'daily_entry': daily_entry, 'entry_by': entry_by, 'entry_src': entry_src})
     inbound = sorted([{'id': e['id'], 'date': e['date'], 'code': e['code'], 'qty': e['qty'], 'unit': e.get('unit', ''), 'exp': e.get('exp', ''),
-                       'supplier': e.get('supplier', ''), 'dest': e.get('dest', ''),
+                       'supplier': e.get('supplier', ''), 'dest': e.get('dest', ''), 'src': e.get('src', ''),
                        'by': e.get('name', ''), 'name': next((x['name'] for x in out if x['code'].upper() == e['code']), ''),
                        'spec': next((x['spec'] for x in out if x['code'].upper() == e['code']), '')} for e in ins], key=lambda x: (x['date'], x['id']))
     return jsonify({'vendor': vendor, 'ym': ym, 'ndays': ndays, 'rows': out, 'inbound': inbound,
@@ -2363,7 +2433,7 @@ def api_vendor_portal_sheet(token):
 
 
 def _vendor_month_entries(vendor, ym):
-    """해당 월의 유효 day/in 엔트리: day는 (code,spec,date)별 최신, in은 삭제 안 된 것."""
+    """해당 월의 유효 day/in 엔트리: day는 (code,spec,rk,date)별 최신(rk=같은 품번+규격 여러 행일 때 '납품처|품명'), in은 삭제 안 된 것."""
     ents = [e for e in _vendor_entries_read() if e.get('vendor') == vendor]
     dels = {e.get('ref') for e in ents if e.get('kind') == 'in_del'}
     day = {}
@@ -2373,7 +2443,7 @@ def _vendor_month_entries(vendor, ym):
         if not d.startswith(ym[:4] + '-' + ym[4:6]):
             continue
         if e.get('kind') == 'day':
-            k = (str(e.get('code', '')).upper(), e.get('spec', ''), d)
+            k = (str(e.get('code', '')).upper(), e.get('spec', ''), e.get('rk', ''), d)
             if k not in day or e['ts'] > day[k]['ts']:
                 day[k] = e
         elif e.get('kind') == 'in' and e.get('id') not in dels:
@@ -2391,16 +2461,369 @@ def api_vendor_portal_daily(token):
     day, ins = _vendor_month_entries(vendor, ym)
     rows = _vendor_rows(vendor)
     for r in rows:
-        e = day.get((r['code'].upper(), r['spec'], date))
+        e = day.get((r['code'].upper(), r['spec'], r['rk'], date))
         r['value'] = e['qty'] if e else None
         r['by'] = e.get('name', '') if e else ''
-        r['month_total'] = sum(v['qty'] for (c, s, d), v in day.items() if c == r['code'].upper() and s == r['spec'])
-        r['month_days'] = sum(1 for (c, s, d), v in day.items() if c == r['code'].upper() and s == r['spec'] and v['qty'])
-    filled_dates = sorted({d for (_, _, d) in day.keys()})
+        mine = [v for (c, s, k, d), v in day.items() if c == r['code'].upper() and s == r['spec'] and k == r['rk']]
+        r['month_total'] = sum(v['qty'] for v in mine)
+        r['month_days'] = sum(1 for v in mine if v['qty'])
+    filled_dates = sorted({k[3] for k in day.keys()})
     return jsonify({'vendor': vendor, 'date': date, 'rows': rows, 'filled_dates': filled_dates,
                     'inbound': sorted([{'id': e['id'], 'date': e['date'], 'code': e['code'], 'qty': e['qty'], 'unit': e.get('unit', ''),
                                         'by': e.get('name', ''), 'name': next((x['name'] for x in rows if x['code'].upper() == e['code']), '')}
                                        for e in ins], key=lambda x: (x['date'], x['id']))})
+
+
+# ── 거래처 재고 엑셀 업로드 (2026-10-08, 사용자 "재고파일 업로드 → 각 외주처에 적용") ──
+# 거래처가 카톡으로 보내던 '원자재부자재 재고파악(N월) - 거래처.xlsx'(또는 취합본)를 대시보드에 올리면
+# 재고일지 시트의 일별 값(사용·생산·출고)과 입고일지 시트의 그 달 입고를 거래처 입력 이력(src='xlsx')으로 기록 →
+# 거래처 포털 화면·현재고 덮어쓰기·마감 생성에 포털 입력과 똑같이 반영된다.
+# 입력 이력의 원본은 GCP(거래처가 입력하는 곳) → 로컬에서 올리면 GCP로 넘겨 처리하고 바로 끌어옴(_vendor_pull_once).
+_VENDOR_UPLOAD_DIR = f'{DATA_DIR}/vendor_uploads'
+
+
+def _xnum(v):
+    """엑셀 셀 → 숫자 (빈칸·nan·문자 = 0, 쉼표 허용)."""
+    if v is None:
+        return 0.0
+    if isinstance(v, (int, float)):
+        return 0.0 if v != v else float(v)
+    s = str(v).replace(',', '').strip()
+    try:
+        x = float(s)
+        return 0.0 if x != x else x
+    except ValueError:
+        return 0.0
+
+
+def _xdate(v):
+    """엑셀 날짜 셀(datetime·일련번호·문자) → 'YYYY-MM-DD' 또는 ''."""
+    if v is None or (isinstance(v, float) and v != v):
+        return ''
+    if hasattr(v, 'strftime'):
+        return v.strftime('%Y-%m-%d')
+    if isinstance(v, (int, float)):
+        if 30000 < v < 80000:   # 엑셀 일련번호 (1982~2119)
+            return (pd.Timestamp('1899-12-30') + pd.Timedelta(days=int(v))).strftime('%Y-%m-%d')
+        return ''
+    t = pd.to_datetime(str(v).strip()[:19], errors='coerce')
+    return '' if pd.isna(t) else t.strftime('%Y-%m-%d')
+
+
+def _parse_vendor_upload(path, fname=''):
+    """재고파악 엑셀 → {'mon','year','rows':[{vendor,dest,code,spec,name,base,daily{day:val}}],'inbound':[...],'has_inbound_sheet'}.
+    시트는 이름으로 찾음(취합본은 4번째, 거래처 제출본은 2번째라 위치가 다름), 머리글은 '품번'/'입고일자'가 있는 줄."""
+    xls = pd.ExcelFile(path, engine='openpyxl')
+    try:
+        sn = next((s for s in xls.sheet_names if '재고일지' in s and '입고' not in s), None)
+        if not sn:
+            raise ValueError("'daily _ 완제품 재고일지' 시트가 없습니다 (재고파악 엑셀이 맞는지 확인)")
+        raw = xls.parse(sheet_name=sn, header=None, dtype=str, nrows=20)
+        hr = next((i for i in range(len(raw)) if '품번' in [str(v).strip() for v in raw.iloc[i].tolist()]), None)
+        if hr is None:
+            raise ValueError('재고일지 시트에서 머리글(품번) 줄을 찾지 못했습니다')
+        df = xls.parse(sheet_name=sn, header=hr, dtype=object)
+        ib = None
+        isn = next((s for s in xls.sheet_names if '입고일지' in s), None)
+        if isn:
+            raw2 = xls.parse(sheet_name=isn, header=None, dtype=object, nrows=10)
+            hr2 = next((i for i in range(len(raw2)) if '입고일자' in [str(v).strip() for v in raw2.iloc[i].tolist()]), None)
+            if hr2 is not None:
+                ib = xls.parse(sheet_name=isn, header=hr2, dtype=object)
+    finally:
+        xls.close()
+    df.columns = [str(c).strip() for c in df.columns]
+    dcols, mon = {}, None
+    for c in df.columns:
+        mm = re.fullmatch(r'(\d+)월(\d+)일', c)
+        if mm:
+            mon = mon or int(mm.group(1))
+            if int(mm.group(1)) == mon:
+                dcols[int(mm.group(2))] = c
+    if not mon:
+        raise ValueError("일별 열('N월DD일')을 찾지 못했습니다")
+    # 연도: 파일명 '(2026.9월)' 또는 경로의 '2026년' → 없으면 지금 기준(다음 달 파일까지는 올해, 그 뒤 달은 작년 파일로 봄)
+    now = datetime.now()
+    my = re.search(r'(20\d{2})\s*[.년]\s*\d{1,2}\s*월', fname or '')
+    year = int(my.group(1)) if my else (now.year if mon <= now.month + 1 else now.year - 1)
+    col = lambda *names: next((n for n in names if n in df.columns), None)
+    c_v, c_code, c_spec = col('외주업체') or df.columns[4], col('품번'), col('규격')
+    c_dest, c_name, c_base = col('납품처'), col('품명'), col('기초재고량')
+    rows = []
+    for _, r in df.iterrows():
+        code = str(r.get(c_code) or '').strip()
+        if not code or code.lower() == 'nan':
+            continue
+        sv = lambda c: '' if c is None or r.get(c) is None or str(r.get(c)) == 'nan' else str(r.get(c)).strip()
+        if c_dest and not sv(c_dest):
+            continue   # 납품처 빈 행은 대시보드 재고일지 로드(_parse_inventory_excel)도 버림 → 같은 행 집합으로 맞춤
+        rows.append({'vendor': sv(c_v), 'dest': sv(c_dest), 'code': code, 'spec': sv(c_spec), 'name': sv(c_name),
+                     'base': _xnum(r.get(c_base)) if c_base else 0.0,
+                     'daily': {d: _xnum(r.get(c)) for d, c in dcols.items() if _xnum(r.get(c))}})
+    vendors = sorted({x['vendor'] for x in rows if x['vendor']})
+    allin = []
+    if ib is not None:
+        ib.columns = [str(c).strip() for c in ib.columns]
+        g = lambda r, c: r.get(c) if c in ib.columns else None
+        for _, r in ib.iterrows():
+            code = str(g(r, '품번') or '').strip()
+            if not code or code.lower() == 'nan':
+                continue
+            dt = _xdate(g(r, '입고일자'))
+            qty = _xnum(g(r, '입고수량'))
+            if not dt or qty <= 0:
+                continue
+            s = lambda c: '' if g(r, c) is None or str(g(r, c)) == 'nan' else str(g(r, c)).strip()
+            v = s('입고처') or (vendors[0] if len(vendors) == 1 else '')
+            exp = g(r, '유통기한')
+            allin.append({'vendor': v, 'date': dt, 'code': code.upper(), 'qty': qty, 'unit': s('입고단위')[:10],
+                          'supplier': s('원/부자재 업체명')[:40], 'dest': s('출고처')[:40],
+                          'exp': (_xdate(exp) or s('유통기한'))[:10]})
+    # 입고일지는 여러 해치가 쌓여 있음 → 마지막 입고일이 추정 연월보다 반년 이상 앞이면 옛 파일
+    # (이름에 연도가 없는 작년 10월 파일을 올해 10월로 넣지 않게). 마지막 입고일에 가장 가까운 연도의 그 달로 봄.
+    warn = ''
+    if not my and allin:
+        last = max(x['date'] for x in allin)
+        lm = int(last[:4]) * 12 + int(last[5:7])
+        if year * 12 + mon - lm >= 6:
+            y2 = min((int(last[:4]) + k for k in (-1, 0, 1)), key=lambda y: abs(y * 12 + mon - lm))
+            warn = f'입고일지 마지막 날짜가 {last}라 {y2}년 {mon}월 파일로 보고 반영합니다'
+            year = y2
+    ym = f'{year}{mon:02d}'
+    inbound = [x for x in allin if x['date'][:7] == f'{year}-{mon:02d}']
+    return {'mon': mon, 'year': year, 'ym': ym, 'rows': rows, 'vendors': vendors, 'inbound': inbound,
+            'has_inbound_sheet': ib is not None, 'warn': warn}
+
+
+def _vendor_upload_plan(p, by, fname, ip=''):
+    """파싱 결과 → 거래처별 요약 + 기록할 엔트리. '지금 화면에 보이는 값'(포털 입력 최신 > 대시보드 파일 값)과 다른 칸만 기록.
+    엑셀에 값이 없는 칸은 '예전에 엑셀 업로드로 넣은 값'만 지움(거래처가 포털에 적은 값·구매팀 파일 값은 그대로).
+    그 달 값이 하나도 없는 거래처는 건너뜀(취합본처럼 아직 비어 있는 파일로 기존 업로드분이 지워지지 않게)."""
+    import calendar as _cal
+    ym, mon = p['ym'], p['mon']
+    ndays = _cal.monthrange(int(ym[:4]), mon)[1]
+    known = set(_vendor_list())
+    dcols, file_mon = _daily_col_map()
+    file_is_month = (file_mon == mon)
+    by_v, ib_v = {}, {}
+    for r in p['rows']:
+        by_v.setdefault(r['vendor'], []).append(r)
+    for e in p['inbound']:
+        ib_v.setdefault(e['vendor'], []).append(e)
+    out, recs = [], []
+    base_rec = {'name': by, 'ip': ip, 'src': 'xlsx', 'file': fname}
+    for v in sorted(x for x in set(by_v) | set(ib_v) if x):
+        s = {'vendor': v, 'rows': len(by_v.get(v, [])), 'matched': 0, 'unmatched': [], 'dup': 0, 'cells': 0,
+             'day_new': 0, 'day_changed': 0, 'day_same': 0, 'day_clear': 0, 'day_override': 0, 'kept': 0,
+             'in_file': len(ib_v.get(v, [])), 'in_new': 0, 'in_dup': 0, 'in_del': 0, 'in_unmatched': [],
+             'base_diff': [], 'code_diff': [], 'skip': ''}
+        out.append(s)
+        if v not in known:
+            s['skip'] = '대시보드 재고일지에 없는 거래처'
+            continue
+        # 대시보드 재고일지 행 (품번+규격, 여러 행이면 납품처|품명까지) — 포털 화면 행과 같은 키
+        rows, filev, dfbase = {}, {}, {}
+        for r, code, spec, rk in _vendor_row_list(v):
+            k = (code.upper(), spec, rk)
+            t, _, sign = _row_type(code, spec)
+            rows[k] = {'type': t, 'sign': sign, 'dest': str(r.get(COL_납품처, '')).strip(), 'name': str(r.get(COL_품명, '')).strip()}
+            dfbase[k] = _xnum(r.get(DF.columns[7]))
+            if file_is_month:
+                filev[k] = {d: _xnum(r.get(c)) for d, c in dcols.items() if _xnum(r.get(c))}
+        by_cs = {}
+        for k in rows:
+            by_cs.setdefault(k[:2], []).append(k)
+        nn = lambda t: re.sub(r'\s+', '', t).lower()   # 공백만 무시 (괄호 속 '20g*20개입'/'20g*10개입'이 제품을 가름)
+        frows = by_v.get(v, [])
+        frks = _row_rks([(r['code'], r['spec'], r['dest'], r['name']) for r in frows])
+        # 파일 안에서 각 행이 (품번·규격·납품처·품명) / (품번·규격·납품처) 묶음의 몇 번째인지
+        by_nm = {}   # (납품처, 규격, 품명) → 대시보드 행 (품번 무시 — 품번이 서로 다르게 적힌 행 찾기용)
+        for kk, x in rows.items():
+            by_nm.setdefault((x['dest'], kk[1], nn(x['name'])), []).append(kk)
+        o_nm, n_d, o_n2, f_pos = {}, {}, {}, []
+        for r in frows:
+            a = (r['code'].upper(), r['spec'], r['dest'], nn(r['name'])); b = (r['code'].upper(), r['spec'], r['dest'])
+            c2 = (r['dest'], r['spec'], nn(r['name']))
+            f_pos.append((o_nm.get(a, 0), n_d.get(b, 0), o_n2.get(c2, 0)))
+            o_nm[a] = o_nm.get(a, 0) + 1; n_d[b] = n_d.get(b, 0) + 1; o_n2[c2] = o_n2.get(c2, 0) + 1   # 다 돌면 n_d = 묶음별 행 수
+        same_row = lambda kk, r: rows[kk]['dest'] == r['dest'] or nn(rows[kk]['name']) == nn(r['name'])
+        fv, fbase = {}, {}
+        for r, frk, (i_nm, i_d, i_n2) in zip(frows, frks, f_pos):
+            k = (r['code'].upper(), r['spec'], frk)
+            if k not in rows or (not frk and not same_row(k, r)):
+                # 양식이 조금 달라 키가 안 맞으면: 품번+규격이 한 행뿐이면 그 행(납품처나 품명이 같을 때만) → 같은 납품처·품명(공백·괄호 무시)의 n번째 →
+                # 품명만 다르면(거래처 사본 '화덕고구마원물' vs 취합본 '화덕고구마') 같은 납품처 행 수가 같을 때 순서대로
+                cands = by_cs.get(k[:2], [])
+                same_d = [c for c in cands if rows[c]['dest'] == r['dest']]
+                same_nm = [c for c in same_d if nn(rows[c]['name']) == nn(r['name'])]
+                if len(cands) == 1 and (nn(rows[cands[0]]['name']) == nn(r['name']) or (not frk and rows[cands[0]]['dest'] == r['dest'])):
+                    k = cands[0]     # 엑셀에 같은 품번+규격이 여러 행이면 품명이 같은 행만 (나머지는 품번이 잘못 적힌 행일 수 있음)
+                elif i_nm < len(same_nm):
+                    k = same_nm[i_nm]
+                elif len(same_d) == n_d.get((k[0], k[1], r['dest']), 0) and i_d < len(same_d):
+                    k = same_d[i_d]
+                else:
+                    # 품번이 서로 다르게 적힌 행 (거래처 사본 I0115 ↔ 취합본 I0110 등) → 같은 납품처·규격·품명 행에, 미리보기에 알림
+                    L = by_nm.get((r['dest'], r['spec'], nn(r['name'])), [])
+                    k = L[i_n2] if i_n2 < len(L) else None
+                    if k is not None:
+                        s['code_diff'].append(f"{r['dest']} {r['code']}→{k[0]}")
+            if k is None:
+                s['unmatched'].append((r['dest'] + ' ' + r['code'] + ' ' + r['spec'] + ' ' + r['name'][:20]).strip())
+                continue
+            if k in fv:
+                s['dup'] += 1              # 엑셀에 완전히 같은 행이 또 있음 → 합산
+            acc = fv.setdefault(k, {})
+            for d, val in r['daily'].items():
+                acc[d] = acc.get(d, 0.0) + val
+            fbase.setdefault(k, r['base'])
+        s['matched'] = len(fv)
+        s['cells'] = sum(1 for x in fv.values() for val in x.values() if val)
+        if not s['cells'] and not s['in_file']:
+            s['skip'] = f'엑셀에 {mon}월 일별 값·입고가 없음'
+            continue
+        if file_is_month:
+            s['base_diff'] = [f'{k[0]} {k[1]}' for k in fv if k in dfbase and abs(fbase.get(k, 0) - dfbase[k]) > 0.5][:30]
+        day, ins = _vendor_month_entries(v, ym)
+        if s['cells']:
+            for k, f in fv.items():
+                sign = rows[k]['sign']
+                for d in range(1, ndays + 1):
+                    date = f'{ym[:4]}-{ym[4:6]}-{d:02d}'
+                    e = day.get((k[0], k[1], k[2], date))
+                    cur = float(e.get('qty', 0) or 0) * sign if e else filev.get(k, {}).get(d, 0.0)
+                    new = f.get(d, 0.0)
+                    if abs(new - cur) < 1e-9:
+                        if new:
+                            s['day_same'] += 1
+                        continue
+                    rkf = {'rk': k[2]} if k[2] else {}
+                    if not new:
+                        if e and e.get('src') == 'xlsx':
+                            recs.append({**base_rec, 'kind': 'day', 'vendor': v, 'code': k[0], 'spec': k[1], **rkf, 'date': date,
+                                         'qty': 0.0, 'type': rows[k]['type']})
+                            s['day_clear'] += 1
+                        else:
+                            s['kept'] += 1
+                        continue
+                    if e and e.get('src') != 'xlsx' and cur:
+                        s['day_override'] += 1     # 거래처가 포털에 적은 값과 다름 → 엑셀 값으로
+                    s['day_new' if not cur else 'day_changed'] += 1
+                    q = new * sign                 # 엑셀 부호(출고 음수) → 포털 저장 단위(양수+유형)
+                    recs.append({**base_rec, 'kind': 'day', 'vendor': v, 'code': k[0], 'spec': k[1], **rkf, 'date': date,
+                                 'qty': int(q) if float(q).is_integer() else round(q, 3), 'type': rows[k]['type']})
+        if s['in_file']:
+            codes = {k[0] for k in rows}
+            have = {}
+            for e in ins:
+                have.setdefault((e['date'], str(e['code']).upper(), round(float(e.get('qty', 0) or 0), 3)), []).append(e)
+            cnt = {}
+            for x in ib_v.get(v, []):
+                if x['code'] not in codes:
+                    s['in_unmatched'].append(x['code'])
+                    continue
+                key = (x['date'], x['code'], round(x['qty'], 3))
+                cnt[key] = cnt.get(key, 0) + 1
+                if cnt[key] <= len(have.get(key, [])):
+                    s['in_dup'] += 1               # 이미 있는 입고(같은 날짜·품번·수량)
+                    continue
+                q = x['qty']
+                recs.append({**base_rec, 'kind': 'in', 'vendor': v, 'code': x['code'], 'date': x['date'],
+                             'qty': int(q) if float(q).is_integer() else round(q, 3),
+                             'unit': x['unit'] or ('kg' if x['code'].startswith('A') else 'ea'),
+                             'exp': x['exp'], 'supplier': x['supplier'], 'dest': x['dest']})
+                s['in_new'] += 1
+            # 예전 엑셀 업로드 입고 중 이번 파일에 없는 것 → 삭제 (포털에서 거래처가 적은 입고는 유지)
+            for key, lst in have.items():
+                extra = len(lst) - cnt.get(key, 0)
+                for e in [e for e in lst if e.get('src') == 'xlsx'][:max(0, extra)]:
+                    recs.append({**base_rec, 'kind': 'in_del', 'vendor': v, 'code': e['code'], 'qty': 0, 'ref': e['id']})
+                    s['in_del'] += 1
+        s['unmatched'] = s['unmatched'][:30]
+        s['code_diff'] = s['code_diff'][:30]
+        s['in_unmatched'] = sorted(set(s['in_unmatched']))[:30]
+    return {'ym': ym, 'mon': mon, 'file_month_matches': file_is_month, 'vendors': out, 'records': len(recs), 'warn': p.get('warn', '')}, recs
+
+
+@app.route('/api/vendor_upload', methods=['POST'])
+def api_vendor_upload():
+    """거래처 재고 엑셀 업로드 — multipart file(여러 개). apply=1이면 기록, 없으면 미리보기(무엇이 바뀌는지)만."""
+    import tempfile as _tf
+    import uuid as _uuid
+    files = [f for f in request.files.getlist('file') if f and f.filename]
+    apply = request.form.get('apply') == '1'
+    by = (request.form.get('by') or (current_user() or {}).get('name') or '구매팀').strip()[:30]
+    if not files:
+        return jsonify({'ok': False, 'error': '파일을 선택해 주세요'}), 400
+    if os.path.exists('C:/Users/jgkim/OneDrive'):
+        return _vendor_upload_forward(files, apply, by)
+    ip = request.headers.get('X-Forwarded-For', request.remote_addr or '').split(',')[0].strip()
+    results, recs_all, saved = [], [], []
+    for f in files:
+        fname = os.path.basename(f.filename.replace('\\', '/'))
+        if not fname.lower().endswith(('.xlsx', '.xlsm')):
+            results.append({'file': fname, 'error': '엑셀(.xlsx) 파일만 올릴 수 있습니다'})
+            continue
+        tmp = os.path.join(_tf.gettempdir(), f'_vup_{_uuid.uuid4().hex}.xlsx')
+        f.save(tmp)
+        try:
+            p = _parse_vendor_upload(tmp, fname)
+            if p['ym'] < _ym_shift(datetime.now().strftime('%Y%m'), -2):
+                raise ValueError(f"{p['year']}년 {p['mon']}월 파일입니다 — 거래처 화면은 최근 3개월만 다룹니다"
+                                 + (f" ({p['warn']})" if p.get('warn') else ''))
+            plan, recs = _vendor_upload_plan(p, by, fname, ip)
+            results.append({'file': fname, **plan})
+            recs_all += recs
+            if apply and recs:
+                saved.append((tmp, fname))
+                tmp = None
+        except Exception as e:
+            results.append({'file': fname, 'error': str(e)[:200]})
+        finally:
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+    applied = 0
+    if apply and recs_all:
+        now = time.time()
+        for i, r in enumerate(recs_all):
+            r['ts'] = round(now + i * 1e-4, 4)      # 건마다 다른 시각 → 동기화 키·순서가 겹치지 않게
+            if r['kind'] == 'in':
+                r['id'] = f'{int(now * 1000)}-x{i}'
+        _vendor_entries_append(recs_all)
+        applied = len(recs_all)
+        n = _vendor_overlay_apply()
+        import shutil as _sh
+        os.makedirs(_VENDOR_UPLOAD_DIR, exist_ok=True)   # 원본 보관 (나중에 확인용)
+        for tmp, fname in saved:
+            try:
+                _sh.move(tmp, os.path.join(_VENDOR_UPLOAD_DIR, datetime.fromtimestamp(now).strftime('%Y%m%d-%H%M%S_') + fname))
+            except OSError:
+                pass
+        print(f'[거래처 엑셀 업로드] {by} {len(files)}개 파일 → {applied}건 기록 (현재고 적용 {n}행)')
+    return jsonify({'ok': True, 'apply': apply, 'files': results, 'records': len(recs_all), 'applied': applied})
+
+
+def _vendor_upload_forward(files, apply, by):
+    """로컬 → GCP에서 처리(거래처 입력 이력의 원본이 GCP) 후 곧바로 로컬로 끌어옴."""
+    import requests as _rq
+    mf = [('file', (os.path.basename(f.filename.replace('\\', '/')), f.read(),
+                    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')) for f in files]
+    try:
+        r = _rq.post(f'{_VENDOR_CLOUD}/api/vendor_upload', params={'token': _vendor_secret()},
+                     data={'apply': '1' if apply else '', 'by': by}, files=mf, timeout=240)
+        d = r.json()
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'GCP 서버로 보내지 못했습니다: {e}'[:200]}), 502
+    if apply and d.get('ok') and d.get('applied'):
+        try:
+            d['pulled'] = _vendor_pull_once()
+        except Exception as e:
+            d['pull_error'] = str(e)[:120]
+    d['via'] = 'gcp'
+    return jsonify(d), r.status_code
 
 
 # ── 마감 워크북 생성 (로컬 전용: OneDrive 월 파일 복사 → 일별 열·입고일지 기입 → Excel 재계산 → 저장) ──
@@ -2488,10 +2911,13 @@ def _closing_generate(ym, dry_run=False):
     days, ins_all = [], []
     for vendor in _vendor_list():
         day, ins = _vendor_month_entries(vendor, ym)
-        for (code, spec, date), e in day.items():
+        for (code, spec, rk, date), e in day.items():
             q = float(e.get('qty', 0) or 0); sign = _row_type(code, spec)[2]; val = q * sign
-            days.append({'vendor': vendor, 'code': code, 'spec': spec, 'day': int(date[8:10]),
-                         'val': None if q == 0 else (int(val) if float(val).is_integer() else round(val, 3))})
+            dd = {'vendor': vendor, 'code': code, 'spec': spec, 'day': int(date[8:10]),
+                  'val': None if q == 0 else (int(val) if float(val).is_integer() else round(val, 3))}
+            if rk:   # 같은 품번+규격 여러 행 → 납품처·품명·몇 번째로 행 특정 (closing_excel.py)
+                dd['dest'], dd['name'], dd['occ'] = _rk_parts(rk)
+            days.append(dd)
         for e in sorted(ins, key=lambda x: (x['date'], x['id'])):
             q = float(e.get('qty', 0) or 0)
             ins_all.append({'vendor': vendor, 'code': e['code'], 'date': e['date'], 'qty': int(q) if q.is_integer() else q, 'unit': e.get('unit', ''),
@@ -2636,32 +3062,57 @@ def api_closing_status():
                     'day_entries': tot_day, 'inbound_entries': tot_in, 'by_vendor': by_vendor, 'local': os.path.exists('C:/Users/jgkim/OneDrive')})
 
 
+_VENDOR_PULL_LOCK = threading.Lock()
+_VENDOR_KNOWN = None
+
+
+def _vendor_entry_key(e):
+    """동기화 중복 판정 키. (ts, 거래처, 품번)만 쓰면 한 번에 저장한 여러 날짜·규격 칸이 같은 키라 첫 칸만 들어오던 문제 → 칸 단위로 (2026-10-08)."""
+    return (str(e.get('ts')), e.get('vendor'), e.get('code'), e.get('kind', 'set'), e.get('spec', ''), e.get('date', ''),
+            e.get('id', ''), e.get('ref', ''))
+
+
+def _vendor_pull_once():
+    """GCP 입력 이력 중 새 것만 로컬에 추가하고 현재고 덮어쓰기 적용. 반환 새 건수 (5000건씩 이어받기)."""
+    global _VENDOR_KNOWN
+    import requests as _rq
+    with _VENDOR_PULL_LOCK:
+        if _VENDOR_KNOWN is None:
+            _VENDOR_KNOWN = {_vendor_entry_key(e) for e in _vendor_entries_read()}
+        total = 0
+        for _ in range(20):
+            r = _rq.get(f'{_VENDOR_CLOUD}/api/vendor_entries', params={'token': _vendor_secret(), 'after': _VENDOR_PULL_STATE['last_ts']},
+                        timeout=30)
+            if r.status_code != 200:
+                _VENDOR_PULL_STATE['error'] = f'HTTP {r.status_code}'
+                break
+            d = r.json()
+            new = []
+            for e in d.get('items', []):
+                k = _vendor_entry_key(e)
+                if k not in _VENDOR_KNOWN:
+                    _VENDOR_KNOWN.add(k); new.append(e)
+                _VENDOR_PULL_STATE['last_ts'] = max(_VENDOR_PULL_STATE['last_ts'], float(e.get('ts', 0)))
+            if new:
+                _vendor_entries_append(new)
+                total += len(new)
+            _VENDOR_PULL_STATE['error'] = ''
+            if not d.get('more'):
+                break
+        if total:
+            n = _vendor_overlay_apply()
+            _VENDOR_PULL_STATE['pulled'] += total
+            print(f'[거래처입력 동기화] GCP→로컬 {total}건 (적용 {n}행)')
+        _VENDOR_PULL_STATE['last_run'] = datetime.now().strftime('%H:%M')
+        return total
+
+
 def _vendor_pull_loop():
     """로컬 전용: GCP에 거래처가 입력한 값을 1분마다 끌어와 로컬 이력에 합치고 DF에 적용."""
-    import requests as _rq
-    tok = _vendor_secret()
-    known = {(str(e.get('ts')), e.get('vendor'), e.get('code')) for e in _vendor_entries_read()}
     threading.Event().wait(30)
     while True:
         try:
-            r = _rq.get(f'{_VENDOR_CLOUD}/api/vendor_entries', params={'token': tok, 'after': _VENDOR_PULL_STATE['last_ts']},
-                        timeout=15)
-            if r.status_code == 200:
-                new = []
-                for e in r.json().get('items', []):
-                    k = (str(e.get('ts')), e.get('vendor'), e.get('code'))
-                    if k not in known:
-                        known.add(k); new.append(e)
-                    _VENDOR_PULL_STATE['last_ts'] = max(_VENDOR_PULL_STATE['last_ts'], float(e.get('ts', 0)))
-                if new:
-                    _vendor_entries_append(new)
-                    n = _vendor_overlay_apply()
-                    _VENDOR_PULL_STATE['pulled'] += len(new)
-                    print(f'[거래처입력 동기화] GCP→로컬 {len(new)}건 (적용 {n}행)')
-                _VENDOR_PULL_STATE['error'] = ''
-            else:
-                _VENDOR_PULL_STATE['error'] = f'HTTP {r.status_code}'
-            _VENDOR_PULL_STATE['last_run'] = datetime.now().strftime('%H:%M')
+            _vendor_pull_once()
         except Exception as e:
             _VENDOR_PULL_STATE['error'] = str(e)[:80]
         threading.Event().wait(60)
@@ -2949,6 +3400,7 @@ table.grid{border-collapse:separate;border-spacing:0;font-size:12px;min-width:14
 .grid td.day input:focus{background:#eef2ff;box-shadow:inset 0 0 0 2px #4f46e5}
 .grid td.day.file input{color:#64748b}
 .grid td.day.entry input{color:#1d4ed8;font-weight:700;background:#dbeafe}
+.grid td.day.entry.xl input{color:#047857;background:#d1fae5}
 .grid td.day.changed input{background:#fef08a;color:#0f172a;font-weight:700}
 .grid tr.prod td.txt{background:#f0fdf4}.grid tr.out td.txt{background:#fff1f2}
 .grid td.tot{text-align:right;padding:0 6px;font-weight:700;background:#f1f5f9}
@@ -2980,7 +3432,7 @@ table.inbg{min-width:1180px}
   <div class="bar"><input type="text" id="who" placeholder="작성자 이름" maxlength="30" style="width:150px"><select id="ym" onchange="loadSheet()"></select><input type="text" id="q" placeholder="품번/품명 검색" oninput="renderSheet();renderStock()" style="width:180px"><span id="note" class="note" style="margin:0"></span></div>
 
   <div id="pane-sheet">
-    <div class="legend"><span style="background:#f1f5f9;color:#64748b">회색 = 마감 파일에 이미 있는 값</span><span style="background:#dbeafe;color:#1d4ed8">파랑 = 이 화면에서 입력한 값</span><span style="background:#fef08a">노랑 = 저장 전 변경</span> 원·부자재 사용량과 생산량은 양수, 출고는 음수(−)로 엑셀과 동일하게 적습니다. 0을 넣으면 그날 값이 지워집니다.</div>
+    <div class="legend"><span style="background:#f1f5f9;color:#64748b">회색 = 마감 파일에 이미 있는 값</span><span style="background:#dbeafe;color:#1d4ed8">파랑 = 이 화면에서 입력한 값</span><span style="background:#d1fae5;color:#047857">초록 = 매홍이 엑셀로 올린 값</span><span style="background:#fef08a">노랑 = 저장 전 변경</span> 원·부자재 사용량과 생산량은 양수, 출고는 음수(−)로 엑셀과 동일하게 적습니다. 0을 넣으면 그날 값이 지워집니다.</div>
     <div class="gridwrap"><table class="grid" id="grid"></table></div>
   </div>
 
@@ -3015,13 +3467,13 @@ async function reloadAll() { CELL = {}; VALS = {}; await Promise.all([loadSheet(
 // ── 재고일지 그리드 ──
 async function loadSheet() {
   const ym = document.getElementById('ym').value;
-  SHEET = await (await fetch('/api/v/' + TOKEN + '/sheet?ym=' + ym)).json(); CELL = {};
+  SHEET = await (await fetch('/api/v/' + TOKEN + '/sheet?ym=' + ym)).json(); CELL = {}; SHEET.rows.forEach((r, i) => { r.i = i; });
   document.getElementById('note').textContent = (SHEET.file_month_matches ? '기준 파일: ' + SHEET.source : '※ 매홍 마감 파일이 아직 ' + parseInt(ym.slice(4)) + '월이 아니라 파일 값은 비어 있습니다') + ' · 품목 ' + SHEET.rows.length + '개';
   renderSheet();
   INROWS = 8; renderIn();
 }
-function cellVal(r, d) { const k = r.code + '|' + r.spec + '|' + d; if (k in CELL) return CELL[k]; if (d in r.daily_entry) return r.daily_entry[d] === 0 ? '' : r.daily_entry[d]; if (d in r.daily_file) return r.daily_file[d]; return ''; }
-function cellCls(r, d) { const k = r.code + '|' + r.spec + '|' + d; return (k in CELL) ? 'changed' : (d in r.daily_entry && r.daily_entry[d] !== 0) ? 'entry' : (d in r.daily_file && !(d in r.daily_entry)) ? 'file' : ''; }
+function cellVal(r, d) { const k = r.i + ':' + d; if (k in CELL) return CELL[k]; if (d in r.daily_entry) return r.daily_entry[d] === 0 ? '' : r.daily_entry[d]; if (d in r.daily_file) return r.daily_file[d]; return ''; }
+function cellCls(r, d) { const k = r.i + ':' + d; return (k in CELL) ? 'changed' : (d in r.daily_entry && r.daily_entry[d] !== 0) ? ('entry' + (r.entry_src && r.entry_src[d] === 'xlsx' ? ' xl' : '')) : (d in r.daily_file && !(d in r.daily_entry)) ? 'file' : ''; }
 function rowSum(r) { let s = 0; for (let d = 1; d <= SHEET.ndays; d++) { const v = cellVal(r, d); if (v !== '' && v != null && !isNaN(v)) s += Number(v); } return s; }
 function rowCur(r) { const inbEntry = (SHEET.inbound || []).filter(i => i.code === r.code.toUpperCase()).reduce((a, i) => a + Number(i.qty || 0), 0); const inb = r.inb_file + inbEntry; const s = rowSum(r); return r.type === 'use' ? r.base + inb - s : r.base + inb + s; }
 function renderSheet() {
@@ -3033,20 +3485,20 @@ function renderSheet() {
     h += '<tr class="' + r.type + '"><td class="txt c1">' + esc(r.dest) + '</td><td class="txt c2"><b>' + esc(r.code) + '</b></td><td class="txt c3">' + esc(r.spec) + '</td><td class="txt c4" title="' + esc(r.name) + '">' + esc(r.name) + '</td>'
       + '<td class="num">' + esc(r.ipsu) + '</td><td class="num">' + fmt(r.base) + '</td><td class="num">' + fmt(r.inb_file) + '</td><td class="num cur" id="cur-' + esc(r.code) + '-' + esc(r.spec).replace(/[^\w가-힣]/g, '_') + '">' + fmt(rowCur(r)) + '</td>';
     for (let d = 1; d <= SHEET.ndays; d++) {
-      const k = r.code + '|' + r.spec + '|' + d; const v = cellVal(r, d);
+      const k = r.i + ':' + d; const v = cellVal(r, d);
       const cls = cellCls(r, d);
-      h += '<td class="day ' + cls + '"><input type="number" step="any" inputmode="decimal" value="' + (v === '' ? '' : v) + '" data-k="' + esc(k) + '" title="' + (r.entry_by[d] ? '입력: ' + esc(r.entry_by[d]) : '') + '" onchange="onCell(this)" onkeydown="navCell(event,this)"></td>';
+      h += '<td class="day ' + cls + '"><input type="number" step="any" inputmode="decimal" value="' + (v === '' ? '' : v) + '" data-k="' + esc(k) + '" title="' + (r.entry_by[d] ? (r.entry_src && r.entry_src[d] ? '' : '입력: ') + esc(r.entry_by[d]) : '') + '" onchange="onCell(this)" onkeydown="navCell(event,this)"></td>';
     }
     h += '<td class="tot">' + fmt(rowSum(r)) + '</td></tr>';
   });
   document.getElementById('grid').innerHTML = h + '</tbody>'; upd();
 }
-function onCell(inp) { const k = inp.dataset.k; const v = inp.value.trim(); const [code, spec, d] = k.split('|'); const r = SHEET.rows.find(x => x.code === code && x.spec === spec); const base = (d in r.daily_entry) ? r.daily_entry[d] : (d in r.daily_file) ? r.daily_file[d] : '';
+function onCell(inp) { const k = inp.dataset.k; const v = inp.value.trim(); const [ri, d] = k.split(':'); const r = SHEET.rows[+ri]; const base = (d in r.daily_entry) ? r.daily_entry[d] : (d in r.daily_file) ? r.daily_file[d] : '';
   if (v === '' && base === '') { delete CELL[k]; } else if (v !== '' && base !== '' && Number(v) === Number(base)) { delete CELL[k]; } else { CELL[k] = v === '' ? 0 : Number(v); }
   inp.closest('td').className = 'day ' + cellCls(r, d);
   const tr = inp.closest('tr'); tr.querySelector('td.cur').textContent = fmt(rowCur(r)); tr.querySelector('td.tot').textContent = fmt(rowSum(r)); upd(); }
 function navCell(e, inp) { if (e.key !== 'Enter' && e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return; e.preventDefault(); const td = inp.closest('td'); const idx = [...td.parentNode.children].indexOf(td); const tr = e.key === 'ArrowUp' ? td.parentNode.previousElementSibling : td.parentNode.nextElementSibling; if (tr && tr.children[idx]) { const n = tr.children[idx].querySelector('input'); if (n) { n.focus(); n.select(); } } }
-function changedSheet() { return Object.keys(CELL).map(k => { const [code, spec, d] = k.split('|'); const r = SHEET.rows.find(x => x.code === code && x.spec === spec); const v = CELL[k]; return { kind: 'day', code, spec, date: SHEET.ym.slice(0, 4) + '-' + SHEET.ym.slice(4) + '-' + String(d).padStart(2, '0'), qty: r.type === 'delta' ? v : Math.abs(v) }; }); }
+function changedSheet() { return Object.keys(CELL).map(k => { const [ri, d] = k.split(':'); const r = SHEET.rows[+ri]; const v = CELL[k]; return { kind: 'day', code: r.code, spec: r.spec, rk: r.rk || '', date: SHEET.ym.slice(0, 4) + '-' + SHEET.ym.slice(4) + '-' + String(d).padStart(2, '0'), qty: r.type === 'delta' ? v : Math.abs(v) }; }); }
 // ── 입고일지 (엑셀 시트 양식: 저장된 행 + 빈 입력행) ──
 let INROWS = 8;
 const VENDOR_NAME = {{ vendor|tojson }};
@@ -3055,7 +3507,7 @@ function renderIn() {
   const L = SHEET ? SHEET.inbound : [];
   document.getElementById('codelist').innerHTML = (SHEET ? SHEET.rows : []).filter(r => /^[A-D]/i.test(r.code)).map(r => '<option value="' + esc(r.code) + '">' + esc(r.name) + '</option>').join('');
   let h = '<thead><tr><th style="min-width:118px">입고일자</th><th style="min-width:110px">품번</th><th style="min-width:380px">제품명</th><th style="min-width:110px">규격</th><th style="min-width:160px">원/부자재 업체명</th><th style="min-width:100px">입고수량</th><th style="min-width:80px">입고단위</th><th style="min-width:100px">입고처</th><th style="min-width:110px">출고처</th><th style="min-width:118px">유통기한</th><th style="min-width:60px"></th></tr></thead><tbody>';
-  L.forEach(e => { h += '<tr class="saved"><td class="y ro">' + e.date + '</td><td class="y ro">' + esc(e.code) + '</td><td class="ro" title="' + esc(e.name) + '">' + esc(e.name) + '</td><td class="ro">' + esc(e.spec) + '</td><td class="y ro">' + esc(e.supplier || '') + '</td><td class="y ro num">' + fmt(e.qty) + '</td><td class="ro">' + esc(e.unit) + '</td><td class="ro">' + esc(VENDOR_NAME) + '</td><td class="ro">' + esc(e.dest || '') + '</td><td class="ro">' + esc(e.exp || '') + '</td><td style="text-align:center"><button class="btn d" onclick="delIn(' + JSON.stringify(e.id) + ',' + JSON.stringify(e.code) + ')">삭제</button></td></tr>'; });
+  L.forEach(e => { h += '<tr class="saved"' + (e.src === 'xlsx' ? ' title="매홍이 엑셀로 올린 입고"' : '') + '><td class="y ro"' + (e.src === 'xlsx' ? ' style="color:#047857"' : '') + '>' + e.date + '</td><td class="y ro">' + esc(e.code) + '</td><td class="ro" title="' + esc(e.name) + '">' + esc(e.name) + '</td><td class="ro">' + esc(e.spec) + '</td><td class="y ro">' + esc(e.supplier || '') + '</td><td class="y ro num">' + fmt(e.qty) + '</td><td class="ro">' + esc(e.unit) + '</td><td class="ro">' + esc(VENDOR_NAME) + '</td><td class="ro">' + esc(e.dest || '') + '</td><td class="ro">' + esc(e.exp || '') + '</td><td style="text-align:center"><button class="btn d" onclick="delIn(' + JSON.stringify(e.id) + ',' + JSON.stringify(e.code) + ')">삭제</button></td></tr>'; });
   for (let i = 0; i < INROWS; i++) h += inBlankRow(i);
   document.getElementById('ingrid').innerHTML = h + '</tbody>'; upd();
 }
@@ -3079,8 +3531,8 @@ async function save() { let items; if (TAB === 'in') { const p = pendingIn(); if
   document.getElementById('save').disabled = true;
   try { const d = await post({ name: w, items }); if (d.ok) { toast('저장 완료 · ' + d.saved + '칸'); await reloadAll(); } else toast('저장 실패: ' + (d.error || '')); } catch (e) { toast('오류: ' + e.message); }
   document.getElementById('save').disabled = false; }
-async function loadHist() { const d = await (await fetch('/api/v/' + TOKEN + '/history')).json(); const H = document.getElementById('hist'); const kd = { set: '실사', day: '일별', in: '입고', in_del: '입고삭제', confirm: '변동없음' };
-  H.innerHTML = (d.items || []).length ? d.items.map(h => '<div>' + h.at + ' · <span style="background:#f1f5f9;padding:1px 6px;border-radius:5px">' + (kd[h.kind] || h.kind) + '</span> ' + (h.kind === 'confirm' ? '<b>변동 없음 확인</b>' : '<b>' + esc(h.code) + '</b> ' + esc(h.name) + (h.date ? ' ' + h.date.slice(5) : '') + (h.kind === 'in_del' ? '' : ' → ' + fmt(h.qty))) + (h.by ? ' <span style="color:#94a3b8">' + esc(h.by) + '</span>' : '') + '</div>').join('') : '<div style="color:#94a3b8">아직 입력 이력이 없습니다</div>'; }
+async function loadHist() { const d = await (await fetch('/api/v/' + TOKEN + '/history')).json(); const H = document.getElementById('hist'); const kd = { set: '실사', day: '일별', in: '입고', in_del: '입고삭제', confirm: '변동없음', xlsx: '엑셀 업로드' };
+  H.innerHTML = (d.items || []).length ? d.items.map(h => '<div>' + h.at + ' · <span style="background:' + (h.kind === 'xlsx' ? '#d1fae5;color:#047857' : '#f1f5f9') + ';padding:1px 6px;border-radius:5px">' + (kd[h.kind] || h.kind) + '</span> ' + (h.kind === 'confirm' ? '<b>변동 없음 확인</b>' : h.kind === 'xlsx' ? '<b>' + esc(h.file) + '</b> · ' + h.n + '칸' : '<b>' + esc(h.code) + '</b> ' + esc(h.name) + (h.date ? ' ' + h.date.slice(5) : '') + (h.kind === 'in_del' ? '' : ' → ' + fmt(h.qty))) + (h.by ? ' <span style="color:#94a3b8">' + esc(h.by) + '</span>' : '') + '</div>').join('') : '<div style="color:#94a3b8">아직 입력 이력이 없습니다</div>'; }
 window.addEventListener('beforeunload', e => { if (Object.keys(CELL).length || changedStock().length || pendingIn().length) { e.preventDefault(); e.returnValue = ''; } });
 init();
 </script></body></html>'''
@@ -8612,6 +9064,8 @@ def api_sales_gap():
     d['pos_ea'] = _pos_ea_dedup(d)
     names = _sales_name_map()
     stk = d[d['stock'].notna()].sort_values('date')
+    stk = stk.assign(st_ea=stk['stock'] * stk['f'])   # 세트 SKU는 환산계수만큼 낱개로 (납품 ea와 단위 맞춤, 2026-10-06)
+    base_map = _gap_stock_base(df, start, set(d['channel']))
     items = []
     for code, g in d.groupby('code'):
         dl, ps = float(g['ea'].sum()), float(g['pos_ea'].sum())
@@ -8619,8 +9073,10 @@ def api_sales_gap():
             continue
         ratio = dl / ps if ps > 0 else None
         s = stk[stk['code'] == code]
-        first = s.groupby(['channel', 'sku'])['stock'].first().sum() if len(s) else None
-        last = s.groupby(['channel', 'sku'])['stock'].last().sum() if len(s) else None
+        # 시작 재고 = 기간 시작 '전날까지'의 마지막 값 (첫날 납품이 시작값에 섞여 재고가 줄어든 것처럼 보이던 문제 수정)
+        firsts = s.groupby(['channel', 'sku'])['st_ea'].first()
+        first = sum(base_map.get(k, v) for k, v in firsts.items()) if len(s) else None
+        last = s.groupby(['channel', 'sku'])['st_ea'].last().sum() if len(s) else None
         level = 'over' if (ratio is None or ratio >= 1.5) else ('under' if ratio <= 0.5 else 'ok')
         items.append({'code': code, 'name': names.get(code, '') or str(g['name'].iloc[-1]),
                       'delivery': int(dl), 'pos': int(ps), 'ratio': round(ratio, 2) if ratio is not None else None,
@@ -8629,6 +9085,94 @@ def api_sales_gap():
     items.sort(key=lambda x: (x['level'] == 'ok', -abs((x['ratio'] or 9) - 1) * (x['pos'] + x['delivery'])))
     return jsonify({'items': items, 'from': start.strftime('%Y-%m-%d'), 'to': end.strftime('%Y-%m-%d'),
                     'summary': {k: sum(1 for x in items if x['level'] == k) for k in ('over', 'under', 'ok')}})
+
+
+def _gap_stock_base(df, start, chans):
+    """기간 시작 전날까지(최대 7일 전)의 채널·SKU별 마지막 재고 ×환산계수 {(channel, sku): 값}."""
+    dts = pd.to_datetime(df['date'])
+    b = df[(dts < start) & (dts >= start - pd.Timedelta(days=7)) & df['stock'].notna() & df['channel'].isin(chans)]
+    if b.empty:
+        return {}
+    b = b.sort_values('date').groupby(['channel', 'sku']).tail(1)
+    return {(c, s): float(v) * float(f or 1) for c, s, v, f in zip(b['channel'], b['sku'], b['stock'], b['f'])}
+
+
+@app.route('/api/sales_gap_detail', methods=['GET'])
+@cached_api()
+def api_sales_gap_detail():
+    """납품 vs 실판매 괴리 항목 상세 (2026-10-06, 사용자 "클릭 시 상세") — 목록과 같은 기준(최근 28일, POS 14일 이상 보고 채널,
+    홈플러스 통합 POS 중복 제거)으로 일별 납품·매장 판매·채널 재고(채널·SKU 마지막 값 이어붙여 합, ×환산계수)와
+    누적 차이(납품−판매), 채널별 표, 최근 12주 주별 흐름, 채널 재고가 며칠분인지, 수급 플래너 값."""
+    code = (request.args.get('code') or '').strip().upper()
+    with app.test_request_context('/api/sales_gap'):
+        lst = api_sales_gap().get_json() or {}
+    it = next((x for x in lst.get('items', []) if x['code'] == code), None)
+    if not it:
+        return jsonify({'error': f'{code}: 괴리 목록에 없음'}), 404
+    df = SALES_DAILY_DF
+    end = pd.to_datetime(df['date'].max())
+    start = end - pd.Timedelta(days=27)
+    dts = pd.to_datetime(df['date'])
+    w = df[dts >= start]
+    pdays = w[w['pos'].notna()].groupby('channel')['date'].nunique()
+    ok = set(pdays[pdays >= 14].index)
+    g = df[(df['code'] == code) & df['channel'].isin(ok)].copy()
+    g['_dt'] = pd.to_datetime(g['date'])
+    g['pe'] = _pos_ea_dedup(g)
+    gw = g[g['_dt'] >= start]
+    days = pd.date_range(start, end, freq='D')
+    dl = gw.groupby('_dt')['ea'].sum().reindex(days, fill_value=0)
+    pe = gw.groupby('_dt')['pe'].sum().reindex(days, fill_value=0)
+    st = gw[gw['stock'].notna()]
+    if len(st):
+        pv = (st.assign(sv=st['stock'].clip(lower=0) * st['f'])
+                .pivot_table(index='_dt', columns=['channel', 'sku'], values='sv', aggfunc='last'))
+        stock = pv.reindex(days).ffill(limit=7).sum(axis=1, min_count=1)
+    else:
+        stock = pd.Series([float('nan')] * len(days), index=days)
+    cum = (dl - pe).cumsum()
+    day_rows = [{'date': t.strftime('%Y-%m-%d'), 'd': t.strftime('%m/%d'), 'wd': '월화수목금토일'[t.dayofweek],
+                 'dl': int(dl[t]), 'pos': int(pe[t]), 'cum': int(cum[t]),
+                 'stock': None if pd.isna(stock[t]) else int(stock[t])} for t in days]
+    # 채널별
+    base_map = _gap_stock_base(df, start, ok)
+    ch_rows = []
+    for c, gc in gw.groupby('channel'):
+        d_, p_ = float(gc['ea'].sum()), float(gc['pe'].sum())
+        sc = gc[gc['stock'].notna()].sort_values('_dt')
+        s_first = s_last = None
+        if len(sc):
+            h1 = sc.groupby('sku').head(1)
+            s_first = int(sum(base_map.get((c, sk), max(float(v), 0) * float(f or 1)) for sk, v, f in zip(h1['sku'], h1['stock'], h1['f'])))
+            s_last = int((sc.groupby('sku').tail(1)['stock'].clip(lower=0) * sc.groupby('sku').tail(1)['f']).sum())
+        if d_ <= 0 and p_ <= 0 and s_last is None:
+            continue
+        ch_rows.append({'name': str(gc['channel_name'].iloc[0]), 'dl': int(d_), 'pos': int(p_),
+                        'ratio': round(d_ / p_, 2) if p_ > 0 else None, 'stock_first': s_first, 'stock_last': s_last,
+                        'orders': int(gc[gc['ea'] > 0]['date'].nunique()), 'pos_days': int(pdays.get(c, 0))})
+    ch_rows.sort(key=lambda x: -(x['dl'] + x['pos']))
+    # 최근 12주 (같은 채널)
+    wend = end - pd.Timedelta(days=end.dayofweek)
+    weeks = []
+    for i in range(11, -1, -1):
+        a = wend - pd.Timedelta(weeks=i)
+        b = min(a + pd.Timedelta(days=6), end)
+        gk = g[(g['_dt'] >= a) & (g['_dt'] <= b)]
+        weeks.append({'w': a.strftime('%m/%d'), 'to': b.strftime('%m/%d'), 'days': int((b - a).days) + 1,
+                      'dl': int(gk['ea'].sum()), 'pos': int(gk['pe'].sum())})
+    # 채널 재고가 며칠분인지 (최근 14일 매장 판매 속도 기준)
+    pos14 = float(pe[pe.index > end - pd.Timedelta(days=14)].sum()) / 14
+    pos7 = float(pe[pe.index > end - pd.Timedelta(days=7)].sum()) / 7   # 시즌 종료 등 급감 감지용
+    st_last = None if pd.isna(stock.iloc[-1]) else float(stock.iloc[-1])
+    cover = round(st_last / pos14, 1) if (st_last is not None and pos14 > 0) else None
+    cover7 = round(st_last / pos7, 1) if (st_last is not None and pos7 > 0) else None
+    with app.test_request_context('/api/supply_plan'):
+        sp = api_supply_plan().get_json() or {}
+    p = next((x for x in sp.get('items', []) if x['code'] == code), None)
+    return jsonify({'item': it, 'days': day_rows, 'channels': ch_rows, 'weeks': weeks,
+                    'pos14': round(pos14, 1), 'pos7': round(pos7, 1), 'stock_last': None if st_last is None else int(st_last),
+                    'cover_days': cover, 'cover7_days': cover7,
+                    'supply': p, 'from': start.strftime('%Y-%m-%d'), 'to': end.strftime('%Y-%m-%d')})
 
 
 @app.route('/api/channel_price_changes', methods=['GET'])
@@ -9331,6 +9875,364 @@ def api_new_product_detail():
                         'orders': int(gdl['date'].nunique()), 'last_dl': str(gdl['date'].max()) if len(gdl) else ''})
     ch_rows.sort(key=lambda x: -(x['dl'] + x['pos']))
     return jsonify({'item': it, 'days': day_rows, 'weeks': weeks, 'channels': ch_rows, 'as_of': end.strftime('%Y-%m-%d')})
+
+
+def _call_json(fn, path):
+    """같은 앱의 다른 API를 내부 호출해 JSON(dict)으로 (상세 API들이 목록 항목·수급 값을 재사용)."""
+    with app.test_request_context(path):
+        r = fn()
+    r = r[0] if isinstance(r, tuple) else r
+    return r.get_json() or {}
+
+
+def _daily_stock_series(g, days):
+    """채널·SKU별 재고 마지막 값을 7일까지 이어 붙여 날짜별 합 (×환산계수, 통합 재고 없는 채널 제외)."""
+    st = g[g['stock'].notna() & ~g['channel'].isin(CH_STOCK_SKIP)]
+    if not len(st):
+        return pd.Series([float('nan')] * len(days), index=days)
+    pv = (st.assign(sv=st['stock'].clip(lower=0) * st['f'])
+            .pivot_table(index='_dt', columns=['channel', 'sku'], values='sv', aggfunc='last'))
+    return pv.reindex(pv.index.union(days)).sort_index().ffill(limit=7).reindex(days).sum(axis=1, min_count=1)
+
+
+def _weekly_rows(g, end, n=12):
+    """최근 n주(월요일 시작) 납품(ea)·매장 판매(pe) — 이번 주는 며칠치."""
+    wend = end - pd.Timedelta(days=end.dayofweek)
+    out = []
+    for i in range(n - 1, -1, -1):
+        a = wend - pd.Timedelta(weeks=i)
+        b = min(a + pd.Timedelta(days=6), end)
+        gk = g[(g['_dt'] >= a) & (g['_dt'] <= b)]
+        out.append({'w': a.strftime('%m/%d'), 'to': b.strftime('%m/%d'), 'days': int((b - a).days) + 1,
+                    'dl': int(gk['ea'].sum()), 'pos': int(gk['pe'].sum())})
+    return out
+
+
+@app.route('/api/demand_shift_detail', methods=['GET'])
+@cached_api()
+def api_demand_shift_detail():
+    """수요 급변 항목 상세 (2026-10-06) — 최근 42일 일별 매장 판매·납품·채널 재고, 채널별 전(15~42일 전)/후(최근 14일) 판매 속도,
+    12주 주별, 발주 계산 속도와 비교, 수급 플래너."""
+    code = (request.args.get('code') or '').strip().upper()
+    lst = _call_json(api_demand_shift, '/api/demand_shift')
+    it = next((x for x in lst.get('items', []) if x['code'] == code), None)
+    if not it:
+        return jsonify({'error': f'{code}: 수요 급변 목록에 없음'}), 404
+    d = _sales_daily_canon()
+    end = d['_dt'].max()
+    rep = _pos_report(d)
+    g = d[d['code'] == code]
+    ra = _pos_rates(g, rep, 14, 0)
+    rb = _pos_rates(g, rep, 28, 14, min_days=10)
+    chs = {}
+    for _, r in rb.iterrows():
+        chs.setdefault(r['channel'], {'name': r['channel_name'], 'r28': 0.0, 'r14': 0.0})['r28'] = float(r['rate'])
+    for _, r in ra.iterrows():
+        chs.setdefault(r['channel'], {'name': r['channel_name'], 'r28': 0.0, 'r14': 0.0})['r14'] = float(r['rate'])
+    ok = set(ra['channel']) & set(rb['channel'])
+    ch_rows = []
+    for c, v in chs.items():
+        gc = g[g['channel'] == c]
+        sc = gc[gc['stock'].notna() & (gc['_dt'] >= end - pd.Timedelta(days=7))].sort_values('_dt').groupby('sku').tail(1)
+        gdl = gc[gc['ea'] > 0]
+        ch_rows.append({'name': v['name'], 'r28': round(v['r28'], 1), 'r14': round(v['r14'], 1),
+                        'pct': round((v['r14'] - v['r28']) / v['r28'] * 100) if v['r28'] > 0 else None,
+                        'used': c in ok, 'stock': int((sc['stock'].clip(lower=0) * sc['f']).sum()) if len(sc) and c not in CH_STOCK_SKIP else None,
+                        'last_dl': str(gdl['date'].max()) if len(gdl) else ''})
+    ch_rows.sort(key=lambda x: -abs(x['r14'] - x['r28']))
+    days = pd.date_range(end - pd.Timedelta(days=41), end, freq='D')
+    gg = g[g['channel'].isin(ok)]
+    dl = gg.groupby('_dt')['ea'].sum().reindex(days, fill_value=0)
+    pe = gg.groupby('_dt')['pe'].sum().reindex(days, fill_value=0)
+    stock = _daily_stock_series(g, days)
+    day_rows = [{'date': t.strftime('%Y-%m-%d'), 'd': t.strftime('%m/%d'), 'wd': '월화수목금토일'[t.dayofweek], 'recent': bool(t > end - pd.Timedelta(days=14)),
+                 'dl': int(dl[t]), 'pos': int(pe[t]), 'stock': None if pd.isna(stock[t]) else int(stock[t])} for t in days]
+    sp = _call_json(api_supply_plan, '/api/supply_plan')
+    p = next((x for x in sp.get('items', []) if x['code'] == code), None)
+    return jsonify({'item': it, 'days': day_rows, 'channels': ch_rows, 'weeks': _weekly_rows(gg, end),
+                    'supply': p, 'as_of': end.strftime('%Y-%m-%d')})
+
+
+@app.route('/api/dormant_detail', methods=['GET'])
+@cached_api()
+def api_dormant_detail():
+    """판매 중단 의심 항목 상세 (2026-10-06) — 월별 납품·매장 판매(언제 멈췄는지), 채널별 마지막 납품·판매·재고,
+    전용 자재와 그 자재를 쓰는 완제품(활동 상태), 최근 120일 발주(외주·구매)."""
+    code = (request.args.get('code') or '').strip().upper()
+    lst = _call_json(api_dormant_items, '/api/dormant_items')
+    it = next((x for x in lst.get('items', []) if x['code'] == code), None)
+    if not it:
+        return jsonify({'error': f'{code}: 판매 중단 의심 목록에 없음'}), 404
+    d = _sales_daily_canon()
+    end = d['_dt'].max()
+    g = d[d['code'] == code].copy()
+    g['ym'] = g['date'].astype(str).str[:7]
+    months = sorted(set(d['date'].astype(str).str[:7]))
+    mrows = [{'ym': ym, 'dl': int(g[g['ym'] == ym]['ea'].sum()), 'pos': int(g[g['ym'] == ym]['pe'].sum())} for ym in months]
+    ch_rows = []
+    for c, gc in g.groupby('channel'):
+        gdl, gps = gc[gc['ea'] > 0], gc[gc['pos'].fillna(0) > 0]
+        sc = gc[gc['stock'].notna()].sort_values('_dt').groupby('sku').tail(1)
+        if not len(gdl) and not len(gps):
+            continue
+        ch_rows.append({'name': str(gc['channel_name'].iloc[0]), 'dl': int(gdl['ea'].sum()), 'pos': int(gc['pe'].sum()),
+                        'last_dl': str(gdl['date'].max()) if len(gdl) else '', 'last_sale': str(gps['date'].max()) if len(gps) else '',
+                        'stock': int((sc['stock'].clip(lower=0) * sc['f']).sum()) if len(sc) and c not in CH_STOCK_SKIP else None,
+                        'stock_date': str(sc['date'].max()) if len(sc) else ''})
+    ch_rows.sort(key=lambda x: x['last_dl'] or x['last_sale'], reverse=True)
+    # 전용 자재 → 그 자재를 쓰는 완제품과 상태
+    _al = _goods_aliases()
+    cut = (end - pd.Timedelta(days=59)).strftime('%Y-%m-%d')
+    last_act = d[(d['ea'] > 0) | (d['pos'].fillna(0) > 0)].groupby('code')['date'].max()
+    seen = set(d['code'])
+    names = _sales_name_map()
+    mats = []
+    want = {m['code'] for m in it.get('materials', [])}
+    users = {m: set() for m in want}
+    if want:
+        for p in _get_bom_index():
+            if p[:1] in ('G', 'H', 'I'):
+                for m in _explode_bom(p):
+                    if m in users:
+                        users[m].add(_al.get(p, p))
+    for m in it.get('materials', []):
+        ul = []
+        for u in sorted(users.get(m['code'], ())):
+            la = str(last_act.get(u, ''))
+            ul.append({'code': u, 'name': names.get(u, ''), 'status': 'self' if u == code else ('active' if la >= cut else ('dormant' if u in seen else 'nodata')),
+                       'last': la})
+        mats.append({**m, 'users': ul})
+    # 최근 120일 발주
+    pos_rows = []
+    po_cut = (end - pd.Timedelta(days=119)).strftime('%Y%m%d')
+    for label, src in (('외주발주', WP_ORDER_DF), ('구매발주', ORDER_DF)):
+        if src is None or src.empty or '품번' not in src.columns:
+            continue
+        cc = src['품번'].astype(str).str.strip().str.upper().map(lambda c: _al.get(c, c))
+        ds = src['발주일자'].astype(str).str.replace('-', '').str[:8]
+        s = src[(cc == code) & (ds >= po_cut)]
+        for _, r in s.iterrows():
+            pos_rows.append({'kind': label, 'date': str(r.get('발주일자', ''))[:10], 'vendor': str(r.get('거래처명', '') or ''),
+                             'qty': int(_num(r.get('발주수량', 0))), 'rcv': int(_num(r.get('입고수량', 0)))})
+    pos_rows.sort(key=lambda x: x['date'], reverse=True)
+    return jsonify({'item': it, 'months': mrows, 'channels': ch_rows, 'materials': mats, 'orders': pos_rows[:20],
+                    'as_of': end.strftime('%Y-%m-%d')})
+
+
+@app.route('/api/delivery_gap_detail', methods=['GET'])
+@cached_api()
+def api_delivery_gap_detail():
+    """채널별 납품 끊김 항목 상세 (2026-10-06) — 그 채널·품번의 납품 이력(최근 180일 납품일·수량·간격),
+    최근 90일 일별 납품·매장 판매·채널 재고, 같은 품번 다른 채널 최근 납품, 수급 플래너."""
+    ch = (request.args.get('channel') or '').strip()
+    code = (request.args.get('code') or '').strip().upper()
+    lst = _call_json(api_delivery_gaps, '/api/delivery_gaps')
+    it = next((x for x in lst.get('items', []) if x['code'] == code and x['channel'] == ch), None)
+    if not it:
+        return jsonify({'error': f'{ch}/{code}: 납품 끊김 목록에 없음'}), 404
+    d = _sales_daily_canon()
+    end = d['_dt'].max()
+    gc = d[(d['code'] == code) & (d['channel'] == ch)]
+    dl_days = gc[gc['ea'] > 0].groupby('_dt')['ea'].sum().sort_index()
+    dl_days = dl_days[dl_days.index >= end - pd.Timedelta(days=179)]
+    hist, prev = [], None
+    for t, q in dl_days.items():
+        hist.append({'date': t.strftime('%Y-%m-%d'), 'qty': int(q), 'gap': int((t - prev).days) if prev is not None else None})
+        prev = t
+    days = pd.date_range(end - pd.Timedelta(days=89), end, freq='D')
+    rawpos = gc.assign(pr=gc['pos'].fillna(0) * gc['f'])   # 이 채널만 보므로 홈플 통합 POS도 그대로(재고와 짝)
+    dl = gc.groupby('_dt')['ea'].sum().reindex(days, fill_value=0)
+    ps = rawpos.groupby('_dt')['pr'].sum().reindex(days, fill_value=0)
+    stock = _daily_stock_series(gc, days) if ch not in CH_STOCK_SKIP else pd.Series([float('nan')] * len(days), index=days)
+    day_rows = [{'date': t.strftime('%Y-%m-%d'), 'd': t.strftime('%m/%d'), 'wd': '월화수목금토일'[t.dayofweek],
+                 'dl': int(dl[t]), 'pos': int(ps[t]), 'stock': None if pd.isna(stock[t]) else int(stock[t])} for t in days]
+    others = []
+    for c2, g2 in d[(d['code'] == code) & (d['channel'] != ch) & (d['ea'] > 0)].groupby('channel'):
+        r30 = g2[g2['_dt'] > end - pd.Timedelta(days=30)]
+        others.append({'name': str(g2['channel_name'].iloc[0]), 'last_dl': str(g2['date'].max()),
+                       'n30': int(r30['date'].nunique()), 'q30': int(r30['ea'].sum())})
+    others.sort(key=lambda x: x['last_dl'], reverse=True)
+    sp = _call_json(api_supply_plan, '/api/supply_plan')
+    p = next((x for x in sp.get('items', []) if x['code'] == code), None)
+    return jsonify({'item': it, 'history': hist, 'days': day_rows, 'others': others, 'supply': p, 'as_of': end.strftime('%Y-%m-%d')})
+
+
+def _ymd(s):
+    """'20261006' / '2026-10-06' → '2026-10-06' (형식 안 맞으면 '')."""
+    s = str(s or '').replace('-', '').replace('.', '').strip()[:8]
+    return f'{s[:4]}-{s[4:6]}-{s[6:8]}' if len(s) == 8 and s.isdigit() else ''
+
+
+@app.route('/api/supply_plan_detail', methods=['GET'])
+@cached_api()
+def api_supply_plan_detail():
+    """완제품 수급 플래너 항목 상세 (2026-10-06) — 판매 속도 계산 근거(최근 14·28·90일 납품), 최근 12주 납품·매장 판매,
+    앞으로 12주 창고 재고 예상(미마감 생산지시는 완료예정일, 외주 미입고는 도착일을 몰라 이번 주 입고로 가정),
+    창고별 재고, 미마감 생산지시·외주 미입고 목록, 채널별 납품·매장 판매·채널 재고."""
+    code = (request.args.get('code') or '').strip().upper()
+    sp = _call_json(api_supply_plan, '/api/supply_plan')
+    it = next((x for x in sp.get('items', []) if x['code'] == code), None)
+    if not it:
+        return jsonify({'error': f'{code}: 수급 플래너 목록에 없음'}), 404
+    _al = _goods_aliases()
+    canon = lambda c: _al.get(str(c).strip().upper(), str(c).strip().upper())
+    today = pd.Timestamp(datetime.now().date())
+    weekly = it['monthly'] / 4.33 if it['monthly'] else 0.0
+    # 판매 속도 근거 (구품번 합산)
+    vel = _sales_velocity()
+    vb = None
+    if vel:
+        acc = {'v': 0.0, 'v14': 0.0, 'v28': 0.0, 'v90': 0.0}
+        for c, v in vel['by'].items():
+            if canon(c) == code:
+                for k in acc:
+                    acc[k] += v[k]
+        vb = {**{k: round(v, 1) for k, v in acc.items()}, 'w28': VEL_W28, 'end': vel['end']}
+    # 최근 12주 실적 + 채널별
+    weeks, ch_rows = [], []
+    d = _sales_daily_canon()
+    if d is not None:
+        end = d['_dt'].max()
+        g = d[d['code'] == code]
+        weeks = _weekly_rows(g, end)
+        rates = _pos_rates(g, _pos_report(d), 14, 0)
+        rate_by = dict(zip(rates['channel'], rates['rate']))
+        for c, gc in g[g['_dt'] > end - pd.Timedelta(days=89)].groupby('channel'):
+            r28 = gc[gc['_dt'] > end - pd.Timedelta(days=28)]
+            sc = gc[gc['stock'].notna() & (gc['_dt'] >= end - pd.Timedelta(days=7))].sort_values('_dt').groupby('sku').tail(1)
+            stv = int((sc['stock'].clip(lower=0) * sc['f']).sum()) if len(sc) and c not in CH_STOCK_SKIP else None
+            pd_ = rate_by.get(c)
+            gdl = gc[gc['ea'] > 0]
+            if not len(gdl) and not pd_ and not stv:
+                continue
+            ch_rows.append({'name': str(gc['channel_name'].iloc[0]), 'dl28': int(r28['ea'].sum()),
+                            'pos_d': round(pd_, 1) if pd_ is not None else None, 'stock': stv,
+                            'cover': round(stv / pd_, 1) if (stv is not None and pd_) else None,
+                            'last_dl': str(gdl['date'].max()) if len(gdl) else ''})
+        ch_rows.sort(key=lambda x: -(x['dl28'] + (x['stock'] or 0)))
+    # 미마감 생산지시 (완료예정일) · 외주 미입고
+    arr, wo_rows, wp_rows = {}, [], []
+    wk = lambda t: min(12, max(0, -(-(t - today).days // 7)))   # 도착 주차(올림) — 지난 예정일은 이번 주
+    if WO_DF is not None and not WO_DF.empty and '품번' in WO_DF.columns:
+        w = WO_DF[WO_DF['품번'].map(canon) == code]
+        for _, r in w.iterrows():
+            if str(r.get('closeDt', '')).strip() not in ('', 'nan'):
+                continue
+            rem = _num(r.get('지시수량', 0)) - _num(r.get('workQt', 0))
+            if rem <= 0:
+                continue
+            due = _ymd(r.get('완료예정일', ''))
+            if due[:4] >= '2100':                 # 9999-12-31 = 완료예정 미정
+                due = ''
+            t = pd.Timestamp(due) if due else today
+            arr[wk(t)] = arr.get(wk(t), 0) + rem
+            od = _ymd(r.get('지시일자', ''))
+            wo_rows.append({'no': str(r.get('생산지시번호', '')), 'date': od, 'due': due,
+                            'qty': int(_num(r.get('지시수량', 0))), 'done': int(_num(r.get('workQt', 0))), 'rem': int(rem),
+                            'vendor': str(r.get('거래처명', '') or ''), 'late': bool(due and t < today),
+                            'old': bool(od and od < (today - pd.Timedelta(days=60)).strftime('%Y-%m-%d'))})   # 60일 넘은 미마감 = 마감 누락 의심
+    if WP_ORDER_DF is not None and not WP_ORDER_DF.empty and '품번' in WP_ORDER_DF.columns:
+        cut = (today - pd.Timedelta(days=120)).strftime('%Y-%m-%d')
+        w = WP_ORDER_DF[WP_ORDER_DF['품번'].map(canon) == code]
+        for _, r in w.iterrows():
+            od = _ymd(r.get('발주일자', ''))
+            rem = _num(r.get('발주수량', 0)) - _num(r.get('입고수량', 0))
+            if od < cut or rem <= 0:
+                continue
+            arr[0] = arr.get(0, 0) + rem
+            wp_rows.append({'date': od, 'vendor': str(r.get('거래처명', '') or ''), 'qty': int(_num(r.get('발주수량', 0))),
+                            'rcv': int(_num(r.get('입고수량', 0))), 'rem': int(rem)})
+    wo_rows.sort(key=lambda x: x['due'] or x['date'])
+    wp_rows.sort(key=lambda x: x['date'], reverse=True)
+    # 앞으로 12주 창고 재고 예상
+    st0 = float(it['stock'])
+    proj, cum = [], 0.0
+    for i in range(13):
+        cum += arr.get(i, 0)
+        proj.append({'w': i, 'date': (today + pd.Timedelta(days=7 * i)).strftime('%Y-%m-%d'), 'in': int(arr.get(i, 0)),
+                     'wh': int(round(st0 - weekly * i)), 'plan': int(round(st0 + cum - weekly * i))})
+    out_date = out_plan = None
+    if weekly > 0:
+        out_date = (today + pd.Timedelta(days=int(max(st0, 0) / weekly * 7))).strftime('%Y-%m-%d')
+        for i in range(1, 13):
+            a, b = proj[i - 1]['plan'], proj[i]['plan']
+            if b < 0:
+                k = 7 * (i - 1) + (int(7 * a / (a - b)) if a > 0 else 0)
+                out_plan = (today + pd.Timedelta(days=k)).strftime('%Y-%m-%d')
+                break
+        if proj[0]['plan'] < 0:
+            out_plan = today.strftime('%Y-%m-%d')
+    # 창고별 재고
+    whs = {}
+    if STOCK_DF is not None and not STOCK_DF.empty and '품번' in STOCK_DF.columns:
+        s = STOCK_DF[STOCK_DF['품번'].map(canon) == code]
+        for _, r in s.iterrows():
+            raw = str(r.get('품번', '')).strip().upper()
+            k = (str(r.get('창고명', '') or '').strip(), str(r.get('위치명', '') or '').strip(), raw if raw != code else '')
+            whs[k] = whs.get(k, 0) + _num(r.get('현재고', 0))
+    wh_rows = sorted([{'wh': k[0], 'loc': k[1], 'code': k[2], 'qty': int(v)} for k, v in whs.items() if v], key=lambda x: -abs(x['qty']))
+    return jsonify({'item': it, 'vel': vb, 'weekly': round(weekly, 1), 'weeks': weeks, 'channels': ch_rows,
+                    'wo': wo_rows, 'wp': wp_rows[:15], 'proj': proj, 'out_date': out_date, 'out_plan': out_plan,
+                    'warehouses': wh_rows, 'today': today.strftime('%Y-%m-%d')})
+
+
+@app.route('/api/channel_stock_detail', methods=['GET'])
+@cached_api()
+def api_channel_stock_detail():
+    """채널 품절 경보 항목 상세 (2026-10-06) — 그 채널·SKU의 최근 60일 채널 재고·매장 판매·납품(SKU 단위) + 앞으로 14일 재고 예상,
+    납품 이력(최근 180일·간격) → 평소 주기로 본 다음 납품 예상일 vs 소진 예상일, 같은 품번 다른 채널 재고, 수급 플래너."""
+    ch = (request.args.get('channel') or '').strip()
+    sku = (request.args.get('sku') or '').strip()
+    lst = _call_json(api_channel_stock, '/api/channel_stock?all=1')
+    it = next((x for x in lst.get('items', []) if x['channel'] == ch and str(x['sku']) == sku), None)
+    if not it:
+        return jsonify({'error': f'{ch}/{sku}: 채널 품절 경보 목록에 없음'}), 404
+    df = SALES_DAILY_DF
+    end = pd.to_datetime(df['date'].max())
+    g = df[(df['channel'] == ch) & (df['sku'].astype(str) == sku)]
+    g = g.assign(_dt=pd.to_datetime(g['date']), q=g['ea'] / g['f'].replace(0, 1).fillna(1))   # 납품을 SKU 단위로 (재고·POS와 같은 단위)
+    rep = set(df[(df['channel'] == ch) & df['pos'].notna()]['date'])   # 채널이 POS를 보고한 날 — 보고한 날의 빈칸 = 0개
+    # 납품 이력 · 평소 주기
+    dl = g[g['q'] > 0].groupby('_dt')['q'].sum().sort_index()
+    hist, prev = [], None
+    for t, q in dl[dl.index >= end - pd.Timedelta(days=179)].items():
+        hist.append({'date': t.strftime('%Y-%m-%d'), 'qty': int(round(q)), 'gap': int((t - prev).days) if prev is not None else None})
+        prev = t
+    gaps = [int((b - a).days) for a, b in zip(dl.index[:-1], dl.index[1:])][-10:]
+    med_gap = sorted(gaps)[len(gaps) // 2] if gaps else None
+    avg_qty = int(round(float(dl.tail(5).mean()))) if len(dl) else 0
+    last_dl = dl.index[-1] if len(dl) else None
+    next_dl = (last_dl + pd.Timedelta(days=med_gap)).strftime('%Y-%m-%d') if (last_dl is not None and med_gap) else None
+    sdate = pd.Timestamp(it['stock_date'])
+    out_date = (sdate + pd.Timedelta(days=int(it['cover']))).strftime('%Y-%m-%d') if it['stock'] > 0 else it['stock_date']
+    # 최근 60일 + 앞으로 14일
+    days = pd.date_range(end - pd.Timedelta(days=59), end + pd.Timedelta(days=14), freq='D')
+    dq = g.groupby('_dt')['q'].sum()
+    ps = g.assign(p0=g['pos'].fillna(0)).groupby('date')['p0'].sum()
+    sv = g[g['stock'].notna()].groupby('_dt')['stock'].last()
+    rows = []
+    for t in days:
+        ds = t.strftime('%Y-%m-%d')
+        fut = t > end
+        pj = None
+        if t >= sdate and t <= end + pd.Timedelta(days=14):
+            pj = max(0.0, it['stock'] - it['pos_d'] * (t - sdate).days)
+        rows.append({'date': ds, 'd': t.strftime('%m/%d'), 'wd': '월화수목금토일'[t.dayofweek], 'future': bool(fut),
+                     'dl': None if fut else int(round(float(dq.get(t, 0)))),
+                     'pos': None if (fut or ds not in rep) else int(ps.get(ds, 0)),
+                     'stock': None if t not in sv.index else int(sv[t]), 'proj': None if pj is None else int(round(pj))})
+    pdays = sum(1 for t in rep if t > (end - pd.Timedelta(days=14)).strftime('%Y-%m-%d'))
+    others = [{'name': x['channel_name'], 'sku': x['sku'], 'stock': x['stock'], 'pos_d': x['pos_d'], 'cover': x['cover'],
+               'level': x['level'], 'stale': x['stale'], 'last_delivery': x['last_delivery']}
+              for x in lst.get('items', []) if x['code'] and x['code'] == it['code'] and not (x['channel'] == ch and str(x['sku']) == sku)]
+    _al = _goods_aliases()
+    cc = _al.get(it['code'], it['code']) if it['code'] else ''
+    sp = _call_json(api_supply_plan, '/api/supply_plan') if cc else {}
+    p = next((x for x in sp.get('items', []) if x['code'] == cc), None)
+    return jsonify({'item': it, 'f': float(g['f'].iloc[-1] or 1) if len(g) else 1.0, 'days': rows, 'history': hist,
+                    'med_gap': med_gap, 'avg_qty': avg_qty, 'next_dl': next_dl, 'out_date': out_date,
+                    'since': int((end - last_dl).days) if last_dl is not None else None, 'pos_days14': pdays,
+                    'others': others, 'supply': p, 'as_of': end.strftime('%Y-%m-%d')})
 
 
 _ABC_CACHE = {}
@@ -13813,6 +14715,34 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   </div>
 </div>
 
+<!-- 수요 급변 · 판매 중단 의심 · 채널별 납품 끊김 공용 상세 모달 (2026-10-06) -->
+<div class="modal-overlay" id="lens-modal" style="z-index:125" onclick="if (event.target === this) closeLensDetail()">
+  <div class="modal" style="max-width:980px">
+    <div class="modal-header">
+      <div>
+        <div class="code-badge" id="lensd-badge" style="background:#475569">상세</div>
+        <h2 id="lensd-title">로딩 중...</h2>
+      </div>
+      <button class="modal-close" onclick="closeLensDetail()">&times;</button>
+    </div>
+    <div class="modal-body" id="lensd-body"><div class="loading">로딩 중...</div></div>
+  </div>
+</div>
+
+<!-- 납품 vs 실판매 괴리 상세 모달 (2026-10-06) -->
+<div class="modal-overlay" id="gap-modal" style="z-index:125" onclick="if (event.target === this) closeGapDetail()">
+  <div class="modal" style="max-width:980px">
+    <div class="modal-header">
+      <div>
+        <div class="code-badge" id="gapd-badge" style="background:#0d9488">🔎 납품 vs 실판매</div>
+        <h2 id="gapd-title">로딩 중...</h2>
+      </div>
+      <button class="modal-close" onclick="closeGapDetail()">&times;</button>
+    </div>
+    <div class="modal-body" id="gapd-body"><div class="loading">로딩 중...</div></div>
+  </div>
+</div>
+
 <!-- 채널 공급단가 변동 상세 모달 (2026-09-29) -->
 <div class="modal-overlay" id="cpc-modal" style="z-index:125" onclick="if (event.target === this) closeCpcDetail()">
   <div class="modal" style="max-width:980px">
@@ -15684,7 +16614,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       const [lb, cls] = PLAN_LV[x.level];
       const plus = (x.plan || x.incoming) ? ' <span style="color:#0891b2">+계획 ' + fmtInt(x.plan + x.incoming) + ' → ' + x.cov_plan_weeks + '주</span>' : '';
       const tr = x.trend >= 1.15 ? ' <span style="color:#dc2626">▲추세</span>' : (x.trend <= 0.85 ? ' <span style="color:#2563eb">▼추세</span>' : '');
-      return '<div class="alert-row" onclick="openItemModal(\\'' + x.code + '\\')">'
+      return '<div class="alert-row" onclick="openPlanDetail(&quot;' + x.code + '&quot;)" title="클릭 = 판매 속도 근거·앞으로 12주 재고 예상·생산지시·창고별 재고">'
         + '<span class="alert-badge ' + cls + '">' + lb + '</span>'
         + '<div><div class="alert-name">' + escapeHtml(x.name || x.code) + '</div>'
         + '<div class="alert-code">' + (x.abc === 'A' || x.abc === 'B' ? '<span class="abc-chip ' + x.abc + '" title="최근 90일 매출 ' + x.abc + '등급">' + x.abc + '</span> ' : '') + escapeHtml(x.code) + ' · ' + x.cls + ' · 월판매 ' + fmtInt(x.monthly) + tr + plus + '</div>'
@@ -15720,7 +16650,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         else if (over) { big = '+' + fmtInt(diff); small = '팔린 양의 ' + (Math.round(x.ratio * 10) / 10) + '배 납품'; }
         else { big = fmtInt(diff); small = '팔린 양의 ' + Math.round(x.ratio * 100) + '%만 납품'; }
         const sc = x.stock_change == null ? '' : ' · 채널재고 ' + (x.stock_change > 0 ? '<b style="color:#c2410c">' + fmtInt(x.stock_change) + ' 늘어남</b>' : x.stock_change < 0 ? '<b style="color:#1d4ed8">' + fmtInt(-x.stock_change) + ' 줄어듦</b>' : '변화 없음');
-        return '<div class="alert-row" onclick="openItemModal(&quot;' + x.code + '&quot;)">'
+        return '<div class="alert-row" onclick="openGapDetail(&quot;' + x.code + '&quot;)" title="클릭 = 일별 납품·매장 판매·채널 재고 상세">'
           + '<span class="alert-badge ' + (over ? 'warning' : 'low') + '" style="' + (over ? '' : 'background:#dbeafe;color:#1d4ed8') + '">' + (over ? '채널에 쌓임' : '채널 소진 중') + '</span>'
           + '<div><div class="alert-name">' + escapeHtml(x.name) + '</div>'
           + '<div class="alert-code">' + escapeHtml(x.code) + ' · 우리가 납품 <b>' + fmtInt(x.delivery) + '</b> vs 매장에서 팔림 <b>' + fmtInt(x.pos) + '</b>' + sc + ' · ' + escapeHtml(x.channels) + '</div></div>'
@@ -15749,6 +16679,428 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       }).join('');
     } catch (e) { list.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
   }
+  // ───── 수요 급변 · 판매 중단 의심 · 채널별 납품 끊김 공용 상세 (2026-10-06) ─────
+  let _lensd = null, _lensdKind = '', _lensdMode = '', _lensdChart = null;
+  function closeLensDetail() {
+    document.getElementById('lens-modal').classList.remove('show');
+    if (_lensdChart) { _lensdChart.destroy(); _lensdChart = null; }
+  }
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && document.getElementById('lens-modal').classList.contains('show')) closeLensDetail(); });
+  async function _openLens(kind, url, badge, color, title) {
+    document.getElementById('lens-modal').classList.add('show');
+    const bd = document.getElementById('lensd-badge'); bd.textContent = badge; bd.style.background = color;
+    document.getElementById('lensd-title').textContent = title;
+    const body = document.getElementById('lensd-body');
+    body.innerHTML = '<div class="loading">로딩 중...</div>';
+    try {
+      const d = await (await fetch(url)).json();
+      if (d.error) throw new Error(d.error);
+      _lensd = d; _lensdKind = kind;
+      ({ shift: renderShiftDetail, dorm: renderDormDetail, dgap: renderDgapDetail, plan: renderPlanDetail, chs: renderChsDetail })[kind]();
+    } catch (e) { body.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
+  }
+  const _ld = {   // 공용 조각
+    R: v => fmtInt(Math.round(v)),
+    md: t => t ? t.slice(5).replace('-', '/') : '-',
+    kpi: (l, val, sub) => '<div>' + l + '<b>' + val + '</b>' + (sub ? '<span style="font-size:10px">' + sub + '</span>' : '') + '</div>',
+    itemBtn: code => '<div style="text-align:right"><button class="vk-chip" style="padding:6px 12px" onclick="openItemModal(&quot;' + code + '&quot;)">📦 품목 정보(BOM·재고) 열기</button></div>',
+    modeChips: (opts, cur) => '<div class="vk-chips" id="lensd-mode" style="margin-left:auto">' + opts.map(o => '<button class="vk-chip' + (o[0] === cur ? ' on' : '') + '" data-m="' + o[0] + '" onclick="setLensdMode(&quot;' + o[0] + '&quot;)">' + o[1] + '</button>').join('') + '</div>',
+    chartBlock: (title, chips) => '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><span class="npd-sec" style="margin:0">' + title + '</span>' + (chips || '') + '</div>'
+      + '<div class="npd-chart-wrap"><canvas id="lensdChart"></canvas></div><div class="npd-note" id="lensd-note"></div>',
+  };
+  function setLensdMode(m) {
+    _lensdMode = m;
+    document.querySelectorAll('#lensd-mode .vk-chip').forEach(b => b.classList.toggle('on', b.dataset.m === m));
+    drawLensdChart();
+  }
+  function _lensChart(labels, datasets, opts) {
+    const cv = document.getElementById('lensdChart'); if (!cv) return;
+    if (_lensdChart) _lensdChart.destroy();
+    const titles = opts.titles || null;
+    _lensdChart = new Chart(cv, {
+      data: { labels, datasets },
+      options: { responsive: true, maintainAspectRatio: false, animation: { duration: 250 }, interaction: { mode: 'index', intersect: false },
+        plugins: { legend: { labels: { boxWidth: 11, font: { size: 10.5 } } },
+                   tooltip: { callbacks: { title: it => titles ? titles[it[0].dataIndex] : it[0].label,
+                                           label: c => c.dataset.label + ': ' + (c.parsed.y == null ? '-' : fmtInt(c.parsed.y) + '개') } } },
+        scales: { x: { grid: { display: false }, ticks: { font: { size: 10 }, maxRotation: 0, autoSkip: true } },
+                  y: { beginAtZero: true, ticks: { font: { size: 10 }, callback: v => fmtInt(v) }, grid: { color: '#eef2f7' }, title: { display: true, text: opts.yTitle || '수량', font: { size: 10 } } },
+                  y2: { display: !!opts.y2, position: 'right', beginAtZero: true, ticks: { font: { size: 10 }, callback: v => fmtInt(v) }, grid: { display: false }, title: { display: true, text: opts.y2 || '', font: { size: 10 } } } } }
+    });
+    document.getElementById('lensd-note').textContent = opts.note || '';
+  }
+  function drawLensdChart() {
+    const d = _lensd; if (!d) return;
+    const stockLine = rows => ({ type: 'line', label: '채널 재고', data: rows.map(r => r.stock), yAxisID: 'y2', borderColor: '#f59e0b', backgroundColor: '#f59e0b', borderWidth: 2, pointRadius: 1.5, tension: 0.25, spanGaps: true, order: 1 });
+    if (_lensdKind === 'shift') {
+      if (_lensdMode === 'w') {
+        const w = d.weeks;
+        _lensChart(w.map(x => x.w + (x.days < 7 ? '*' : '')), [
+          { type: 'bar', label: '납품', data: w.map(x => x.dl), backgroundColor: '#cbd5e1', borderRadius: 3 },
+          { type: 'bar', label: '매장 판매', data: w.map(x => x.pos), backgroundColor: '#16a34a', borderRadius: 3 }],
+          { titles: w.map(x => x.w + '~' + x.to + ' (' + x.days + '일)'), note: '최근 12주 주별 (비교에 쓴 채널 기준) · * 는 며칠치뿐인 주' });
+      } else {
+        const r = d.days;
+        _lensChart(r.map(x => x.d + '(' + x.wd + ')'), [
+          { type: 'bar', label: '매장 판매', data: r.map(x => x.pos), backgroundColor: r.map(x => x.recent ? '#16a34a' : '#86efac'), borderRadius: 3, order: 2 },
+          { type: 'bar', label: '납품', data: r.map(x => x.dl), backgroundColor: '#cbd5e1', borderRadius: 3, order: 2 }, stockLine(r)],
+          { titles: r.map(x => x.date), y2: '채널 재고', note: '초록 막대: 매장 판매 (진한 초록 = 최근 14일, 연한 초록 = 그 전 28일 → 둘의 하루 평균을 비교) · 회색: 납품 · 주황 선: 채널 재고' });
+      }
+    } else if (_lensdKind === 'dorm') {
+      const m = d.months;
+      _lensChart(m.map(x => x.ym.slice(2).replace('-', '/')), [
+        { type: 'bar', label: '납품', data: m.map(x => x.dl), backgroundColor: '#cbd5e1', borderRadius: 3 },
+        { type: 'bar', label: '매장 판매', data: m.map(x => x.pos), backgroundColor: '#16a34a', borderRadius: 3 }],
+        { note: '월별 납품·매장 판매 (판매자료 시작 1월부터) — 막대가 끊긴 달부터 판매가 멈춘 것' });
+    } else if (_lensdKind === 'dgap') {
+      const r = d.days;
+      _lensChart(r.map(x => x.d), [
+        { type: 'bar', label: '납품', data: r.map(x => x.dl), backgroundColor: '#64748b', borderRadius: 2, order: 2 },
+        { type: 'line', label: '매장 판매', data: r.map(x => x.pos), borderColor: '#16a34a', backgroundColor: '#16a34a', borderWidth: 1.5, pointRadius: 0, tension: 0.2, order: 1 },
+        stockLine(r)],
+        { titles: r.map(x => x.date + '(' + x.wd + ')'), y2: '채널 재고', note: '최근 90일 이 채널 기준 · 진회색 막대: 납품 · 초록 선: 매장 판매 · 주황 선: 채널 재고' });
+    } else if (_lensdKind === 'plan') {
+      if (_lensdMode === 'h') {
+        const w = d.weeks;
+        _lensChart(w.map(x => x.w + (x.days < 7 ? '*' : '')), [
+          { type: 'bar', label: '납품 (창고에서 나간 양)', data: w.map(x => x.dl), backgroundColor: '#94a3b8', borderRadius: 3, order: 2 },
+          { type: 'bar', label: '매장 판매', data: w.map(x => x.pos), backgroundColor: '#16a34a', borderRadius: 3, order: 2 },
+          { type: 'line', label: '판매 속도 (주)', data: w.map(x => Math.round(d.weekly * x.days / 7)), borderColor: '#dc2626', backgroundColor: '#dc2626', borderDash: [5, 4], borderWidth: 1.5, pointRadius: 0, order: 1 }],
+          { titles: w.map(x => x.w + '~' + x.to + ' (' + x.days + '일)'), note: '최근 12주 주별 · 빨간 점선 = 수급 판정에 쓰는 판매 속도(주 ' + fmtInt(Math.round(d.weekly)) + '개) · * 는 며칠치뿐인 주' });
+      } else {
+        const p = d.proj;
+        _lensChart(p.map(x => x.w === 0 ? '오늘' : x.w + '주 후'), [
+          { type: 'bar', label: '입고 예정', data: p.map(x => x.in || null), backgroundColor: '#a5f3fc', borderRadius: 3, order: 2 },
+          { type: 'line', label: '창고 재고 (지금 재고만)', data: p.map(x => x.wh), borderColor: '#dc2626', backgroundColor: '#dc2626', borderWidth: 2, pointRadius: 2, tension: 0.1, order: 1 },
+          { type: 'line', label: '생산·입고 예정 포함', data: p.map(x => x.plan), borderColor: '#0891b2', backgroundColor: '#0891b2', borderWidth: 2, pointRadius: 2, tension: 0.1, order: 1 }],
+          { titles: p.map(x => x.date), note: '판매 속도(주 ' + fmtInt(Math.round(d.weekly)) + '개)대로 줄어든다고 본 예상 · 생산지시는 완료예정일 주에, 외주 미입고·완료예정 미정 지시는 이번 주에 들어온다고 가정 · 0 아래 = 모자라는 수량' });
+      }
+    } else if (_lensdKind === 'chs') {
+      const r = d.days;
+      _lensChart(r.map(x => x.d), [
+        { type: 'bar', label: '납품', data: r.map(x => x.dl), backgroundColor: '#64748b', borderRadius: 2, order: 3 },
+        { type: 'line', label: '판매', data: r.map(x => x.pos), borderColor: '#16a34a', backgroundColor: '#16a34a', borderWidth: 1.5, pointRadius: 0, tension: 0.2, spanGaps: false, order: 2 },
+        { type: 'line', label: '채널 재고', data: r.map(x => x.stock), yAxisID: 'y2', borderColor: '#f59e0b', backgroundColor: '#f59e0b', borderWidth: 2, pointRadius: 1.5, tension: 0.2, spanGaps: true, order: 1 },
+        { type: 'line', label: '예상 재고', data: r.map(x => x.proj), yAxisID: 'y2', borderColor: '#f59e0b', backgroundColor: '#fff', borderDash: [5, 4], borderWidth: 2, pointRadius: 0, order: 1 }],
+        { titles: r.map(x => x.date + '(' + x.wd + ')' + (x.future ? ' 예상' : '')), y2: '채널 재고',
+          note: '최근 60일 + 앞으로 14일 · 이 채널·SKU 단위 · 회색 막대: 납품 · 초록 선: 판매 · 주황 선: 채널 재고 · 점선: 지금 판매 속도(하루 ' + d.item.pos_d + '개)대로 줄어들 때' });
+    }
+  }
+  // 수요 급변
+  function openShiftDetail(code) { _lensdMode = 'd'; _openLens('shift', '/api/demand_shift_detail?code=' + encodeURIComponent(code), '⚡ 수요 급변 · ' + code, '#db2777', code); }
+  function renderShiftDetail() {
+    const d = _lensd, x = d.item, s = d.supply || {}, R = _ld.R;
+    document.getElementById('lensd-title').textContent = x.name;
+    const up = x.dir === 'up';
+    const top = d.channels.filter(c => c.used)[0];
+    let why = '매장 판매가 하루 <b>' + R(x.r28) + '개</b>(15~42일 전 평균) → <b>' + R(x.r14) + '개</b>(최근 14일)로 '
+      + '<b style="color:' + (up ? '#be123c' : '#1d4ed8') + '">' + (x.pct == null ? '새로 생김' : (x.pct > 0 ? '+' : '') + x.pct + '%') + '</b>.';
+    if (top) why += '<br>변화가 가장 큰 채널: <b>' + escapeHtml(top.name) + '</b> 하루 ' + R(top.r28) + ' → ' + R(top.r14) + '개.';
+    if (x.vel != null) {
+      const gap = x.r14 > 0 ? Math.round((x.vel - x.r14) / x.r14 * 100) : null;
+      why += '<br>발주 계산에 쓰는 판매 속도는 하루 <b>' + R(x.vel) + '개</b>(납품 기준 4주·3개월 평균)'
+        + (gap != null ? ' — 최근 매장 판매보다 <b>' + Math.abs(gap) + '% ' + (gap >= 0 ? '높음' : '낮음') + '</b>' : '') + '.';
+    }
+    if (x.note) why += '<br><b style="color:#b45309">⚠ ' + escapeHtml(x.note) + '</b> — 채널 재고가 옛 판매량 3일분도 안 돼, 수요가 준 게 아니라 물건이 없어서 못 판 것일 수 있습니다.';
+    let act = up ? '판매가 늘었습니다. 자재·완제품 재고가 예상보다 빨리 줄 수 있으니 '
+                   + (s.cov_weeks != null ? '창고 ' + s.cov_weeks + '주분인지 확인하고 ' : '') + '생산·발주를 앞당길지 검토하세요.'
+                 : (x.note ? '채널에 물건이 다시 들어가면 판매가 회복될 수 있습니다. 채널 납품 상황을 먼저 확인하세요.'
+                           : '판매가 줄었습니다. 발주 계산 속도가 아직 높게 남아 있어 과잉 생산·발주가 되지 않게 주의하세요.');
+    let h = '<div class="npd-why" style="background:#fdf2f8;border-color:#fbcfe8">' + why + '<br>→ ' + act + '</div>';
+    h += '<div class="npd-kpis">' + _ld.kpi('이전 판매', '하루 ' + R(x.r28), '15~42일 전') + _ld.kpi('최근 판매', '하루 ' + R(x.r14), '최근 14일')
+      + _ld.kpi('변화', x.pct == null ? '신규' : (x.pct > 0 ? '+' : '') + x.pct + '%', '하루 ' + (x.diff_d > 0 ? '+' : '') + R(x.diff_d) + '개')
+      + _ld.kpi('발주 계산 속도', x.vel != null ? '하루 ' + R(x.vel) : '-', '납품 기준') + _ld.kpi('채널 재고', x.ch_stock != null ? fmtInt(x.ch_stock) : '-', '')
+      + _ld.kpi('우리 창고', s.stock != null ? fmtInt(s.stock) : '-', s.cov_weeks != null ? s.cov_weeks + '주분' : '') + '</div>';
+    h += _ld.chartBlock('매장 판매 · 납품 · 채널 재고', _ld.modeChips([['d', '최근 42일'], ['w', '12주']], _lensdMode));
+    h += '<div class="npd-sec">채널별 하루 매장 판매</div><table class="npd-tbl"><thead><tr><th>채널</th><th>이전(15~42일 전)</th><th>최근 14일</th><th>변화</th><th>채널 재고</th><th>마지막 납품</th></tr></thead><tbody>'
+      + d.channels.map(c => '<tr' + (c.used ? '' : ' class="part"') + '><td>' + escapeHtml(c.name) + (c.used ? '' : ' <span style="font-size:10px">(자료 부족, 비교 제외)</span>') + '</td><td>' + R(c.r28) + '</td><td>' + R(c.r14) + '</td><td>'
+          + (c.pct == null ? '-' : '<b style="color:' + (c.pct >= 0 ? '#be123c' : '#1d4ed8') + '">' + (c.pct > 0 ? '+' : '') + c.pct + '%</b>') + '</td><td>' + (c.stock != null ? fmtInt(c.stock) : '-') + '</td><td>' + _ld.md(c.last_dl) + '</td></tr>').join('')
+      + '</tbody></table>' + _ld.itemBtn(x.code);
+    document.getElementById('lensd-body').innerHTML = h;
+    drawLensdChart();
+  }
+  // 판매 중단 의심
+  function openDormDetail(code) { _lensdMode = ''; _openLens('dorm', '/api/dormant_detail?code=' + encodeURIComponent(code), '💤 판매 중단 의심 · ' + code, '#a16207', code); }
+  function renderDormDetail() {
+    const d = _lensd, x = d.item, md = _ld.md;
+    const won = v => v >= 1e8 ? (v / 1e8).toFixed(2) + '억' : (v >= 1e4 ? fmtInt(Math.round(v / 1e4)) + '만' : fmtInt(v));
+    document.getElementById('lensd-title').textContent = x.name;
+    const ST = { stopped: '판매 멈춤', selling: '채널 재고로 판매 중', po: '최근 발주 있음' };
+    let why = '마지막 납품 <b>' + md(x.last_delivery) + '</b>(' + x.days_since + '일 전)' + (x.last_sale ? ', 마지막 매장 판매 <b>' + md(x.last_sale) + '</b>' : ', 매장 판매 기록 없음')
+      + ' — 최근 ' + 60 + '일 동안 납품도 매장 판매도 없어 <b>' + (ST[x.status] || '') + '</b>으로 봤습니다.';
+    why += '<br>우리 창고에 <b>' + fmtInt(x.ours) + '개</b>' + (x.ours_value ? '(' + won(x.ours_value) + '원' + (x.ours_value_src === 'BOM원가' ? ', BOM 원가' : '') + ')' : '') + ' 남아 있습니다.';
+    const sure = (d.materials || []).filter(m => !m.unknown_users), maybe = (d.materials || []).filter(m => m.unknown_users);
+    const sureVal = sure.reduce((a, m) => a + m.value, 0);
+    if (sure.length) why += '<br>이 품번에만 쓰는 자재 <b>' + sure.length + '종' + (sureVal ? ' ' + won(sureVal) + '원' : '') + '</b>'
+      + (sure.some(m => !m.value) ? ' <span style="color:var(--text-3)">(단가 없는 자재는 금액 미상)</span>' : '') + ' — 추가 발주를 멈추고 남은 재고 처리를 검토하세요.';
+    if (maybe.length) why += '<br><span style="color:#b45309">⚠ 자재 ' + maybe.map(m => escapeHtml(m.code)).join('·') + '은 판매자료에 없는 다른 완제품도 써서 아래 표에서 쓰는 곳을 확인하세요.</span>';
+    if (x.status === 'po') why += '<br><b style="color:#1d4ed8">최근 발주(' + md(x.recent_po.slice(0, 4) + '-' + x.recent_po.slice(4, 6) + '-' + x.recent_po.slice(6, 8)) + ')가 있어 다시 생산·판매할 가능성이 있습니다.</b>';
+    why += '<br><span style="color:var(--text-3)">※ 온라인팀 판매자료 채널 기준 — 홀세일·B2B로만 나가는 품목이면 실제로는 판매 중일 수 있습니다.</span>';
+    let h = '<div class="npd-why" style="background:#fefce8;border-color:#fde68a">' + why + '</div>';
+    h += '<div class="npd-kpis">' + _ld.kpi('마지막 납품', md(x.last_delivery), x.days_since + '일 전') + _ld.kpi('마지막 매장 판매', md(x.last_sale), '')
+      + _ld.kpi('올해 납품', fmtInt(x.total_delivery), '') + _ld.kpi('창고 재고', fmtInt(x.ours), x.ours_value ? won(x.ours_value) + '원' : '')
+      + _ld.kpi('전용 자재', sure.length + '종', won(x.mat_value || 0) + '원') + _ld.kpi('공용 가능 자재', maybe.length + '종', won(x.mat_maybe_value || 0) + '원') + '</div>';
+    h += _ld.chartBlock('월별 납품 · 매장 판매', '');
+    h += '<div class="npd-sec">채널별</div><table class="npd-tbl"><thead><tr><th>채널</th><th>올해 납품</th><th>마지막 납품</th><th>매장 판매</th><th>마지막 판매</th><th>채널 재고</th></tr></thead><tbody>'
+      + d.channels.map(c => '<tr><td>' + escapeHtml(c.name) + '</td><td>' + fmtInt(c.dl) + '</td><td>' + md(c.last_dl) + '</td><td>' + fmtInt(c.pos) + '</td><td>' + md(c.last_sale) + '</td><td>'
+          + (c.stock != null ? fmtInt(c.stock) + ' <span style="font-size:10px;color:var(--text-3)">(' + md(c.stock_date) + ')</span>' : '-') + '</td></tr>').join('') + '</tbody></table>';
+    if ((d.materials || []).length) {
+      const USt = { self: ['이 품번', '#64748b'], active: ['판매 중', '#15803d'], dormant: ['판매 멈춤', '#b91c1c'], nodata: ['판매자료 없음', '#b45309'] };
+      h += '<div class="npd-sec">전용 자재와 쓰는 완제품</div><table class="npd-tbl"><thead><tr><th>자재</th><th>재고</th><th>금액</th><th>이 자재를 쓰는 완제품</th></tr></thead><tbody>'
+        + d.materials.map(m => '<tr><td>' + escapeHtml(m.code) + ' ' + escapeHtml((m.name || '').slice(0, 26)) + '</td><td>' + fmtInt(m.qty) + '</td><td>' + (m.value ? won(m.value) + '원' : '-') + '</td><td style="text-align:left">'
+            + (m.users || []).map(u => '<span style="white-space:nowrap;margin-right:8px">' + escapeHtml(u.code) + ' <span style="color:' + USt[u.status][1] + '">' + USt[u.status][0] + '</span>' + (u.name && u.status !== 'self' ? ' <span style="color:var(--text-3)">' + escapeHtml(u.name.slice(0, 16)) + '</span>' : '') + '</span>').join('') + '</td></tr>').join('')
+        + '</tbody></table>';
+    }
+    if ((d.orders || []).length) {
+      h += '<div class="npd-sec">최근 120일 발주</div><table class="npd-tbl"><thead><tr><th>구분</th><th>발주일</th><th>거래처</th><th>발주</th><th>입고</th></tr></thead><tbody>'
+        + d.orders.map(o => '<tr><td>' + o.kind + '</td><td>' + escapeHtml(o.date) + '</td><td>' + escapeHtml(o.vendor) + '</td><td>' + fmtInt(o.qty) + '</td><td>' + fmtInt(o.rcv) + '</td></tr>').join('') + '</tbody></table>';
+    }
+    h += _ld.itemBtn(x.code);
+    document.getElementById('lensd-body').innerHTML = h;
+    drawLensdChart();
+  }
+  // 채널별 납품 끊김
+  function openDgapDetail(ch, code) { _lensdMode = ''; _openLens('dgap', '/api/delivery_gap_detail?channel=' + encodeURIComponent(ch) + '&code=' + encodeURIComponent(code), '⛔ 납품 끊김 · ' + code, '#b91c1c', code); }
+  function renderDgapDetail() {
+    const d = _lensd, x = d.item, s = d.supply || {}, R = _ld.R, md = _ld.md;
+    const st = DGAP_ST[x.status] || DGAP_ST.unknown;
+    document.getElementById('lensd-title').textContent = x.name;
+    document.getElementById('lensd-badge').textContent = '⛔ ' + st[0] + ' · ' + x.channel_name + ' · ' + x.code;
+    let why = '<b>' + escapeHtml(x.channel_name) + '</b>에 평소 <b>' + x.med_gap + '일마다 ' + fmtInt(x.avg_qty) + '개</b>씩 납품됐는데, 마지막 납품 <b>' + md(x.last_delivery) + '</b> 이후 <b style="color:#b91c1c">' + x.since + '일째</b> 납품이 없습니다.';
+    if (x.pos_d != null) why += '<br>그동안 이 채널 매장에서 하루 <b>' + R(x.pos_d) + '개</b>씩 팔렸고' + (x.ch_stock != null ? ', 채널 재고는 <b>' + fmtInt(x.ch_stock) + '개</b>' + (x.cover_days != null ? '(' + R(x.cover_days) + '일분)' : '') : '') + ' 남았습니다.';
+    else why += '<br>이 채널은 매장 판매(POS) 자료를 주지 않아 판매 상황은 알 수 없습니다.';
+    if (x.others && x.others.length) why += '<br>다른 채널(' + escapeHtml(x.others.join(', ')) + ')에는 최근 30일 안에 납품이 있었습니다.';
+    let h = '<div class="npd-why" style="background:#fef2f2;border-color:#fecaca">' + why + '<br>→ <b>' + st[0] + '</b>: ' + st[2]
+      + (x.status === 'our_out' && s.stock != null ? ' (우리 창고 ' + fmtInt(s.stock) + '개)' : '') + '</div>';
+    const gaps = (d.history || []).map(r => r.gap).filter(g => g != null);
+    h += '<div class="npd-kpis">' + _ld.kpi('평소 납품 주기', x.med_gap + '일', '최근 10회 간격 중앙값') + _ld.kpi('마지막 납품', md(x.last_delivery), x.since + '일째 없음')
+      + _ld.kpi('1회 납품량', fmtInt(x.avg_qty) + '개', '최근 5회 평균') + _ld.kpi('매장 판매', x.pos_d != null ? '하루 ' + R(x.pos_d) : '-', '최근 14일')
+      + _ld.kpi('채널 재고', x.ch_stock != null ? fmtInt(x.ch_stock) : '-', x.cover_days != null ? R(x.cover_days) + '일분' : '')
+      + _ld.kpi('우리 창고', s.stock != null ? fmtInt(s.stock) : fmtInt(x.ours), s.cov_weeks != null ? s.cov_weeks + '주분' : '') + '</div>';
+    h += _ld.chartBlock('최근 90일 납품 · 매장 판매 · 채널 재고', '');
+    h += '<div class="npd-sec">납품 이력 (최근 180일, 최신순)</div><table class="npd-tbl"><thead><tr><th>납품일</th><th>수량</th><th>직전 납품과 간격</th></tr></thead><tbody>'
+      + (d.history || []).slice().reverse().slice(0, 20).map(r => '<tr><td>' + escapeHtml(r.date) + '</td><td>' + fmtInt(r.qty) + '</td><td>' + (r.gap != null ? r.gap + '일' : '-') + '</td></tr>').join('')
+      + '<tr class="part"><td>지금(' + md(d.as_of) + ')</td><td>-</td><td><b style="color:#b91c1c">' + x.since + '일째</b></td></tr>'
+      + '</tbody></table>';
+    if ((d.others || []).length) {
+      h += '<div class="npd-sec">같은 품번 다른 채널</div><table class="npd-tbl"><thead><tr><th>채널</th><th>마지막 납품</th><th>최근 30일 납품 횟수</th><th>최근 30일 납품량</th></tr></thead><tbody>'
+        + d.others.map(o => '<tr><td>' + escapeHtml(o.name) + '</td><td>' + md(o.last_dl) + '</td><td>' + o.n30 + '회</td><td>' + fmtInt(o.q30) + '</td></tr>').join('') + '</tbody></table>';
+    }
+    h += _ld.itemBtn(x.code);
+    document.getElementById('lensd-body').innerHTML = h;
+    drawLensdChart();
+  }
+  // 완제품 수급 플래너 (2026-10-06: 품번 정보 대신 수급 상세)
+  function openPlanDetail(code) { _lensdMode = 'f'; _openLens('plan', '/api/supply_plan_detail?code=' + encodeURIComponent(code), '📦 수급 플래너 · ' + code, '#0891b2', code); }
+  function renderPlanDetail() {
+    const d = _lensd, x = d.item, v = d.vel, R = _ld.R, md = _ld.md;
+    const lv = PLAN_LV[x.level] || PLAN_LV.ok;
+    document.getElementById('lensd-title').textContent = x.name || x.code;
+    document.getElementById('lensd-badge').textContent = '📦 ' + lv[0] + ' · ' + x.code;
+    const pl = x.plan + x.incoming;
+    const need8 = Math.max(0, Math.round(d.weekly * 8 - x.stock - pl));
+    const oldWo = (d.wo || []).filter(w => w.old);
+    let why = '판매 속도 하루 <b>' + R(d.weekly / 7) + '개</b>(주 ' + R(d.weekly) + ' · 월 ' + fmtInt(x.monthly) + ')'
+      + (v ? ' — 최근 4주 납품 하루 ' + R(v.v28) + '개×' + Math.round(v.w28 * 100) + '% + 3개월 ' + R(v.v90) + '개×' + Math.round((1 - v.w28) * 100) + '%' : '') + '.';
+    if (x.stock <= 0) why += '<br>우리 창고 재고가 <b style="color:#dc2626">' + fmtInt(x.stock) + '개</b>로 이미 바닥입니다.';
+    else why += '<br>우리 창고 <b>' + fmtInt(x.stock) + '개</b> = <b>' + x.cov_weeks + '주분</b> → 지금 속도면 <b>' + md(d.out_date) + '</b>쯤 바닥납니다.';
+    const junk = (d.warehouses || []).filter(w => w.loc.indexOf('폐기') >= 0 && w.qty > 0).reduce((a, w) => a + w.qty, 0);
+    if (junk && x.stock > 0) why += ' <span style="color:#b45309">(이 중 ' + fmtInt(junk) + '개는 폐기·장기품목 위치 — 판매 가능한 재고인지 확인 필요)</span>';
+    if (pl) why += '<br>' + (x.plan && x.incoming ? '생산지시 잔량 ' + fmtInt(x.plan) + ' + 외주 미입고 ' + fmtInt(x.incoming) + ' = ' : (x.plan ? '생산지시 잔량 ' : '외주 미입고 ')) + '<b>' + fmtInt(pl) + '개</b>가 들어오면 <b>' + x.cov_plan_weeks + '주분</b>'
+      + (d.out_plan ? ' (예정대로 들어와도 <b>' + md(d.out_plan) + '</b>쯤 부족)' : ' (12주 이상 버팀)') + '.';
+    else why += '<br>잡혀 있는 생산지시·외주 미입고가 <b>없습니다</b>.';
+    if (x.ch_stock != null) why += '<br>채널(쿠팡 센터·마트 매장)에 ' + fmtInt(x.ch_stock) + '개가 더 있어 채널 포함 <b>' + x.cov_ch_weeks + '주분</b>' + (x.ch_note ? ' — <b>' + x.ch_note + '</b>' : '') + '.';
+    if (x.trend >= 1.15 || x.trend <= 0.85) why += '<br>최근 4주 판매가 3개월 평균의 <b>' + Math.round(x.trend * 100) + '%</b> — 판매가 ' + (x.trend > 1 ? '늘고' : '줄고') + ' 있습니다.';
+    let act;
+    if (x.level === 'out' || x.level === 'critical') {
+      act = pl ? '생산·입고가 잡혀 있지만 2주를 못 버팁니다. <b>완료 시점을 당길 수 있는지</b> 확인하세요.'
+               : '<b>생산(발주) 착수가 급합니다.</b>';
+      if (x.ch_note === '채널 여유') act += ' 채널 재고가 넉넉해 당장 매장 품절 위험은 낮지만 창고 보충은 필요합니다.';
+    } else if (x.level === 'warning') act = '4주 안에 바닥납니다. ' + (pl ? '잡힌 계획이 제때 들어오는지 확인하세요.' : '생산 일정을 잡으세요.');
+    else if (x.level === 'low') act = '여유는 있지만 8주 안에 바닥납니다. 다음 생산 계획에 넣으세요.';
+    else act = '재고가 8주 이상 충분합니다.';
+    if (need8 > 0 && x.level !== 'ok') act += ' 8주분을 채우려면 약 <b>' + fmtInt(need8) + '개</b>가 더 필요합니다.';
+    if (oldWo.length) act += '<br><span style="color:#b45309">⚠ 60일 넘게 마감되지 않은 생산지시 ' + oldWo.length + '건(' + fmtInt(oldWo.reduce((a, w) => a + w.rem, 0)) + '개)이 계획에 포함돼 있습니다 — 실제 생산 예정인지, 마감 누락인지 확인하세요.</span>';
+    let h = '<div class="npd-why" style="background:#ecfeff;border-color:#a5f3fc">' + why + '<br>→ ' + act + '</div>';
+    h += '<div class="npd-kpis">' + _ld.kpi('창고 재고', fmtInt(x.stock), x.cov_weeks + '주분') + _ld.kpi('판매 속도', '하루 ' + R(d.weekly / 7), '월 ' + fmtInt(x.monthly))
+      + _ld.kpi('바닥 예상', x.stock <= 0 ? '이미 부족' : md(d.out_date), '지금 재고만') + _ld.kpi('생산·입고 예정', fmtInt(pl), pl ? x.cov_plan_weeks + '주분까지' : '없음')
+      + _ld.kpi('채널 재고', x.ch_stock != null ? fmtInt(x.ch_stock) : '-', x.cov_ch_weeks != null ? '채널 포함 ' + x.cov_ch_weeks + '주' : '')
+      + _ld.kpi('8주분 부족량', need8 ? fmtInt(need8) : '없음', '계획 포함') + '</div>';
+    h += _ld.chartBlock('창고 재고 흐름', _ld.modeChips([['f', '앞으로 12주'], ['h', '최근 12주 실적']], _lensdMode));
+    if (v) h += '<div class="npd-sec">판매 속도 계산 (하루 납품, 구품번 포함)</div><table class="npd-tbl"><thead><tr><th>최근 14일</th><th>최근 4주</th><th>최근 3개월</th><th>적용 (4주 ' + Math.round(v.w28 * 100) + '% + 3개월 ' + Math.round((1 - v.w28) * 100) + '%)</th></tr></thead><tbody>'
+      + '<tr><td>' + R(v.v14) + '</td><td>' + R(v.v28) + '</td><td>' + R(v.v90) + '</td><td><b>' + R(v.v) + '</b></td></tr></tbody></table>';
+    if ((d.warehouses || []).length) h += '<div class="npd-sec">창고별 재고</div><table class="npd-tbl"><thead><tr><th>창고</th><th>위치</th><th>재고</th></tr></thead><tbody>'
+      + d.warehouses.map(w => '<tr><td>' + escapeHtml(w.wh) + (w.code ? ' <span style="font-size:10px;color:var(--text-3)">(' + escapeHtml(w.code) + ')</span>' : '') + '</td><td>' + escapeHtml(w.loc) + '</td><td' + (w.qty < 0 ? ' style="color:#dc2626"' : '') + '>' + fmtInt(w.qty) + '</td></tr>').join('') + '</tbody></table>';
+    if ((d.wo || []).length) h += '<div class="npd-sec">미마감 생산지시</div><table class="npd-tbl"><thead><tr><th>지시번호</th><th>지시일</th><th>완료예정</th><th>지시</th><th>실적</th><th>남은 수량</th></tr></thead><tbody>'
+      + d.wo.map(w => '<tr' + (w.old ? ' class="part"' : '') + '><td>' + escapeHtml(w.no) + '</td><td>' + escapeHtml(w.date) + (w.old ? ' <span style="font-size:10px;color:#b45309">60일↑</span>' : '') + '</td><td>'
+          + (w.due ? escapeHtml(w.due) + (w.late ? ' <span style="font-size:10px;color:#dc2626">지남</span>' : '') : '<span style="color:var(--text-3)">미정</span>') + '</td><td>' + fmtInt(w.qty) + '</td><td>' + fmtInt(w.done) + '</td><td><b>' + fmtInt(w.rem) + '</b></td></tr>').join('') + '</tbody></table>';
+    if ((d.wp || []).length) h += '<div class="npd-sec">외주 미입고 (최근 120일 발주)</div><table class="npd-tbl"><thead><tr><th>발주일</th><th>거래처</th><th>발주</th><th>입고</th><th>남은 수량</th></tr></thead><tbody>'
+      + d.wp.map(w => '<tr><td>' + escapeHtml(w.date) + '</td><td>' + escapeHtml(w.vendor) + '</td><td>' + fmtInt(w.qty) + '</td><td>' + fmtInt(w.rcv) + '</td><td><b>' + fmtInt(w.rem) + '</b></td></tr>').join('') + '</tbody></table>';
+    if ((d.channels || []).length) h += '<div class="npd-sec">채널별</div><table class="npd-tbl"><thead><tr><th>채널</th><th>최근 28일 납품</th><th>하루 매장 판매</th><th>채널 재고</th><th>채널 재고 일수</th><th>마지막 납품</th></tr></thead><tbody>'
+      + d.channels.map(c => '<tr><td>' + escapeHtml(c.name) + '</td><td>' + fmtInt(c.dl28) + '</td><td>' + (c.pos_d != null ? c.pos_d : '-') + '</td><td>' + (c.stock != null ? fmtInt(c.stock) : '-') + '</td><td>'
+          + (c.cover != null ? c.cover + '일' : '-') + '</td><td>' + md(c.last_dl) + '</td></tr>').join('') + '</tbody></table>';
+    h += _ld.itemBtn(x.code);
+    document.getElementById('lensd-body').innerHTML = h;
+    drawLensdChart();
+  }
+  // 채널 품절 경보 (2026-10-06: 품번 정보 대신 채널 재고 상세)
+  function openChsDetail(ch, sku) { _lensdMode = ''; _openLens('chs', '/api/channel_stock_detail?channel=' + encodeURIComponent(ch) + '&sku=' + encodeURIComponent(sku), '🏬 채널 품절 · ' + sku, '#ea580c', sku); }
+  function renderChsDetail() {
+    const d = _lensd, x = d.item, s = d.supply, R = _ld.R, md = _ld.md;
+    const lv = CH_LV[x.level] || CH_LV.warning;
+    const where = x.channel_type === 'online' ? '센터' : '매장';
+    document.getElementById('lensd-title').textContent = x.name;
+    document.getElementById('lensd-badge').textContent = '🏬 ' + lv[0] + ' · ' + x.channel_name + ' · ' + (x.code || 'SKU ' + x.sku);
+    const dd = (a, b) => Math.round((new Date(a) - new Date(b)) / 864e5);
+    let why = '<b>' + escapeHtml(x.channel_name) + '</b> ' + where + ' 재고 ';
+    if (x.stock <= 0) why += '<b style="color:#dc2626">0개</b>(' + md(x.stock_date) + ' 기준) — 최근 14일 하루 <b>' + x.pos_d + '개</b>씩 팔리던 품목이라 하루 약 ' + R(x.pos_d) + '개씩 판매 기회를 놓치고 있습니다.';
+    else why += '<b>' + fmtInt(x.stock) + '개</b>(' + md(x.stock_date) + ' 기준), 최근 14일 하루 <b>' + x.pos_d + '개</b>씩 팔려 '
+      + (x.cover < 1 ? '<b style="color:#dc2626">하루치도 안 됩니다</b> → 곧 품절.' : '<b>' + x.cover + '일분</b> → <b>' + md(d.out_date) + '</b>쯤 품절 예상.');
+    let late = false, after = false;
+    if (d.since != null) {
+      why += '<br>마지막 납품 <b>' + md(x.last_delivery) + ' ' + fmtInt(x.last_delivery_qty) + '개</b>(' + d.since + '일 전)';
+      if (d.med_gap) {
+        why += ', 평소 <b>' + d.med_gap + '일마다 ' + fmtInt(d.avg_qty) + '개</b>씩 납품';
+        late = d.next_dl < d.as_of;
+        after = !late && d.next_dl > d.out_date;
+        if (late) why += ' → 평소대로면 ' + md(d.next_dl) + '에 들어왔어야 하는데 <b style="color:#dc2626">' + dd(d.as_of, d.next_dl) + '일 늦어지고</b> 있습니다';
+        else why += ' → 다음 납품 예상 <b>' + md(d.next_dl) + '</b>' + (after ? ' <b style="color:#dc2626">(품절 뒤)</b>' : ' (품절 전)');
+      }
+      why += '.';
+    } else why += '<br>최근 납품 기록이 없습니다.';
+    if (s) why += '<br>우리 창고 <b>' + fmtInt(s.stock) + '개</b>' + (s.cov_weeks != null ? '(' + s.cov_weeks + '주분)' : '')
+      + (s.stock <= 0 ? ' — <b style="color:#dc2626">창고도 비어 있습니다</b>' : ' — 납품할 물건은 있습니다') + (d.f > 1 ? ' <span style="color:var(--text-3)">(창고는 낱개 기준, 이 SKU = 낱개 ' + d.f + '개)</span>' : '') + '.';
+    if (x.stale) why += '<br><span style="color:#b45309">⚠ 최근 7일 재고값이 그대로입니다 — 채널 재고 자료가 갱신되지 않았을 수 있어 실제와 다를 수 있습니다.</span>';
+    if (d.pos_days14 < 14) why += '<br><span style="color:var(--text-3)">최근 14일 중 판매 자료가 들어온 날은 ' + d.pos_days14 + '일입니다.</span>';
+    let act;
+    if (s && s.stock <= 0) act = '우리 창고도 비어 있어 <b>생산·입고가 먼저</b>입니다 — 수급 상세에서 생산 일정을 확인하세요.';
+    else if (late || after || !d.med_gap) act = '<b>채널 발주가 들어왔는지 확인</b>하고, 아직이면 담당 MD에게 발주를 요청하세요' + (s && s.stock > 0 ? ' (우리 창고 재고로 바로 납품 가능)' : '') + '.';
+    else act = '평소 주기대로 납품되면 품절 전에 채워집니다. 발주서가 들어왔는지만 확인하세요.';
+    let h = '<div class="npd-why" style="background:#fff7ed;border-color:#fed7aa">' + why + '<br>→ ' + act + '</div>';
+    h += '<div class="npd-kpis">' + _ld.kpi('채널 재고', fmtInt(x.stock), md(x.stock_date) + ' 기준') + _ld.kpi('하루 판매', String(x.pos_d), '최근 14일')
+      + _ld.kpi('버티는 기간', x.stock <= 0 ? '품절' : (x.cover < 1 ? '1일 미만' : x.cover + '일'), x.stock <= 0 || x.cover < 1 ? '' : md(d.out_date) + ' 품절 예상')
+      + _ld.kpi('마지막 납품', md(x.last_delivery), d.since != null ? d.since + '일 전' : '')
+      + _ld.kpi('평소 납품', d.med_gap ? d.med_gap + '일마다' : '-', d.med_gap ? fmtInt(d.avg_qty) + '개씩' : '')
+      + _ld.kpi('우리 창고', s ? fmtInt(s.stock) : (x.ours != null ? fmtInt(x.ours) : '-'), s && s.cov_weeks != null ? s.cov_weeks + '주분' : '') + '</div>';
+    h += _ld.chartBlock('채널 재고 · 판매 · 납품', '');
+    h += '<div class="npd-sec">납품 이력 (최근 180일, 최신순)</div><table class="npd-tbl"><thead><tr><th>납품일</th><th>수량</th><th>직전 납품과 간격</th></tr></thead><tbody>'
+      + (d.history || []).slice().reverse().slice(0, 15).map(r => '<tr><td>' + escapeHtml(r.date) + '</td><td>' + fmtInt(r.qty) + '</td><td>' + (r.gap != null ? r.gap + '일' : '-') + '</td></tr>').join('')
+      + (d.since != null ? '<tr class="part"><td>지금(' + md(d.as_of) + ')</td><td>-</td><td><b' + (late ? ' style="color:#dc2626"' : '') + '>' + d.since + '일째</b></td></tr>' : '')
+      + '</tbody></table>';
+    if ((d.others || []).length) h += '<div class="npd-sec">같은 품번 다른 채널 재고</div><table class="npd-tbl"><thead><tr><th>채널</th><th>채널 재고</th><th>하루 판매</th><th>버티는 기간</th><th>마지막 납품</th></tr></thead><tbody>'
+      + d.others.map(o => '<tr><td>' + escapeHtml(o.name) + '</td><td>' + fmtInt(o.stock) + (o.stale ? ' <span style="font-size:10px;color:var(--text-3)">(정체)</span>' : '') + '</td><td>' + o.pos_d + '</td><td'
+          + (o.level === 'out' || o.level === 'critical' ? ' style="color:#dc2626"' : '') + '>' + (o.stock <= 0 ? '품절' : o.cover + '일') + '</td><td>' + md(o.last_delivery) + '</td></tr>').join('') + '</tbody></table>';
+    if (x.code) h += '<div style="text-align:right;display:flex;gap:6px;justify-content:flex-end">'
+      + (s ? '<button class="vk-chip" style="padding:6px 12px" onclick="openPlanDetail(&quot;' + s.code + '&quot;)">📦 수급 상세 열기</button>' : '')
+      + '<button class="vk-chip" style="padding:6px 12px" onclick="openItemModal(&quot;' + x.code + '&quot;)">📦 품목 정보(BOM·재고) 열기</button></div>';
+    document.getElementById('lensd-body').innerHTML = h;
+    drawLensdChart();
+  }
+
+  // ───── 납품 vs 실판매 괴리 상세 모달 (2026-10-06) ─────
+  let _gapd = null, _gapdMode = 'd', _gapdChart = null;
+  function closeGapDetail() {
+    document.getElementById('gap-modal').classList.remove('show');
+    if (_gapdChart) { _gapdChart.destroy(); _gapdChart = null; }
+  }
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && document.getElementById('gap-modal').classList.contains('show')) closeGapDetail(); });
+  async function openGapDetail(code) {
+    document.getElementById('gap-modal').classList.add('show');
+    document.getElementById('gapd-title').textContent = code;
+    const body = document.getElementById('gapd-body');
+    body.innerHTML = '<div class="loading">로딩 중...</div>';
+    try {
+      const d = await (await fetch('/api/sales_gap_detail?code=' + encodeURIComponent(code))).json();
+      if (d.error) throw new Error(d.error);
+      _gapd = d; _gapdMode = 'd';
+      renderGapDetail();
+    } catch (e) { body.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
+  }
+  function setGapdMode(m) {
+    _gapdMode = m;
+    document.querySelectorAll('#gapd-mode .vk-chip').forEach(b => b.classList.toggle('on', b.dataset.m === m));
+    drawGapdChart();
+  }
+  function renderGapDetail() {
+    const d = _gapd, x = d.item, s = d.supply || {};
+    const R = v => fmtInt(Math.round(v));
+    const md = t => t ? t.slice(5).replace('-', '/') : '-';
+    const over = x.level === 'over';
+    document.getElementById('gapd-title').textContent = x.name;
+    document.getElementById('gapd-badge').textContent = '🔎 ' + (over ? '채널에 쌓임' : '채널 소진 중') + ' · ' + x.code;
+    const diff = x.delivery - x.pos;
+    // 판매가 최근 7일에 급감했으면(시즌·행사 종료) 7일 속도로 재고 일수를 봄
+    const drop = d.pos14 > 0 && d.pos7 < d.pos14 * 0.3;
+    const rate = drop ? d.pos7 : d.pos14;
+    const slow = rate < 1;                                   // 하루 1개도 안 팔림 → 재고 일수 의미 없음
+    const cov0 = slow ? null : (drop ? d.cover7_days : d.cover_days);
+    const cov = cov0 == null ? null : (cov0 >= 10 ? Math.round(cov0) : cov0);
+    let why = md(d.from) + '~' + md(d.to) + ' 28일 동안 우리가 <b>' + fmtInt(x.delivery) + '개 납품</b>, 매장에서 <b>' + fmtInt(x.pos) + '개 팔림</b> → '
+      + (diff >= 0 ? '보낸 게 <b style="color:#c2410c">' + fmtInt(diff) + '개 더 많음</b>' : '팔린 게 <b style="color:#1d4ed8">' + fmtInt(-diff) + '개 더 많음</b>')
+      + (x.stock_change != null ? ' (채널 재고 ' + (x.stock_change >= 0 ? '+' : '') + fmtInt(x.stock_change) + ')' : '') + '.';
+    if (d.stock_last != null) why += '<br>지금 채널 재고 <b>' + fmtInt(d.stock_last) + '개</b>'
+      + (slow ? ' — 최근 매장 판매가 <b>거의 없어</b>(하루 1개 미만) 재고가 줄지 않고 있습니다' : (cov != null ? ' = 최근 매장 판매(하루 ' + R(rate) + '개) 기준 <b>' + cov + '일분</b>' : '')) + '.';
+    if (drop) why += '<br><b style="color:#b45309">최근 7일 매장 판매가 하루 ' + R(d.pos7) + '개로, 그 전 2주 평균(' + R(d.pos14) + '개)보다 크게 줄었습니다</b> — 시즌·행사가 끝났을 수 있습니다.';
+    // 납품 > 판매인데 채널 재고가 줄었다 = 매장 판매가 일부만 잡혔거나(다른 센터·매장) 재고 기준이 다름 → 판단 주의
+    if (x.stock_change != null && diff * x.stock_change < 0)
+      why += '<br><span style="color:#b45309">⚠ ' + (diff >= 0 ? '판매보다 많이 보냈는데 채널 재고는 오히려 ' + fmtInt(-x.stock_change) + '개 줄었습니다'
+                                                       : '판매보다 적게 보냈는데 채널 재고는 오히려 ' + fmtInt(x.stock_change) + '개 늘었습니다')
+        + '. 매장 판매(POS)나 재고가 일부 매장·센터만 잡혔을 수 있어 해석에 주의가 필요합니다.</span>';
+    let act = '';
+    if (over) act = (slow || (cov != null && cov > 30)) ? '채널 재고가 넉넉해 <b>당분간 발주가 줄거나 끊길 가능성</b>이 큽니다. 생산·입고 계획을 늦출지 검토하세요.'
+                                           : '보낸 양이 판매보다 많아 채널에 재고가 쌓이는 중입니다. 다음 발주량이 줄 수 있습니다.';
+    else if (slow) act = '판매보다 덜 보냈지만 최근엔 거의 팔리지 않아 <b>지금은 납품이 필요 없는 상태</b>입니다(시즌 종료 품목이면 재고 처리 검토).';
+    else if (cov != null && cov >= 60) act = '판매보다 덜 보냈지만 채널 재고가 ' + cov + '일분으로 충분해 <b>지금은 납품이 필요 없는 상태</b>입니다(급하지 않음).';
+    else if (cov != null && cov < 14) act = '채널 재고가 ' + cov + '일분뿐이라 <b>곧 추가 발주가 올 가능성</b>이 높습니다.'
+      + (s.stock != null ? ' 우리 창고 ' + fmtInt(s.stock) + '개(' + s.cov_weeks + '주분)' + (s.level === 'out' || s.level === 'critical' ? ' — <b style="color:#dc2626">대응 재고가 부족합니다</b>.' : ' — 대응 가능합니다.') : '');
+    else act = '채널 재고가 줄고 있어 앞으로 추가 발주가 올 수 있습니다.';
+    let h = '<div class="npd-why" style="background:#f0fdfa;border-color:#99f6e4">' + why + '<br>→ ' + act + '</div>';
+    const kpi = (l, val, sub) => '<div>' + l + '<b>' + val + '</b>' + (sub ? '<span style="font-size:10px">' + sub + '</span>' : '') + '</div>';
+    h += '<div class="npd-kpis">'
+      + kpi('28일 납품', fmtInt(x.delivery), '') + kpi('28일 매장 판매', fmtInt(x.pos), '')
+      + kpi('납품 ÷ 판매', x.ratio != null ? (Math.round(x.ratio * 100) + '%') : '판매 0', '')
+      + kpi('채널 재고', d.stock_last != null ? fmtInt(d.stock_last) : '-', slow ? '판매 거의 없음' : (cov != null ? cov + '일분' : ''))
+      + kpi('매장 판매 속도', slow ? '1개 미만' : '하루 ' + R(rate), drop ? '최근 7일' : '최근 14일')
+      + kpi('우리 창고', s.stock != null ? fmtInt(s.stock) : '-', s.cov_weeks != null ? s.cov_weeks + '주분' : '') + '</div>';
+    h += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><span class="npd-sec" style="margin:0">납품 · 매장 판매 · 채널 재고</span>'
+      + '<div class="vk-chips" id="gapd-mode" style="margin-left:auto"><button class="vk-chip on" data-m="d" onclick="setGapdMode(&quot;d&quot;)">최근 28일</button>'
+      + '<button class="vk-chip" data-m="w" onclick="setGapdMode(&quot;w&quot;)">12주</button></div></div>'
+      + '<div class="npd-chart-wrap"><canvas id="gapdChart"></canvas></div><div class="npd-note" id="gapd-note"></div>';
+    h += '<div class="npd-sec">채널별 (최근 28일)</div><table class="npd-tbl"><thead><tr><th>채널</th><th>납품</th><th>납품 횟수</th><th>매장 판매</th><th>납품 ÷ 판매</th><th>채널 재고 (28일 전 → 지금)</th></tr></thead><tbody>'
+      + d.channels.map(c => '<tr><td>' + escapeHtml(c.name) + '</td><td>' + fmtInt(c.dl) + '</td><td>' + c.orders + '회</td><td>' + fmtInt(c.pos) + '</td><td>'
+          + (c.ratio != null ? Math.round(c.ratio * 100) + '%' : '-') + '</td><td>'
+          + (c.stock_last != null ? fmtInt(c.stock_first) + ' → <b>' + fmtInt(c.stock_last) + '</b> (' + (c.stock_last - c.stock_first >= 0 ? '+' : '') + fmtInt(c.stock_last - c.stock_first) + ')' : '<span style="color:var(--text-3)">재고 자료 없음</span>') + '</td></tr>').join('')
+      + '</tbody></table>';
+    h += '<div style="text-align:right"><button class="vk-chip" style="padding:6px 12px" onclick="openItemModal(&quot;' + x.code + '&quot;)">📦 품목 정보(BOM·재고) 열기</button></div>';
+    document.getElementById('gapd-body').innerHTML = h;
+    drawGapdChart();
+  }
+  function drawGapdChart() {
+    const d = _gapd; const cv = document.getElementById('gapdChart'); if (!d || !cv) return;
+    if (_gapdChart) _gapdChart.destroy();
+    const daily = _gapdMode === 'd';
+    const rows = daily ? d.days : d.weeks;
+    const ds = [
+      { type: 'bar', label: '납품', data: rows.map(r => r.dl), backgroundColor: '#cbd5e1', borderRadius: 3, order: 2 },
+      { type: 'bar', label: '매장 판매', data: rows.map(r => r.pos), backgroundColor: '#16a34a', borderRadius: 3, order: 2 },
+    ];
+    if (daily) ds.push({ type: 'line', label: '채널 재고', data: rows.map(r => r.stock), yAxisID: 'y2', borderColor: '#f59e0b', backgroundColor: '#f59e0b',
+                         borderWidth: 2, pointRadius: 1.5, tension: 0.25, spanGaps: true, order: 1 });
+    _gapdChart = new Chart(cv, {
+      data: { labels: daily ? rows.map(r => r.d + '(' + r.wd + ')') : rows.map(r => r.w + (r.days < 7 ? '*' : '')), datasets: ds },
+      options: { responsive: true, maintainAspectRatio: false, animation: { duration: 250 }, interaction: { mode: 'index', intersect: false },
+        plugins: { legend: { labels: { boxWidth: 11, font: { size: 10.5 } } },
+                   tooltip: { callbacks: { title: it => daily ? rows[it[0].dataIndex].date : (rows[it[0].dataIndex].w + '~' + rows[it[0].dataIndex].to + ' (' + rows[it[0].dataIndex].days + '일)'),
+                                           label: c => c.dataset.label + ': ' + (c.parsed.y == null ? '-' : fmtInt(c.parsed.y) + '개') } } },
+        scales: { x: { grid: { display: false }, ticks: { font: { size: 10 }, maxRotation: 0, autoSkip: true } },
+                  y: { beginAtZero: true, ticks: { font: { size: 10 }, callback: v => fmtInt(v) }, grid: { color: '#eef2f7' }, title: { display: true, text: '납품·판매', font: { size: 10 } } },
+                  y2: { display: daily, position: 'right', beginAtZero: true, ticks: { font: { size: 10 }, callback: v => fmtInt(v) }, grid: { display: false }, title: { display: true, text: '채널 재고', font: { size: 10 } } } } }
+    });
+    document.getElementById('gapd-note').textContent = daily
+      ? '회색 막대: 우리가 납품한 수량 · 초록 막대: 매장 판매(POS) · 주황 선: 채널 재고(오른쪽 축). 납품이 판매보다 많으면 채널 재고가 오르고, 적으면 내려갑니다.'
+      : '최근 12주 주별 납품·매장 판매 (같은 채널 기준) · * 는 며칠치뿐인 주';
+  }
+
   // ───── 채널 공급단가 상세 모달 (2026-09-29) ─────
   let _cpcd = null, _cpcdChart = null;
   function closeCpcDetail() {
@@ -15862,7 +17214,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         const tc = x.top_channel ? ' · ' + escapeHtml(x.top_channel.name) + (Math.round(x.top_channel.r14) === Math.round(x.r14) && Math.round(x.top_channel.r28) === Math.round(x.r28) ? ' 단독' : ' ' + R(x.top_channel.r28) + '→' + R(x.top_channel.r14)) : '';
         const extra = (x.ch_stock != null ? ' · 채널재고 ' + fmtInt(x.ch_stock) : '') + (x.vel != null ? ' · 발주 계산 속도 하루 ' + R(x.vel) : '');
         const big = x.pct == null ? '신규' : (x.pct > 0 ? '+' : '') + fmtInt(x.pct) + '%';
-        return '<div class="alert-row" onclick="openItemModal(&quot;' + x.code + '&quot;)">' + badge
+        return '<div class="alert-row" onclick="openShiftDetail(&quot;' + x.code + '&quot;)" title="클릭 = 일별 매장 판매·채널별 변화 상세">' + badge
           + '<div><div class="alert-name">' + escapeHtml(x.name) + '</div>'
           + '<div class="alert-code">' + escapeHtml(x.code) + ' · 하루 <b>' + R(x.r28) + '</b> → <b style="color:' + col + '">' + R(x.r14) + '</b>개' + tc + extra
           + (so ? ' · <span style="color:#b45309">' + escapeHtml(x.note) + '</span>' : '') + '</div></div>'
@@ -15894,7 +17246,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
           + (m.value ? ' (' + won(m.value) + ')' : '') + (m.unknown_users ? ' <span class="warn" title="판매자료에 안 나오는 다른 완제품도 이 자재를 씀">⚠ 다른 제품 ' + m.unknown_users + '개도 사용</span>' : '')
           + (m.shared && m.shared.length > 1 ? ' <span style="color:var(--text-3)">(' + escapeHtml(m.shared.join('·')) + ' 공용)</span>' : '') + '</span>').join('');
         const tot = (x.mat_value || 0) + (x.ours_value || 0);   // ⚠ 다른 제품도 쓰는 자재는 합계에서 뺌
-        return '<div class="alert-row" onclick="openItemModal(&quot;' + x.code + '&quot;)">'
+        return '<div class="alert-row" onclick="openDormDetail(&quot;' + x.code + '&quot;)" title="클릭 = 월별 납품·판매 이력·전용 자재 상세">'
           + '<span class="alert-badge" style="' + st[1] + '">' + st[0] + '</span>'
           + '<div><div class="alert-name">' + escapeHtml(x.name) + '</div>'
           + '<div class="alert-code">' + escapeHtml(x.code) + ' · 마지막 납품 ' + x.last_delivery.slice(5).replace('-', '/') + ' (' + x.days_since + '일 전) · 올해 납품 ' + fmtInt(x.total_delivery)
@@ -15935,7 +17287,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         const chInfo = (x.pos_d != null ? ' · 매장 하루 ' + fmtInt(Math.round(x.pos_d)) + '개' : '')
           + (x.ch_stock != null ? ' · 채널재고 ' + fmtInt(x.ch_stock) + (x.cover_days != null ? ' (' + fmtInt(Math.round(x.cover_days)) + '일분)' : '') : '')
           + ' · 창고 ' + fmtInt(x.ours);
-        return '<div class="alert-row" onclick="openItemModal(&quot;' + x.code + '&quot;)" title="' + st[2] + '">'
+        return '<div class="alert-row" data-ch="' + escapeHtml(x.channel) + '" data-code="' + escapeHtml(x.code) + '" onclick="openDgapDetail(this.dataset.ch, this.dataset.code)" title="' + st[2] + ' · 클릭 = 납품 이력·일별 흐름 상세">'
           + '<span class="alert-badge" style="' + st[1] + '">' + st[0] + '</span>'
           + '<div><div class="alert-name">' + escapeHtml(x.name) + '</div>'
           + '<div class="alert-code">' + escapeHtml(x.code) + ' · <b>' + escapeHtml(x.channel_name) + '</b> · 평소 ' + x.med_gap + '일마다 ' + fmtInt(x.avg_qty) + '개 → 마지막 ' + x.last_delivery.slice(5).replace('-', '/') + chInfo + '</div>'
@@ -16314,7 +17666,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       const dl = x.last_delivery ? ' · 최근납품 ' + x.last_delivery.slice(5).replace('-', '/') + ' ' + fmtInt(x.last_delivery_qty) : '';
       const ours = (x.ours != null) ? ' · 우리재고 ' + fmtInt(x.ours) : '';
       const stale = x.stale ? ' <span style="color:#94a3b8" title="최근 7일 재고값이 변하지 않음 — 채널 재고 스냅샷이 갱신되지 않았을 수 있음">(재고값 정체)</span>' : '';
-      const click = x.code ? ' onclick="openItemModal(\\'' + x.code + '\\')"' : '';
+      // 클릭 = 이 채널·SKU 재고 상세 (2026-10-06: 품번 정보 대신)
+      const click = ' data-ch="' + escapeHtml(x.channel) + '" data-sku="' + escapeHtml(String(x.sku)) + '" onclick="openChsDetail(this.dataset.ch, this.dataset.sku)" title="클릭 = 채널 재고 흐름·납품 주기·다음 납품 예상"';
       return '<div class="alert-row"' + click + '>'
         + '<span class="alert-badge ' + cls + '">' + lb + '</span>'
         + '<div><div class="alert-name">' + escapeHtml(x.name) + '<span class="ch-tag' + (x.channel_type === 'online' ? ' on' : '') + '">' + escapeHtml(x.channel_name) + '</span></div>'
@@ -16445,24 +17798,110 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     if (typeof _phChart !== 'undefined' && _phChart) { _phChart.destroy(); _phChart = null; }
     const badge = document.getElementById('cd-badge'); badge.textContent = '거래처 입력'; badge.style.background = 'linear-gradient(135deg,#dc2626,#f87171)';
     document.getElementById('cd-title').textContent = '외주 재고 거래처 셀프 입력';
-    document.getElementById('cd-sub').textContent = '거래처에 링크를 보내면 로그인 없이 품번별 재고를 입력합니다. 저장 즉시 재고경고·거래처 페이지·마감에 반영됩니다.';
+    document.getElementById('cd-sub').textContent = '거래처에 링크를 보내면 로그인 없이 일별 사용량·입고를 입력합니다. 카톡으로 받은 거래처 엑셀은 아래에 올리면 같은 화면에 채워집니다. 저장 즉시 재고경고·거래처 페이지·마감에 반영됩니다.';
     const body = document.getElementById('cd-body'); body.innerHTML = '<div class="loading" style="padding:20px">로딩 중...</div>';
     try {
-      const d = await (await fetch('/api/vendor_links')).json();
-      const cell = 'padding:8px 10px;border-bottom:1px solid #f1f5f9;vertical-align:middle';
-      body.innerHTML = '<table style="width:100%;font-size:12.5px;border-collapse:collapse"><thead><tr style="background:#f8fafc;color:#64748b;font-size:11px"><th style="' + cell + ';text-align:left">거래처</th><th style="' + cell + '">품목</th><th style="' + cell + ';text-align:left">최근 입력</th><th style="' + cell + '">이번달</th><th style="' + cell + ';text-align:left">링크</th></tr></thead><tbody>'
-        + (d.items || []).map(v => '<tr><td style="' + cell + ';font-weight:700">' + escapeHtml(v.vendor) + '</td><td style="' + cell + ';text-align:center">' + v.items + '</td>'
-          + '<td style="' + cell + '">' + (v.last_at ? v.last_at + ' <span style="color:#94a3b8">' + escapeHtml(v.last_by || '') + '</span>' : '<span style="color:#cbd5e1">없음</span>') + '</td>'
-          + '<td style="' + cell + ';text-align:center">' + (v.month_count ? v.month_codes + '품목 · ' + v.month_count + '건' : '-') + '</td>'
-          + '<td style="' + cell + '"><input readonly value="' + escapeHtml(v.url) + '" style="width:260px;font-size:11px;padding:4px 6px;border:1px solid #e2e8f0;border-radius:6px;color:#475569" onclick="this.select()"> '
-          + '<button class="po-cal-btn" onclick="navigator.clipboard.writeText(&quot;' + escapeHtml(v.url) + '&quot;).then(()=>{this.textContent=&quot;복사됨&quot;;setTimeout(()=>this.textContent=&quot;복사&quot;,1500)})">복사</button> '
-          + '<a class="po-cal-btn" href="' + escapeHtml(v.url) + '" target="_blank" style="text-decoration:none">열기</a></td></tr>').join('')
-        + '</tbody></table>'
-        + '<div style="margin-top:12px;font-size:11px;color:#94a3b8">링크는 거래처별 고유 토큰이라 외부에 공유하지 마세요. 입력값은 원본 재고 파일보다 나중 것만 적용되며, 구매팀이 마감 파일을 새로 만들면 그 시점 이전 입력은 파일 값으로 흡수됩니다.'
-        + (d.pull && d.pull.last_run ? ' · GCP 동기화 ' + d.pull.last_run + (d.pull.error ? ' (오류: ' + escapeHtml(d.pull.error) + ')' : ' 정상') : '') + '</div>'
+      body.innerHTML = '<div id="vl-table"><div class="loading">로딩 중...</div></div>'
+        + '<div id="vup-box" style="margin-top:14px;padding:12px;border:1.5px dashed #a5b4fc;border-radius:10px;background:#f5f7ff">'
+        + '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><b style="font-size:13px">📤 거래처 재고 엑셀 올리기</b>'
+        + '<label class="po-cal-btn" style="cursor:pointer">파일 선택<input type="file" id="vup-file" accept=".xlsx,.xlsm" multiple style="display:none" onchange="vupPick(this.files)"></label>'
+        + '<span id="vup-names" style="font-size:11.5px;color:#475569">또는 이 칸에 파일을 끌어다 놓기 (여러 개 가능)</span>'
+        + '<button class="po-cal-btn" id="vup-apply" style="margin-left:auto;display:none;background:#4f46e5;color:#fff;border-color:#4f46e5" onclick="vupSend(true)">적용</button></div>'
+        + '<div style="font-size:11px;color:#64748b;margin-top:6px;line-height:1.5">거래처가 보낸 <b>원자재부자재 재고파악(N월) - 거래처명.xlsx</b>(또는 취합본)를 올리면 <b>일별 사용·생산·출고</b>와 <b>입고일지</b>가 각 거래처 화면에 초록색으로 채워집니다. '
+        + '먼저 바뀌는 칸 수를 보여 드리고, <b>[적용]</b>을 눌러야 반영됩니다. 엑셀에 비어 있는 칸은 예전에 엑셀로 올린 값만 지우고, 거래처가 화면에 직접 적은 값은 그대로 둡니다.</div>'
+        + '<div id="vup-result" style="margin-top:8px"></div></div>'
         + '<div id="closing-box" style="margin-top:14px;padding:12px;border:1px solid #e2e8f0;border-radius:10px;background:#fafafa"><div class="loading">마감 상태 확인 중...</div></div>';
+      const box = document.getElementById('vup-box');
+      box.addEventListener('dragover', e => { e.preventDefault(); box.style.background = '#e0e7ff'; });
+      box.addEventListener('dragleave', () => { box.style.background = '#f5f7ff'; });
+      box.addEventListener('drop', e => { e.preventDefault(); box.style.background = '#f5f7ff'; vupPick(e.dataTransfer.files); });
+      _vupFiles = [];
+      await loadVendorLinkTable();
       loadClosingStatus();
     } catch (e) { body.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
+  }
+  async function loadVendorLinkTable() {
+    const el = document.getElementById('vl-table'); if (!el) return;
+    const d = await (await fetch('/api/vendor_links')).json();
+    const cell = 'padding:8px 10px;border-bottom:1px solid #f1f5f9;vertical-align:middle';
+    el.innerHTML = '<table style="width:100%;font-size:12.5px;border-collapse:collapse"><thead><tr style="background:#f8fafc;color:#64748b;font-size:11px"><th style="' + cell + ';text-align:left">거래처</th><th style="' + cell + '">품목</th><th style="' + cell + ';text-align:left">최근 입력</th><th style="' + cell + '">이번달</th><th style="' + cell + ';text-align:left">링크</th></tr></thead><tbody>'
+      + (d.items || []).map(v => '<tr><td style="' + cell + ';font-weight:700">' + escapeHtml(v.vendor) + '</td><td style="' + cell + ';text-align:center">' + v.items + '</td>'
+        + '<td style="' + cell + '">' + (v.last_at ? v.last_at + ' <span style="color:#94a3b8">' + escapeHtml(v.last_by || '') + '</span>' : '<span style="color:#cbd5e1">없음</span>') + '</td>'
+        + '<td style="' + cell + ';text-align:center" title="일별 ' + (v.month_days || 0) + '칸 · 입고 ' + (v.month_in || 0) + '건 · 실사 ' + (v.month_sets || 0) + '건">' + (v.month_count ? v.month_codes + '품목 · ' + fmtInt(v.month_count) + '칸' : '-') + '</td>'
+        + '<td style="' + cell + '"><input readonly value="' + escapeHtml(v.url) + '" style="width:260px;font-size:11px;padding:4px 6px;border:1px solid #e2e8f0;border-radius:6px;color:#475569" onclick="this.select()"> '
+        + '<button class="po-cal-btn" onclick="navigator.clipboard.writeText(&quot;' + escapeHtml(v.url) + '&quot;).then(()=>{this.textContent=&quot;복사됨&quot;;setTimeout(()=>this.textContent=&quot;복사&quot;,1500)})">복사</button> '
+        + '<a class="po-cal-btn" href="' + escapeHtml(v.url) + '" target="_blank" style="text-decoration:none">열기</a></td></tr>').join('')
+      + '</tbody></table>'
+      + '<div style="margin-top:12px;font-size:11px;color:#94a3b8">링크는 거래처별 고유 토큰이라 외부에 공유하지 마세요. 입력값은 원본 재고 파일보다 나중 것만 적용되며, 구매팀이 마감 파일을 새로 만들면 그 시점 이전 입력은 파일 값으로 흡수됩니다.'
+      + (d.pull && d.pull.last_run ? ' · GCP 동기화 ' + d.pull.last_run + (d.pull.error ? ' (오류: ' + escapeHtml(d.pull.error) + ')' : ' 정상') : '') + '</div>';
+  }
+  // ───── 거래처 재고 엑셀 업로드 (2026-10-08) ─────
+  let _vupFiles = [];
+  function vupPick(fl) {
+    _vupFiles = Array.from(fl || []).filter(f => /[.]xls[xm]$/i.test(f.name));
+    document.getElementById('vup-names').textContent = _vupFiles.length ? _vupFiles.map(f => f.name).join(', ') : '엑셀(.xlsx) 파일을 골라 주세요';
+    document.getElementById('vup-apply').style.display = 'none';
+    if (_vupFiles.length) vupSend(false);
+  }
+  async function vupSend(apply) {
+    const R = document.getElementById('vup-result'), btn = document.getElementById('vup-apply');
+    if (!_vupFiles.length) return;
+    R.innerHTML = '<span class="loading">' + (apply ? '반영 중...' : '엑셀 읽는 중... (파일당 10~30초)') + '</span>';
+    btn.disabled = true;
+    const fd = new FormData();
+    _vupFiles.forEach(f => fd.append('file', f));
+    if (apply) fd.append('apply', '1');
+    try {
+      const r = await fetch('/api/vendor_upload', { method: 'POST', body: fd });
+      const d = await r.json();
+      if (!d.ok) { R.innerHTML = '<span style="color:#dc2626">실패: ' + escapeHtml(d.error || ('HTTP ' + r.status)) + '</span>'; return; }
+      R.innerHTML = vupReport(d, apply);
+      btn.style.display = (!apply && d.records) ? '' : 'none';
+      if (apply) {
+        _vupFiles = []; document.getElementById('vup-file').value = '';
+        document.getElementById('vup-names').textContent = '반영 완료 — 위 표의 [열기]로 거래처 화면을 확인하세요';
+        loadVendorLinkTable();
+        const sel = document.getElementById('closing-ym'); loadClosingStatus(sel ? sel.value : undefined);
+      }
+    } catch (e) { R.innerHTML = '<span style="color:#dc2626">오류: ' + escapeHtml(e.message) + '</span>'; }
+    finally { btn.disabled = false; }
+  }
+  function vupReport(d, apply) {
+    const n = x => x ? '<b>' + fmtInt(x) + '</b>' : '<span style="color:#cbd5e1">0</span>';
+    const c = 'padding:5px 8px;border-bottom:1px solid #eef2f7;text-align:center';
+    let h = '';
+    (d.files || []).forEach(f => {
+      h += '<div style="font-size:12px;margin:8px 0 4px">📄 <b>' + escapeHtml(f.file) + '</b>'
+        + (f.error ? ' <span style="color:#dc2626">' + escapeHtml(f.error) + '</span>'
+                   : ' · ' + f.ym.slice(0, 4) + '년 ' + parseInt(f.ym.slice(4)) + '월' + (f.file_month_matches ? '' : ' <span style="color:#b45309">(대시보드 재고 파일은 아직 다른 달 — 비교 없이 엑셀 값 그대로 반영)</span>')
+                     + (f.warn ? ' <span style="color:#b45309">⚠ ' + escapeHtml(f.warn) + '</span>' : '')) + '</div>';
+      if (f.error) return;
+      h += '<table style="width:100%;font-size:11.5px;border-collapse:collapse;background:#fff;border-radius:8px;table-layout:fixed">'
+        + '<colgroup><col style="width:86px"><col style="width:60px">' + '<col style="width:56px">'.repeat(7) + '<col></colgroup><thead><tr style="background:#eef2ff;color:#475569">'
+        + '<th style="' + c + ';text-align:left">거래처</th><th style="' + c + '">맞춘 행</th><th style="' + c + '">일별 새로</th><th style="' + c + '">바뀜</th><th style="' + c + '">같음</th><th style="' + c + '">지움</th>'
+        + '<th style="' + c + '">입고 새로</th><th style="' + c + '">입고 이미 있음</th><th style="' + c + '">입고 지움</th><th style="' + c + ';text-align:left">확인할 점</th></tr></thead><tbody>'
+        + (f.vendors || []).map(v => {
+            const notes = [];
+            if (v.skip) notes.push('<span style="color:#94a3b8">' + escapeHtml(v.skip) + ' → 건너뜀</span>');
+            if (v.day_override) notes.push('<span style="color:#b45309">거래처가 화면에 적은 값과 달라 엑셀 값으로 바뀜 ' + v.day_override + '칸</span>');
+            if (v.kept) notes.push('엑셀엔 비어 있어 기존 값 유지 ' + v.kept + '칸');
+            if ((v.unmatched || []).length) notes.push('<span style="color:#b45309">대시보드에 없는 행 ' + v.unmatched.length + '개: ' + escapeHtml(v.unmatched.slice(0, 4).join(', ')) + '</span>');
+            if ((v.code_diff || []).length) notes.push('<span style="color:#b45309">품번이 대시보드 파일과 달라 같은 품명 행에 반영 ' + v.code_diff.length + '개: ' + escapeHtml(v.code_diff.slice(0, 4).join(', ')) + '</span>');
+            if (v.dup) notes.push('<span style="color:#b45309">한 행에 겹쳐 합산 ' + v.dup + '건</span>');
+            if ((v.in_unmatched || []).length) notes.push('<span style="color:#b45309">입고 품번이 이 거래처에 없음: ' + escapeHtml(v.in_unmatched.slice(0, 4).join(', ')) + '</span>');
+            if ((v.base_diff || []).length) notes.push('기초재고가 대시보드 파일과 다른 행 ' + v.base_diff.length + '개(대시보드 값 기준)');
+            return '<tr><td style="' + c + ';text-align:left;font-weight:700">' + escapeHtml(v.vendor) + '</td><td style="' + c + '">' + (v.rows ? v.matched + '/' + v.rows : '-') + '</td>'
+              + '<td style="' + c + '">' + n(v.day_new) + '</td><td style="' + c + '">' + n(v.day_changed) + '</td><td style="' + c + '">' + n(v.day_same) + '</td><td style="' + c + '">' + n(v.day_clear) + '</td>'
+              + '<td style="' + c + '">' + n(v.in_new) + '</td><td style="' + c + '">' + n(v.in_dup) + '</td><td style="' + c + '">' + n(v.in_del) + '</td>'
+              + '<td style="' + c + ';text-align:left;font-size:11px;line-height:1.45">' + (notes.join('<br>') || '<span style="color:#16a34a">이상 없음</span>') + '</td></tr>';
+          }).join('') + '</tbody></table>';
+    });
+    const bad = (d.files || []).filter(f => f.error).length;
+    h += '<div style="margin-top:8px;font-size:12.5px">' + (apply
+      ? '<b style="color:#16a34a">✅ ' + fmtInt(d.applied) + '칸 반영 완료</b>' + (d.via === 'gcp' ? ' <span style="color:#64748b">(GCP 서버에 기록 → 로컬로 ' + fmtInt(d.pulled || 0) + '건 가져옴)</span>' : '')
+      : (d.records ? '반영할 칸 <b>' + fmtInt(d.records) + '개</b> — 내용을 확인하고 <b>[적용]</b>을 누르세요' : '<span style="color:#64748b">바뀌는 칸이 없습니다 (이미 같은 값)</span>'))
+      + (bad ? ' · <span style="color:#dc2626">읽지 못한 파일 ' + bad + '개</span>' : '') + '</div>';
+    return h;
   }
   function _ymOpts() { const out = []; const d = new Date(); for (let i = 0; i < 3; i++) { const y = d.getFullYear(), m = d.getMonth() + 1; out.push(String(y) + String(m).padStart(2, '0')); d.setMonth(d.getMonth() - 1); } return out; }
   async function loadClosingStatus(ym) {
@@ -21775,7 +23214,8 @@ def export_source_csv():
     today = datetime.now().strftime('%Y%m%d')
     try:
         if DF is not None and not DF.empty:
-            DF.to_csv(f'{DATA_DIR}/{today}_재고일지.csv', index=False, encoding='utf-8-sig')
+            # 중복 제거 전 전체 행으로 내보냄 → GCP도 거래처 화면에 엑셀과 같은 행을 보여줌(재고 계산용 DF는 GCP 로드 때 같은 규칙으로 중복 제거)
+            _inv_full_df().to_csv(f'{DATA_DIR}/{today}_재고일지.csv', index=False, encoding='utf-8-sig')
             out['재고일지'] = len(DF)
         if JASA_DF is not None and not JASA_DF.empty:
             JASA_DF.to_csv(f'{DATA_DIR}/{today}_자사재고.csv', index=False, encoding='utf-8-sig')
