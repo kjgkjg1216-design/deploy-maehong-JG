@@ -12770,7 +12770,6 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     .chart-grid > .chart-panel > .alert-list { flex: 1 1 0; min-height: 310px; max-height: none; }
     .chart-grid > .chart-panel > .po-inline-list { flex: 1 1 0; min-height: 260px; max-height: none; }
   }
-  .plan-panel .chart-sub, .chstock-panel .chart-sub, .vendor-panel .chart-sub { display: block; margin-left: 0; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
   .ch-tag { display:inline-block; font-size:10px; font-weight:700; padding:1px 6px; border-radius:5px; margin-left:4px; background:#fff7ed; color:#c2410c; vertical-align:1px; }
   .ch-tag.on { background:#eff6ff; color:#1d4ed8; }
   .vk-chips { display:flex; gap:3px; background:#f1f5f9; border-radius:8px; padding:2px; }
@@ -12905,7 +12904,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     cursor: pointer; color: var(--text-3, #94a3b8); padding: 0 4px; }
   .ipsu-zoom-body .ipsu-cv { height: min(78vh, 900px); }
   .ipsu-zoom-sub { margin-top: 8px; font-size: 12px; color: var(--text-2, #475569); }
-  .ipsu-cv .cv-hint { position: absolute; bottom: 5px; left: 7px; font-size: 9.5px;
+  .ipsu-cv .cv-hint { position: absolute; bottom: 5px; left: 7px; font-size: 10px;
                       color: #94a3b8; pointer-events: none; }
   .ipsu-sh { margin: 0 0 5px; font-size: 12px; display: flex; justify-content: space-between; align-items: baseline; }
   .ipsu-sh .sc { font-size: 16px; font-weight: 800; color: #7c3aed; font-variant-numeric: tabular-nums; }
@@ -12925,7 +12924,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     display: grid; grid-template-columns: 1.55fr 1fr; gap: 12px;
   }
   .chart-panel.sales-panel { border-top: 3px solid #0ea5e9; }
-  .chart-panel.prod-panel { border-top: 3px solid #f59e0b; }
+  /* 발주·입고 추이: 옛 .prod-panel(그라데이션 배경·모서리 16·여백 18/22)이 남아 다른 패널과 달라 보였음 → 공통 패널 모양으로 (2026-10-23) */
+  .chart-panel.prod-panel { background: var(--surface); border: 1px solid var(--border); border-top: 3px solid #f59e0b;
+                            border-radius: 12px; padding: 12px 16px 10px; }
   .prod-chart-wrap { height: 240px; position: relative; }
   /* ───── 월 판매기반 자료 패널 ───── */
   .salesbase-strip { max-width: none; margin: 12px auto 0; padding: 0 var(--pg); }
@@ -12971,7 +12972,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .npd-tbl tr.part td { color: var(--text-3); }
   .npd-sec { font-size: 12px; font-weight: 800; color: var(--text); margin: 4px 0 6px; }
   @media (max-width: 768px) { .npd-kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); } .npd-chart-wrap { height: 220px; } .npd-tbl { font-size: 10.5px; } }
-  .np-kind { display: inline-block; font-size: 9.5px; font-weight: 700; padding: 0 5px; border-radius: 4px; margin-right: 4px; vertical-align: 1px; }
+  .np-kind { display: inline-block; font-size: 10px; font-weight: 700; padding: 0 5px; border-radius: 4px; margin-right: 4px; vertical-align: 1px; }
   .np-kind.new { background: #dcfce7; color: #15803d; } .np-kind.restart { background: #e0f2fe; color: #0369a1; }
   .abc-grades { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-bottom: 8px; }
   .abc-grades div { border-radius: 8px; padding: 5px 8px; font-size: 10.5px; color: var(--text-2); background: #f8fafc; border: 1px solid var(--border); }
@@ -12982,7 +12983,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .abc-legend { font-size: 10px; color: var(--text-3); line-height: 1.6; margin-bottom: 6px; }
   .abc-legend span { white-space: nowrap; margin-right: 8px; }
   .abc-legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 3px; vertical-align: 0; }
-  .abc-chip { display: inline-block; font-size: 9.5px; font-weight: 800; padding: 0 5px; border-radius: 4px; vertical-align: 1px; }
+  .abc-chip { display: inline-block; font-size: 10px; font-weight: 800; padding: 0 5px; border-radius: 4px; vertical-align: 1px; }
   .abc-chip.A { background: #ede9fe; color: #6d28d9; } .abc-chip.B { background: #f1f5f9; color: #475569; } .abc-chip.C { background: #fafafa; color: #94a3b8; border: 1px solid #e2e8f0; }
   .abc-grades div { cursor: pointer; transition: box-shadow .12s; }
   .abc-grades div:hover { box-shadow: 0 0 0 2px #c4b5fd; }
@@ -13018,14 +13019,14 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .sb-metric b { font-weight: 700; font-variant-numeric: tabular-nums; font-size: 11.5px; }
   .sb-metric.avg b { color: var(--text-2); }
   .sb-metric.m1 b  { color: #2f8576; }
-  .sb-metric i { font-style: normal; font-variant-numeric: tabular-nums; color: var(--text-3); font-size: 9.5px; }
-  .sb-list-head { display: flex; align-items: center; gap: 8px; padding: 2px 6px 5px; font-size: 9.5px; font-weight: 700; color: var(--text-3); border-bottom: 1.5px solid var(--border-2); }
+  .sb-metric i { font-style: normal; font-variant-numeric: tabular-nums; color: var(--text-3); font-size: 10px; }
+  .sb-list-head { display: flex; align-items: center; gap: 8px; padding: 2px 6px 5px; font-size: 10px; font-weight: 700; color: var(--text-3); border-bottom: 1.5px solid var(--border-2); }
   .sb-lh-name { flex: 1; min-width: 0; padding-left: 28px; }
   .sb-lh-avg, .sb-lh-m1 { width: 66px; flex: none; text-align: right; }
   .sb-lh-m1 { padding-left: 9px; }
   .sb-lh-avg { color: var(--text-2); }
   .sb-lh-m1 { color: #2f8576; }
-  .sb-cls { font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 4px; flex: none; }
+  .sb-cls { font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 4px; flex: none; }
   .sb-cls.jasa  { background:#ebeef9; color:#45589f; }
   .sb-cls.sagup { background:#f7efda; color:#927029; }
   .sb-cls.saip  { background:#e4f1ed; color:#2f8576; }
@@ -13052,6 +13053,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   }
   .sales-div-row .dv-name { color: var(--text-2); font-weight: 600; }
   .sales-div-row .dv-amt { font-weight: 800; color: #0369a1; font-variant-numeric: tabular-nums; }
+  @media (max-width: 1200px) {   /* 1024px 등 좁은 화면에서 월 매출 패널이 찌그러지던 것 → 한 줄씩 (2026-10-23) */
+    .sales-npd-strip { grid-template-columns: 1fr; }
+  }
   @media (max-width: 900px) {
     .sales-npd-strip { grid-template-columns: 1fr; padding: 0 12px; }
     .sales-body { flex-direction: column; }
@@ -13086,7 +13090,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .spec-row .sc-cat-단상자 { background: #fef3c7; color: #92400e; }
   .spec-row .sc-cat-rrp { background: #fee2e2; color: #b91c1c; }
   .spec-row .sc-div {
-    display: inline-block; font-size: 9.5px; font-weight: 700;
+    display: inline-block; font-size: 10px; font-weight: 700;
     padding: 2px 6px; border-radius: 6px; white-space: nowrap;
     overflow: hidden; text-overflow: ellipsis; max-width: 100%;
     background: #f1f5f9; color: #475569;
@@ -13133,7 +13137,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .kpi-chip .kpi-label { color: var(--text-3); font-weight: 600; }
   .kpi-chip .kpi-val { color: var(--c); font-weight: 800; font-variant-numeric: tabular-nums; }
   .kpi-chip .kpi-live {
-    font-size: 9px; font-weight: 700; color: #dc2626;
+    font-size: 10px; font-weight: 700; color: #dc2626;
     background: #fee2e2; padding: 1px 5px; border-radius: 999px;
   }
   .chart-wrap { position: relative; height: 200px; }
@@ -13516,7 +13520,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .cal-widget .cal-nav button:hover { background: #f1f5f9; color: var(--text); }
   .cal-widget .cal-ym { font-size: 11px; color: var(--text-2); font-weight: 600; min-width: 66px; text-align: center; font-variant-numeric: tabular-nums; }
   .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 1px; }
-  .cal-grid .dow { font-size: 9px; text-align: center; padding: 3px 0; color: var(--text-3); font-weight: 600; }
+  .cal-grid .dow { font-size: 10px; text-align: center; padding: 3px 0; color: var(--text-3); font-weight: 600; }
   .cal-grid .dow.sun { color: #dc2626; }
   .cal-grid .dow.sat { color: #2563eb; }
   .cal-cell { aspect-ratio: 1; font-size: 11px; display: flex; align-items: center; justify-content: center; border-radius: 5px; cursor: pointer; position: relative; color: var(--text-2); font-variant-numeric: tabular-nums; transition: all 0.1s; }
@@ -13598,7 +13602,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .pmini { flex: 1; background: #f8fafc; border: 1px solid var(--border); border-radius: 12px; padding: 10px 11px 11px; }
   .pmini-ym { font-size: 11.5px; font-weight: 700; color: var(--text-2); text-align: center; margin-bottom: 8px; letter-spacing: 0.02em; }
   .pmini-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 1px; }
-  .pmd-dow { font-size: 9.5px; text-align: center; color: var(--text-3); font-weight: 700; padding: 1px 0 3px; }
+  .pmd-dow { font-size: 10px; text-align: center; color: var(--text-3); font-weight: 700; padding: 1px 0 3px; }
   .pmd-dow.sun { color: #ef4444; } .pmd-dow.sat { color: #3b82f6; }
   .pmd-cell { font-size: 11px; text-align: center; color: var(--text-2); padding: 2.5px 0; font-variant-numeric: tabular-nums; }
   .pmd-cell.empty { color: transparent; }
@@ -13893,6 +13897,11 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   }
   .modal-close:hover { background: #f1f5f9; color: var(--text); }
   .modal-body { padding: 24px 28px; overflow-y: auto; flex: 1; }
+  /* 상세 창 제목·부제목 크기 통일 (창마다 15/16/18px로 달랐음 — 인라인 지정보다 우선, 2026-10-23) */
+  .modal-header h2 { font-size: 18px !important; }
+  .modal-header h2 + div { font-size: 12.5px !important; line-height: 1.5; }
+  .nt-modal .modal-header h2 { font-size: 20px !important; }
+  .nt-modal .modal-header h2 + div { font-size: 13px !important; }
 
   /* ───── 알림 센터 (2026-10-23 가독성 개선: 넓은 창·큰 글자·종류 필터·날짜 묶음·품번 강조) ───── */
   .nt-modal { max-width: min(1080px, 96vw) !important; height: min(880px, calc(100vh - 48px)); max-height: none !important; }
@@ -18361,7 +18370,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       if (_pcalcActualPrice > 0 && _pcalcBase
           && wInput === _pcalcBase.w && hInput === _pcalcBase.h && dInput === _pcalcBase.d) {
         estEl.innerHTML =
-          '<span style="font-size:9px;font-weight:800;background:#dcfce7;color:#15803d;padding:2px 6px;border-radius:6px;vertical-align:middle">실제</span>'
+          '<span style="font-size:10px;font-weight:800;background:#dcfce7;color:#15803d;padding:2px 6px;border-radius:6px;vertical-align:middle">실제</span>'
           + '<span style="color:#059669;font-size:16px;font-weight:800;margin-left:5px;vertical-align:middle">' + fmtInt(_pcalcActualPrice)
           + '<span style="font-size:10px;font-weight:700;margin-left:1px">원</span></span>'
           + '<span style="font-size:10px;font-weight:600;color:#9aa5b1;margin-left:7px;vertical-align:middle">예상 ' + fmtInt(Math.round(d.estimate || 0)) + '원</span>';
@@ -18407,17 +18416,17 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
               // ── 단가 행 ──
               + '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
               + '<div style="display:flex;flex-direction:column;align-items:center;background:#dbeafe;border-radius:7px;padding:4px 12px;min-width:64px">'
-              + '<span style="font-size:9px;font-weight:800;color:#1d4ed8;letter-spacing:0.04em">기준</span>'
+              + '<span style="font-size:10px;font-weight:800;color:#1d4ed8;letter-spacing:0.04em">기준</span>'
               + '<span style="font-weight:900;color:#1d4ed8;font-size:15px;line-height:1.25">' + fmtInt(basePrice) + '<span style="font-size:10px;font-weight:600">원</span></span>'
               + '</div>'
               + '<span style="color:#a5b4fc;font-size:16px">→</span>'
               + '<div style="display:flex;flex-direction:column;align-items:center;background:#ede9fe;border-radius:7px;padding:4px 12px;min-width:64px">'
-              + '<span style="font-size:9px;font-weight:800;color:#6d28d9;letter-spacing:0.04em">변경</span>'
+              + '<span style="font-size:10px;font-weight:800;color:#6d28d9;letter-spacing:0.04em">변경</span>'
               + '<span style="font-weight:900;color:#6d28d9;font-size:15px;line-height:1.25">' + fmtInt(newPrice) + '<span style="font-size:10px;font-weight:600">원</span></span>'
               + '</div>'
               + (diff !== 0
                 ? '<div style="margin-left:4px;display:flex;flex-direction:column;align-items:center;background:' + diffBg + ';border-radius:7px;padding:4px 12px;min-width:64px">'
-                  + '<span style="font-size:9px;font-weight:700;color:' + diffColor + '">차이</span>'
+                  + '<span style="font-size:10px;font-weight:700;color:' + diffColor + '">차이</span>'
                   + '<span style="font-weight:900;font-size:13px;color:' + diffColor + '">' + diffSign + fmtInt(diff) + '원</span>'
                   + '<span style="font-size:10px;font-weight:700;color:' + diffColor + '">(' + diffSign + diffPct + '%)</span>'
                   + '</div>'
@@ -18425,11 +18434,11 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
               + '</div>'
               // ── 사이즈 행 ──
               + '<div style="margin-top:7px;padding-top:6px;border-top:1px dashed #c7d2fe;display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
-              + '<span style="font-size:9.5px;font-weight:700;color:#64748b;min-width:28px">사이즈</span>'
+              + '<span style="font-size:10px;font-weight:700;color:#64748b;min-width:28px">사이즈</span>'
               + '<span style="display:inline-flex;align-items:center;gap:1px">' + baseSzHtml + '</span>'
               + '<span style="color:#a5b4fc;font-size:13px">→</span>'
               + '<span style="display:inline-flex;align-items:center;gap:1px">' + newSzHtml + '</span>'
-              + '<span style="font-size:9px;color:#64748b">(강조 = 변경된 치수)</span>'
+              + '<span style="font-size:10px;color:#64748b">(강조 = 변경된 치수)</span>'
               + '</div>'
               + '</div>';
           } else if (!sizeChanged && cmpBar) {
@@ -18770,7 +18779,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       return '<div class="po-inline-row os" onclick="openOsModal()">'
            + '<div style="display:flex;flex-direction:column;align-items:flex-start;gap:1px">'
            + '<span class="po-inline-code">' + code + '</span>'
-           + '<span style="font-size:9px;font-weight:700;color:' + groupColor + ';letter-spacing:-0.01em">' + groupLabel + '</span>'
+           + '<span style="font-size:10px;font-weight:700;color:' + groupColor + ';letter-spacing:-0.01em">' + groupLabel + '</span>'
            + '</div>'
            + '<div><div class="po-inline-name" title="' + name + '">' + name + '</div>'
            + '<div class="po-inline-sub">' + vendor + '</div></div>'
@@ -19336,7 +19345,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         + '</tr></thead><tbody>'
         + m.slice().reverse().map(x =>
             '<tr style="border-bottom:1px solid var(--border)' + (x.is_current ? ';color:var(--text-3)' : '') + '">'
-            + '<td style="padding:4px 6px">' + x.ym + (x.is_current ? ' <span style="font-size:9px">(진행중)</span>' : '') + '</td>'
+            + '<td style="padding:4px 6px">' + x.ym + (x.is_current ? ' <span style="font-size:10px">(진행중)</span>' : '') + '</td>'
             + '<td style="padding:4px 6px;text-align:right;font-variant-numeric:tabular-nums;font-weight:700">' + fmtInt(x.ea) + '</td>'
             + (hasAmt ? '<td style="padding:4px 6px;text-align:right;font-variant-numeric:tabular-nums;color:#2f8576">' + fmtWonC(x.amt) + '</td>' : '')
             + '</tr>').join('')
@@ -19406,7 +19415,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
             + '</div>'
             + '<div style="text-align:right;flex-shrink:0">'
             +   '<div style="font-size:12px;font-weight:800;color:' + color + '">' + (hasAmt ? fmtWonC(it.amt) : fmtInt(it.ea) + '개') + '</div>'
-            +   '<div style="font-size:9px;color:var(--text-3)">' + (hasAmt ? fmtInt(it.ea) + '개 · ' : '') + pct.toFixed(1) + '%</div>'
+            +   '<div style="font-size:10px;color:var(--text-3)">' + (hasAmt ? fmtInt(it.ea) + '개 · ' : '') + pct.toFixed(1) + '%</div>'
             + '</div></div>';
         }).join('');
       if (!body._cdProwBound) {
@@ -19427,7 +19436,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     return items.map((it, i) => {
       const pct = total > 0 ? (it.amount / total * 100) : 0;
       const barW = (it.amount / max * 100);
-      const sub = it.div ? ' <span style="font-size:9.5px;color:var(--text-3)">' + escapeHtml(it.div) + '</span>' : '';
+      const sub = it.div ? ' <span style="font-size:10px;color:var(--text-3)">' + escapeHtml(it.div) + '</span>' : '';
       return '<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border)">'
         + '<span style="width:18px;font-size:11px;font-weight:700;color:' + color + '">' + (i+1) + '</span>'
         + '<div style="flex:1;min-width:0">'
@@ -19436,7 +19445,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         + '</div>'
         + '<div style="text-align:right;flex-shrink:0">'
         +   '<div style="font-size:12px;font-weight:800;color:' + color + '">' + fmtEok(it.amount) + '</div>'
-        +   '<div style="font-size:9px;color:var(--text-3)">' + pct.toFixed(1) + '%</div>'
+        +   '<div style="font-size:10px;color:var(--text-3)">' + pct.toFixed(1) + '%</div>'
         + '</div></div>';
     }).join('');
   }
