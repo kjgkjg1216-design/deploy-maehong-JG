@@ -92,6 +92,24 @@ try {
   }
   Log "  업로드 $uploaded 파일 (내용 변경분)"
 
+  # ③-1 알림 기록(🔔 알림 센터) — 점검 엔진은 PC에서만 돌므로 기록을 GCP로 복사 (2026-10-23, GCP는 9/2 기록에 멈춰 있었음)
+  #     앱이 요청 때마다 파일을 읽으므로 리로드 불필요
+  $an = Invoke-Remote 'ssh' "-i `"$KEY`" $SSHOPT jgkim@$IP `"timeout 30 sh -c 'md5sum /opt/maehong/data/alerts_log.jsonl /opt/maehong/data/_alert_state.json 2>/dev/null; true'`"" 60
+  if ($an.ok) {
+    $am = @{}
+    foreach($line in $an.lines){ if($line -match '^([0-9a-f]{32})\s+\S*/([^/]+)$'){ $am[$Matches[2]] = $Matches[1] } }
+    $aup = 0
+    foreach($n in @('alerts_log.jsonl', '_alert_state.json')) {
+      $lf = "$DIR\data\$n"
+      if (-not (Test-Path $lf)) { continue }
+      if ($am[$n] -ne (Get-FileHash -Path $lf -Algorithm MD5).Hash.ToLower()) {
+        $u = Invoke-Remote 'scp' "-i `"$KEY`" $SSHOPT `"$lf`" jgkim@${IP}:/opt/maehong/data/" 60
+        if ($u.ok) { $aup++ } else { Log "  ⚠ 알림 기록 업로드 실패: $n" }
+      }
+    }
+    if ($aup) { Log "  알림 기록 업로드 $aup 파일" }
+  } else { Log "  ⚠ 알림 기록 확인 실패(시간 초과=$($an.timeout))" }
+
   # ③-2 프로젝트 루트의 수동 CSV(판매 CSV·SKU매핑)도 동기화 (2026-09-17: 예전엔 scp 수작업)
   #     → /opt/maehong/ 루트로. -p로 수정시각 보존(로더가 mtime 최신 판매 파일을 고르므로 순서가 바뀌면 안 됨)
   $r2 = Invoke-Remote 'ssh' "-i `"$KEY`" $SSHOPT jgkim@$IP `"timeout 60 md5sum /opt/maehong/*.csv`"" 90

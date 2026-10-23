@@ -8522,7 +8522,8 @@ def api_notifications():
         items.reverse()
     st = _notify_state_load()
     return jsonify({'items': items, 'channels': list(_notify_channels()),
-                    'last_run': st.get('last_run'), 'live': False})
+                    'last_run': st.get('last_run'), 'live': False,
+                    'host': os.path.exists('C:/Users/jgkim/OneDrive')})   # False = GCP(점검 엔진 없음, PC 기록을 30분마다 복사받음)
 
 
 @app.route('/api/notify_run', methods=['POST'])
@@ -13893,6 +13894,52 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .modal-close:hover { background: #f1f5f9; color: var(--text); }
   .modal-body { padding: 24px 28px; overflow-y: auto; flex: 1; }
 
+  /* ───── 알림 센터 (2026-10-23 가독성 개선: 넓은 창·큰 글자·종류 필터·날짜 묶음·품번 강조) ───── */
+  .nt-modal { max-width: min(1080px, 96vw) !important; height: min(880px, calc(100vh - 48px)); max-height: none !important; }
+  .nt-modal .modal-header h2 { font-size: 20px; }
+  .nt-sub { font-size: 13px; color: var(--text-2); margin-top: 6px; line-height: 1.5; }
+  .nt-sub .warn { color: #b45309; font-weight: 600; }
+  .nt-filters { display: flex; gap: 6px; flex-wrap: wrap; padding: 14px 28px 0; }
+  .nt-chip { padding: 7px 14px; font-size: 13px; font-weight: 700; border-radius: 999px; border: 1px solid var(--border); background: #fff; color: var(--text-2); cursor: pointer; }
+  .nt-chip .n { margin-left: 6px; padding: 1px 7px; border-radius: 999px; background: #f1f5f9; font-size: 11.5px; }
+  .nt-chip.on { background: #1e293b; color: #fff; border-color: #1e293b; }
+  .nt-chip.on .n { background: rgba(255,255,255,.2); }
+  .nt-body { padding: 14px 28px 20px !important; overflow-x: hidden; }
+  .nt-day { font-size: 13px; font-weight: 800; color: var(--text-3); margin: 18px 0 8px; display: flex; align-items: center; gap: 10px; }
+  .nt-day:first-child { margin-top: 2px; }
+  .nt-day::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+  .nt-card { padding: 16px 20px; margin-bottom: 12px; border-radius: 14px; border: 1px solid var(--border); border-left-width: 5px; background: #fff; }
+  .nt-card.unread { box-shadow: 0 2px 10px rgba(15,23,42,.08); }
+  .nt-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .nt-title { font-size: 16.5px; font-weight: 800; letter-spacing: -0.01em; }
+  .nt-kind { font-size: 11.5px; font-weight: 700; padding: 2px 9px; border-radius: 6px; margin-right: 8px; vertical-align: 2px; }
+  .nt-new { font-size: 11px; font-weight: 800; color: #fff; background: #ef4444; padding: 2px 7px; border-radius: 999px; margin-left: 8px; vertical-align: 2px; }
+  .nt-time { font-size: 12.5px; color: var(--text-3); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .nt-lead { font-size: 15px; font-weight: 700; color: var(--text); margin-top: 10px; line-height: 1.6; }
+  .nt-list { margin: 8px 0 0; padding: 0; list-style: none; }
+  .nt-list li { font-size: 14.5px; color: var(--text); line-height: 1.55; padding: 7px 0; border-top: 1px dashed #e2e8f0; display: flex; gap: 10px; align-items: baseline; }
+  .nt-list li:first-child { border-top: 0; }
+  .nt-code { flex: 0 0 auto; font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace; font-size: 13px; font-weight: 800; color: #3730a3; background: #eef2ff; border-radius: 6px; padding: 2px 8px; cursor: pointer; }
+  .nt-code:hover { background: #c7d2fe; }
+  .nt-text { font-size: 14.5px; color: var(--text-2); line-height: 1.65; margin-top: 8px; }
+  .nt-foot { padding: 14px 28px 18px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; border-top: 1px solid var(--border); background: var(--surface-2); }
+  .nt-btn { padding: 9px 16px; font-size: 13.5px; font-weight: 700; border-radius: 9px; background: #fff; cursor: pointer; border: 1px solid; }
+  .nt-msg { font-size: 13px; color: #059669; font-weight: 600; }
+  @media (max-width: 760px) {
+    .nt-modal { height: calc(100vh - 16px); }
+    .nt-filters, .nt-body, .nt-foot { padding-left: 14px !important; padding-right: 14px !important; }
+    .nt-filters { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 6px; -webkit-overflow-scrolling: touch; }
+    .nt-chip { flex: 0 0 auto; padding: 6px 11px; font-size: 12.5px; }
+    .nt-foot { gap: 6px; padding-top: 10px; padding-bottom: 12px; }
+    .nt-btn { flex: 1 1 0; padding: 8px 6px; font-size: 12.5px; white-space: nowrap; }
+    .nt-msg { flex-basis: 100%; font-size: 12px; }
+    .nt-msg:empty { display: none; }
+    .nt-sub { font-size: 12px; }
+    .nt-card { padding: 13px 14px; }
+    .nt-title { font-size: 15.5px; }
+    .nt-list li, .nt-text { font-size: 14px; }
+  }
+
   /* ───── Tables ───── */
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th {
@@ -14893,26 +14940,24 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
 
 <!-- 알림 센터 모달 -->
 <div class="modal-overlay" id="notify-modal" style="z-index:129">
-  <div class="modal" style="max-width:min(760px, 94vw)">
+  <div class="modal nt-modal">
     <div class="modal-header">
       <div>
         <div class="code-badge" style="background:linear-gradient(135deg,#475569,#64748b)">알림</div>
-        <h2 style="font-size:15px">🔔 알림 센터</h2>
-        <div id="notify-sub" style="font-size:11.5px;color:var(--text-2);margin-top:4px"></div>
+        <h2>🔔 알림 센터</h2>
+        <div id="notify-sub" class="nt-sub"></div>
       </div>
       <button class="modal-close" onclick="document.getElementById('notify-modal').classList.remove('show')">&times;</button>
     </div>
-    <div class="modal-body" id="notify-body" style="max-height:60vh;overflow:auto">
+    <div class="nt-filters" id="notify-filters"></div>
+    <div class="modal-body nt-body" id="notify-body">
       <div class="loading">로딩 중...</div>
     </div>
-    <div style="padding:10px 24px 16px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <button onclick="notifyRunNow()" style="padding:6px 12px;font-size:11.5px;font-weight:700;border:1px solid #475569;
-        border-radius:7px;background:#fff;color:#475569;cursor:pointer">🔄 지금 점검</button>
-      <button onclick="notifyRunNow(true)" style="padding:6px 12px;font-size:11.5px;font-weight:700;border:1px solid #0369a1;
-        border-radius:7px;background:#fff;color:#0369a1;cursor:pointer">☀️ 요약 보내기</button>
-      <button onclick="notifyTest()" style="padding:6px 12px;font-size:11.5px;font-weight:700;border:1px solid #059669;
-        border-radius:7px;background:#fff;color:#059669;cursor:pointer">📨 채널 테스트</button>
-      <span id="notify-msg" style="font-size:11.5px;color:#059669;font-weight:600"></span>
+    <div class="nt-foot">
+      <button class="nt-btn" onclick="notifyRunNow()" style="border-color:#475569;color:#475569">🔄 지금 점검</button>
+      <button class="nt-btn" onclick="notifyRunNow(true)" style="border-color:#0369a1;color:#0369a1">☀️ 요약 보내기</button>
+      <button class="nt-btn" onclick="notifyTest()" style="border-color:#059669;color:#059669">📨 채널 테스트</button>
+      <span id="notify-msg" class="nt-msg"></span>
     </div>
   </div>
 </div>
@@ -17979,6 +18024,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       b.style.display = unread ? 'block' : 'none';
     } catch (e) {}
   }
+  // 알림 종류별 이름 (필터 칩·카드 꼬리표)
+  const NOTIFY_KIND = { out: '품절', reorder: '지금 발주', chstock: '채널 품절', vendor: '거래처 입력', daily: '아침 요약', health: '데이터',
+                        sales: '판매 자료', closing: '마감', report: '월간 리포트', test: '테스트' };
+  let _ntItems = [], _ntKind = 'all', _ntSeen = 0;
   async function openNotify() {
     const modal = document.getElementById('notify-modal');
     modal.classList.add('show');
@@ -17987,29 +18036,78 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     body.innerHTML = '<div class="loading" style="padding:20px">로딩 중...</div>';
     try {
       const d = await (await fetch('/api/notifications')).json();
-      const items = d.items || [];
-      document.getElementById('notify-sub').textContent =
-        '채널: ' + (d.channels.length ? d.channels.map(c => c === 'email' ? '메일' : '카톡').join(' · ') : '대시보드만 (.env에 메일/카톡 설정 시 발송)')
-        + (d.last_run ? ' · 마지막 점검 ' + d.last_run : '');
-      if (!items.length) { body.innerHTML = '<div class="search-empty">아직 알림이 없습니다. "지금 점검"을 눌러 시작하세요.</div>'; }
-      else {
-        const seen = _notifySeen();
-        body.innerHTML = items.map(x => {
-          const [bg, fg] = NOTIFY_LV[x.level] || NOTIFY_LV.info;
-          const sent = Object.entries(x.sent || {}).map(([k, v]) => (k === 'email' ? '메일' : '카톡') + (v === true ? '✓' : '✗')).join(' ');
-          return '<div style="padding:10px 12px;margin-bottom:8px;border-radius:9px;background:' + bg + ';border-left:4px solid ' + fg
-            + (x.id > seen ? ';box-shadow:0 0 0 1px ' + fg + '33' : '') + '">'
-            + '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">'
-            + '<b style="color:' + fg + ';font-size:13px">' + escapeHtml(x.title) + '</b>'
-            + '<span style="font-size:10.5px;color:var(--text-3);white-space:nowrap">' + x.ts + (sent ? ' · ' + sent : '') + '</span></div>'
-            + '<div style="font-size:12px;color:var(--text-2);margin-top:4px;white-space:pre-line">' + escapeHtml(x.body) + '</div></div>';
-        }).join('');
-        try { localStorage.setItem('notifySeenId', String(Math.max(...items.map(x => x.id)))); } catch (e) {}
-      }
+      _ntItems = d.items || []; _ntSeen = _notifySeen();
+      if (_ntKind !== 'all' && !_ntItems.some(x => x.kind === _ntKind)) _ntKind = 'all';
+      document.getElementById('notify-sub').innerHTML =
+        '알림 발송: ' + (d.channels.length ? '<b>' + d.channels.map(c => c === 'email' ? '메일' : '카톡').join(' · ') + '</b>'
+                                          : '<span class="warn">설정 안 됨 — 대시보드에서만 보입니다 (.env에 메일·카톡 정보를 넣으면 발송)</span>')
+        + (d.last_run ? ' · 마지막 점검 ' + escapeHtml(d.last_run) : '')
+        + (d.host ? '' : '<br>이 서버(클라우드)는 PC 대시보드의 점검 기록을 30분마다 받아 보여줍니다');
+      // 클라우드에선 점검 버튼 숨김 (여기서 점검하면 PC 기록과 따로 쌓여 알림이 겹침)
+      document.querySelectorAll('#notify-modal .nt-btn').forEach(b => { b.style.display = d.host ? '' : 'none'; });
+      renderNotify();
+      if (_ntItems.length) { try { localStorage.setItem('notifySeenId', String(Math.max(..._ntItems.map(x => x.id)))); } catch (e) {} }
       loadNotifyBadge();
     } catch (e) {
       body.innerHTML = '<div class="search-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>';
     }
+  }
+  function setNotifyKind(k) { _ntKind = k; renderNotify(); document.getElementById('notify-body').scrollTop = 0; }
+  function ntOpenItem(code) { document.getElementById('notify-modal').classList.remove('show'); openItemModal(code); }
+  function _ntDayLabel(day) {
+    const t = new Date(), p = n => String(n).padStart(2, '0');
+    const iso = dt => dt.getFullYear() + '-' + p(dt.getMonth() + 1) + '-' + p(dt.getDate());
+    const y = new Date(t.getTime() - 864e5);
+    const dd = new Date(day + 'T00:00:00');
+    const base = (dd.getMonth() + 1) + '월 ' + dd.getDate() + '일 (' + '일월화수목금토'[dd.getDay()] + ')';
+    return day === iso(t) ? '오늘 · ' + base : (day === iso(y) ? '어제 · ' + base : base);
+  }
+  // 본문: '·'로 시작하는 줄은 목록(품번은 칩, '이름: 내용'은 이름 굵게), 목록 앞 첫 줄은 요약 줄, 나머지는 문단
+  function _ntBody(text) {
+    const lines = String(text || '').split(String.fromCharCode(10)).map(s => s.trim()).filter(Boolean);
+    let h = '', list = [], seenList = false;
+    const flush = () => { if (list.length) { h += '<ul class="nt-list">' + list.join('') + '</ul>'; list = []; } };
+    lines.forEach(l => {
+      const c0 = l.charAt(0);
+      if (c0 === '·' || c0 === '•' || c0 === '-') {
+        seenList = true;
+        let s = l.slice(1).trim(), chip = '';
+        const m = s.match(/^([A-Z][0-9]{4})[ ]+(.*)$/);
+        if (m) { chip = '<span class="nt-code" title="클릭 = 품목 정보" onclick="ntOpenItem(&quot;' + m[1] + '&quot;)">' + m[1] + '</span>'; s = m[2]; }
+        const ci = s.indexOf(': ');
+        const txt = (!chip && ci > 0 && ci < 20) ? '<b>' + escapeHtml(s.slice(0, ci)) + '</b>' + escapeHtml(s.slice(ci)) : escapeHtml(s);
+        list.push('<li>' + chip + '<span>' + txt + '</span></li>');
+      } else {
+        flush();
+        h += (!seenList && !h) ? '<div class="nt-lead">' + escapeHtml(l) + '</div>' : '<div class="nt-text">' + escapeHtml(l) + '</div>';
+      }
+    });
+    flush();
+    return h;
+  }
+  function renderNotify() {
+    const cnt = {};
+    _ntItems.forEach(x => { cnt[x.kind] = (cnt[x.kind] || 0) + 1; });
+    const chip = (k, label, n) => '<button class="nt-chip' + (k === _ntKind ? ' on' : '') + '" onclick="setNotifyKind(&quot;' + k + '&quot;)">' + escapeHtml(label) + '<span class="n">' + n + '</span></button>';
+    document.getElementById('notify-filters').innerHTML = _ntItems.length
+      ? chip('all', '전체', _ntItems.length) + Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a]).map(k => chip(k, NOTIFY_KIND[k] || k, cnt[k])).join('') : '';
+    const body = document.getElementById('notify-body');
+    const items = _ntItems.filter(x => _ntKind === 'all' || x.kind === _ntKind);
+    if (!items.length) { body.innerHTML = '<div class="search-empty" style="font-size:14px">아직 알림이 없습니다. [지금 점검]을 눌러 시작하세요.</div>'; return; }
+    let h = '', day = '';
+    items.forEach(x => {
+      const dkey = String(x.ts || '').slice(0, 10);
+      if (dkey !== day) { day = dkey; h += '<div class="nt-day">' + _ntDayLabel(day) + '</div>'; }
+      const [bg, fg] = NOTIFY_LV[x.level] || NOTIFY_LV.info;
+      const sent = Object.entries(x.sent || {}).map(([k, v]) => (k === 'email' ? '메일' : '카톡') + (v === true ? ' 발송됨' : ' 실패')).join(' · ');
+      h += '<div class="nt-card' + (x.id > _ntSeen ? ' unread' : '') + '" style="border-left-color:' + fg + '">'
+        + '<div class="nt-head"><div class="nt-title" style="color:' + fg + '">'
+        + '<span class="nt-kind" style="background:' + bg + ';color:' + fg + '">' + escapeHtml(NOTIFY_KIND[x.kind] || x.kind) + '</span>'
+        + escapeHtml(x.title) + (x.id > _ntSeen ? '<span class="nt-new">NEW</span>' : '') + '</div>'
+        + '<span class="nt-time">' + escapeHtml(String(x.ts || '').slice(11, 16)) + (sent ? ' · ' + sent : '') + '</span></div>'
+        + _ntBody(x.body) + '</div>';
+    });
+    body.innerHTML = h;
   }
   async function notifyRunNow(daily) {
     const m = document.getElementById('notify-msg');
@@ -23161,13 +23259,18 @@ def api_data_health():
                 # 품번 정리 화면(/sku_review)의 남은 건수 = 자사코드 없는 SKU + 매핑표↔API 품번 불일치 미결정
                 um = [{'SKU': x['sku'], '판매제품명': x['sale_name']} for x in _sku_review_data()['pending']]
             _mf = f'{BASE_DIR}/SKU매핑_확정.csv'
+            # 날짜 칸 = 확인한 판매자료 날짜(매번 최신 판매자료로 검사). 매핑표 수정일은 새 SKU가 생길 때만 바뀌므로 문구로 따로 표시
+            # (예전엔 매핑표 수정일 9/23을 날짜 칸에 보여 자료가 오래된 것처럼 보였음, 2026-10-16)
+            _sf = sorted(glob.glob(f'{DATA_DIR}/*_판매일별.csv'))
+            _chk = os.path.basename(_sf[-1])[:8] if _sf else _dt.now().strftime('%Y%m%d')
+            _medit = (' · 매핑표 수정 ' + _dt.fromtimestamp(os.path.getmtime(_mf)).strftime('%m/%d')) if os.path.exists(_mf) else ''
             items.append({'label': '판매 SKU매핑', 'date_col': '', 'rows': int(len(um)), 'months_behind': None,
-                          'latest_ym': _dt.fromtimestamp(os.path.getmtime(_mf)).strftime('%Y-%m-%d') if os.path.exists(_mf) else '',
+                          'latest_ym': f'{_chk[:4]}-{_chk[4:6]}-{_chk[6:8]}',
                           'status': 'warn' if um else 'ok',
                           'msg': ((f'품번 확인 필요 SKU {len(um)}건 · 아래 [판매 SKU 품번 정리]에서 클릭으로 정리'
                                    if SALES_SOURCE.get('kind') == 'api' else
                                    f'미매핑 SKU {len(um)}건 · SKU매핑_미매핑_추천.csv 확인 후 SKU매핑_확정.csv에 추가') if um
-                                  else '정상 · 판매 SKU 전부 매핑됨')})
+                                  else '정상 · 판매 SKU 전부 매핑됨 (최신 판매자료로 확인)') + _medit})
             worst = max(worst, 1 if um else 0)
     except Exception:
         pass
