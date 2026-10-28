@@ -51,6 +51,7 @@ data/*.json
 data/*.jsonl
 data/리포트/
 data/마감/
+data/spec_pdf/
 *.bak
 *.bak[0-9]*
 *.bak_*
