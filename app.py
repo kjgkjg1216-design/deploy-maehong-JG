@@ -142,7 +142,8 @@ def _require_login():
     if p == '/login' or any(p.startswith(x) for x in _PUBLIC_PREFIXES):
         return None
     # 로컬 갱신/감지 스크립트용 토큰 우회
-    if p in ('/api/reload_dfs', '/api/monday_dirty', '/api/monday_dirty/clear', '/api/vendor_entries', '/api/vendor_upload'):
+    if p in ('/api/reload_dfs', '/api/monday_dirty', '/api/monday_dirty/clear', '/api/vendor_entries', '/api/vendor_upload') \
+            or p.startswith('/api/spec_design_preview/'):   # 로컬 PC가 GCP의 시안 미리보기를 받아 감 (2026-10-28)
         _tok = os.environ.get('RELOAD_TOKEN', '')
         if _tok and request.args.get('token') == _tok:
             return None
@@ -1472,7 +1473,8 @@ def load_monday_data():
                  '금액','공급가액','구분','부서','진행상태',
                  '채널','업무 상태','목표 출시일','카테고리','우선순위',
                  '입항일','계약번호','부모아이템ID',
-                 'box 입수량','PT적재량'}  # 입수 테스트(3D) 패널용
+                 'box 입수량','PT적재량',  # 입수 테스트(3D) 패널용
+                 '시안'}  # 부자재 규격 보드 시안 파일(URL) — 규격 패널 시안 아이콘 (2026-10-28)
     df = pd.read_csv(mon_files[0], encoding='utf-8-sig', dtype=str,
                      usecols=lambda c: c in _mon_keep)
     df = df.fillna('')
@@ -6501,6 +6503,252 @@ def api_spec_pdf(item_id):
     return resp
 
 
+@app.route('/api/spec_design/<item_id>', methods=['GET'])
+def api_spec_design(item_id):
+    """부자재 규격 보드 '시안' 파일 칸의 첨부 목록 (2026-10-28, 사용자 "규격 패널에서 시안 아이콘 → 클릭 시 보기").
+    Monday 파일 칸 URL은 Monday 로그인이 필요해 바로 못 열므로, 클릭 때마다 1시간짜리 공개 URL을 받아 넘긴다.
+    시안 칸에 적힌 순서대로 [{name, ext, kind(image|pdf|file|link), url}]."""
+    import requests as _req
+    if not _IS_HOST_PC:   # 부자재 규격 패널은 호스트 PC 전용
+        return jsonify({'ok': False, 'error': '호스트 PC에서만 볼 수 있습니다'}), 403
+    api_key = os.getenv('MONDAY_API_KEy')
+    if not api_key:
+        return jsonify({'ok': False, 'error': 'Monday API 키 없음'}), 500
+    if not str(item_id).isdigit():
+        return jsonify({'ok': False, 'error': '잘못된 item_id'}), 400
+    # url_thumbnail은 Monday 로그인이 필요한 주소라 못 씀 → 썸네일도 public_url 원본 사용
+    q = ('{ items(ids: [%s]) { name column_values { id type value column { title } } '
+         'assets { id name public_url file_extension file_size } } }' % item_id)
+    try:
+        r = _req.post('https://api.monday.com/v2', json={'query': q},
+                      headers={'Authorization': api_key, 'API-Version': '2024-10'}, timeout=20)
+        its = (r.json().get('data') or {}).get('items') or []
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Monday 조회 실패: {e}'[:200]}), 502
+    if not its:
+        return jsonify({'ok': False, 'error': '항목을 찾을 수 없음'}), 404
+    it = its[0]
+    amap = {str(a.get('id')): a for a in (it.get('assets') or [])}
+    img_ext = ('jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp')
+    files = []
+    for cv in it.get('column_values') or []:
+        if cv.get('type') != 'file' or (cv.get('column') or {}).get('title') != '시안':
+            continue
+        try:
+            entries = (json.loads(cv.get('value') or '{}') or {}).get('files') or []
+        except (TypeError, ValueError):
+            entries = []
+        for f in entries:
+            a = amap.get(str(f.get('assetId') or ''))
+            if a:
+                ext = (a.get('file_extension') or '').lower().lstrip('.')
+                aid = str(a.get('id'))
+                files.append({'name': a.get('name') or f.get('name') or '', 'ext': ext, 'id': aid,
+                              'size': int(a.get('file_size') or 0),
+                              'kind': 'image' if ext in img_ext else ('pdf' if ext == 'pdf' else 'file'),
+                              'url': a.get('public_url') or '',
+                              # .ai(PDF 호환)·.pdf는 서버가 첫 페이지 JPG 미리보기를 만들어 보여 줌 (원본은 받기 버튼)
+                              'preview': f'/api/spec_design_preview/{item_id}/{aid}' if ext in ('ai', 'pdf') else '',
+                              'ready': ext in ('ai', 'pdf') and bool(_design_preview_meta(aid))})
+            elif f.get('linkToFile'):   # 구글 드라이브 등 링크로 붙인 파일
+                files.append({'name': f.get('name') or '링크', 'ext': '', 'kind': 'link', 'url': f.get('linkToFile')})
+    if not files:
+        return jsonify({'ok': False, 'error': '시안 파일 없음'}), 404
+    return jsonify({'ok': True, 'item': it.get('name', ''), 'files': files})
+
+
+_DSG_LOCKS = {}
+_DSG_LOCKS_GUARD = threading.Lock()
+_IS_HOST_PC = os.path.exists('C:/Users/jgkim/OneDrive')   # 로컬 PC(OneDrive 있음) / GCP 구분
+
+
+_DSG_HD = 6000   # 확대용 고해상도 긴 변(px) — 기본 2400px를 4배로 늘리면 글자가 깨짐(2026-10-29 사용자 지적)
+
+
+def _design_preview_paths(asset_id, page=1, hd=False):
+    """(쪽 JPG 경로, 정보 json 경로). 1쪽 <asset>.jpg, n쪽 <asset>-p<n>.jpg, 고해상도는 <asset>-hd[-p<n>].jpg."""
+    d = f'{DATA_DIR}/design_preview'
+    stem = f'{asset_id}-hd' if hd else str(asset_id)
+    return (f'{d}/{stem}.jpg' if page <= 1 else f'{d}/{stem}-p{page}.jpg'), f'{d}/{asset_id}.json'
+
+
+def _design_preview_meta(asset_id):
+    """다 만들어진 미리보기의 정보 {pages, rendered, hd?} 또는 None. 'rendered'가 없으면 첫 쪽만 만들던 옛 형식 → 다시 만듦.
+    hd = 고해상도로 만든 쪽 수(없으면 아직 안 만듦)."""
+    jpg, meta = _design_preview_paths(asset_id)
+    if not os.path.exists(jpg):
+        return None
+    try:
+        m = json.load(open(meta, encoding='utf-8'))
+    except Exception:
+        return None
+    return m if m.get('rendered') else None
+
+
+def _design_preview_make(item_id, asset_id, low=False, hd=False):
+    """시안 .ai/.pdf를 쪽별 JPG(최대 8쪽)로 data/design_preview/에 만듦 → None(성공) 또는 (오류 문구, 상태코드).
+    기본 = 긴 변 2400px. hd=True면 확대용 6000px도 만듦(원본을 받은 김에 둘 다). 미리 만들기(low)는 늘 둘 다.
+    로컬 PC는 먼저 GCP에서 받아 옴(GCP는 원본을 초당 십수 MB로 받고 미리 만들어 두기도 함 — 사무실 회선으론 133MB에 90초).
+    직접 만들 땐 원본을 디스크로 바로 받아(수백 MB도 메모리에 안 올림) design_preview.py로 변환하고 원본은 버림.
+    쪽 파일을 먼저 쓰고 정보 json을 맨 마지막에 써서 '다 만들어짐' 표시로 씀. low=True면 낮은 CPU 우선순위로."""
+    import requests as _req
+    import subprocess as _sp
+    import shutil, tempfile
+    hd = hd or low
+
+    def need():
+        m = _design_preview_meta(asset_id)
+        return (not m), bool(hd and not (m or {}).get('hd'))
+
+    if not any(need()):
+        return None
+    jpg, meta = _design_preview_paths(asset_id)
+    os.makedirs(os.path.dirname(jpg), exist_ok=True)
+    with _DSG_LOCKS_GUARD:
+        lk = _DSG_LOCKS.setdefault(asset_id, threading.Lock())
+    with lk:   # 같은 파일을 두 사람이 동시에 열어도 한 번만 받음
+        need_std, need_hd = need()
+        if not (need_std or need_hd):
+            return None
+        m0 = _design_preview_meta(asset_id) or {}
+        if _IS_HOST_PC:
+            try:
+                tok, base = _vendor_secret(), f'{_VENDOR_CLOUD}/api/spec_design_preview/{item_id}/{asset_id}'
+                c = _req.get(base, params={'check': '1', 'token': tok, 'hd': '1' if need_hd else '0'}, timeout=900).json()
+                n = int(c.get('rendered') or 0)
+                if c.get('ok') and n and (not need_hd or c.get('hd')):
+                    kinds = ([False] if need_std else []) + ([True] if need_hd else [])
+                    got = {}
+                    for k in kinds:
+                        for p in range(1, (int(c.get('hd') or 0) if k else n) + 1):
+                            r = _req.get(base, params={'token': tok, 'page': p, 'hd': '1' if k else '0'}, timeout=120)
+                            if r.status_code != 200 or r.content[:2] != b'\xff\xd8':   # JPG
+                                raise RuntimeError(f'{p}쪽 받기 실패 (HTTP {r.status_code})')
+                            got[(k, p)] = r.content
+                    for (k, p), data in sorted(got.items(), key=lambda x: -x[0][1]):   # 1쪽을 맨 마지막에
+                        with open(_design_preview_paths(asset_id, p, k)[0], 'wb') as fp:
+                            fp.write(data)
+                    m = dict(m0, pages=c.get('pages'), rendered=n, src='cloud')
+                    if need_hd:
+                        m['hd'] = int(c.get('hd') or 0)
+                    json.dump(m, open(meta, 'w', encoding='utf-8'), ensure_ascii=False)
+                    return None
+            except Exception as e:
+                print(f'[시안 미리보기] GCP에서 받기 실패 → 직접 만듦: {e!r:.120}')
+        try:
+            q = '{ items(ids: [%s]) { assets { id name public_url file_extension } } }' % item_id
+            r = _req.post('https://api.monday.com/v2', json={'query': q},
+                          headers={'Authorization': os.getenv('MONDAY_API_KEy') or '', 'API-Version': '2024-10'}, timeout=20)
+            its = (r.json().get('data') or {}).get('items') or []
+            a = next((x for x in (its[0].get('assets') or []) if str(x.get('id')) == str(asset_id)), None) if its else None
+        except Exception as e:
+            return f'Monday 조회 실패: {e}'[:200], 502
+        if a is None:
+            return '시안 파일을 찾을 수 없음', 404
+        tmp_dir = tempfile.mkdtemp(prefix='dsgsrc_')
+        try:
+            src = os.path.join(tmp_dir, 'src' + (a.get('file_extension') or '.pdf'))
+            with _req.get(a.get('public_url') or '', stream=True, timeout=(15, 120)) as resp:
+                if resp.status_code != 200:
+                    return f'원본 내려받기 실패 (HTTP {resp.status_code})', 502
+                with open(src, 'wb') as fp:
+                    for chunk in resp.iter_content(1 << 20):
+                        fp.write(chunk)
+            m = dict(m0, name=a.get('name', ''))
+            for k in ([False] if need_std else []) + ([True] if need_hd else []):
+                prefix = os.path.join(tmp_dir, 'hd' if k else 'out')
+                cmd = [sys.executable, os.path.join(BASE_DIR, 'design_preview.py'), src, prefix, str(_DSG_HD if k else 2400), '8']
+                if low and os.name != 'nt':
+                    cmd = ['nice', '-n', '19'] + cmd
+                pr = _sp.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=1200, cwd=BASE_DIR)
+                lines = (pr.stdout or '').strip().splitlines()
+                res = json.loads(lines[-1]) if lines else {'ok': False, 'error': (pr.stderr or '')[-300:]}
+                n = int(res.get('rendered') or 0)
+                if not res.get('ok') or not n or not os.path.exists(prefix + '.jpg'):
+                    return str(res.get('error') or '미리보기 실패'), 500
+                for p in range(n, 0, -1):   # 1쪽을 맨 마지막에
+                    shutil.move(prefix + '.jpg' if p == 1 else f'{prefix}-p{p}.jpg', _design_preview_paths(asset_id, p, k)[0])
+                if k:
+                    m['hd'] = n
+                else:
+                    m.update(pages=res.get('pages'), rendered=n)
+            json.dump(m, open(meta, 'w', encoding='utf-8'), ensure_ascii=False)
+            return None
+        except _sp.TimeoutExpired:
+            return '미리보기 만들기 시간 초과', 504
+        except Exception as e:
+            return f'미리보기 실패: {e}'[:200], 500
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _design_warm_todo():
+    """부자재 규격 '시안' 칸의 .ai/.pdf → [(item_id, asset_id)]. 파일 칸 텍스트 URL '.../resources/<asset id>/<파일명>'."""
+    if MONDAY_DF is None or MONDAY_DF.empty or '시안' not in MONDAY_DF.columns:
+        return []
+    out = []
+    for _, r in MONDAY_DF[MONDAY_DF['보드명'] == '부자재 규격'].iterrows():
+        for m in re.finditer(r'/resources/(\d+)/([^,\s]+)', str(r.get('시안', '') or '')):
+            if os.path.splitext(m.group(2))[1].lower() in ('.ai', '.pdf'):
+                out.append((str(r.get('아이템ID', '')).strip(), m.group(1)))
+    return out
+
+
+def _design_warm_loop():
+    """GCP 전용: 시안 미리보기를 미리 만들어 둠 (2026-10-28) — 처음 누를 때 수십 초 기다리지 않게.
+    한 번에 하나씩·낮은 우선순위(실측 413MB 원본도 받기 35초+변환 26초, 메모리 32MB). 기동 3분 뒤 시작, 6시간마다 새 시안 확인."""
+    threading.Event().wait(180)
+    while True:
+        try:
+            made = fail = 0
+            for item_id, asset_id in _design_warm_todo():
+                if not item_id.isdigit() or (_design_preview_meta(asset_id) or {}).get('hd'):
+                    continue
+                err = _design_preview_make(item_id, asset_id, low=True)
+                if err:
+                    fail += 1
+                    print(f'[시안 미리보기] {item_id}/{asset_id} 실패: {err[0]}')
+                else:
+                    made += 1
+                threading.Event().wait(3)
+            if made or fail:
+                print(f'[시안 미리보기] 미리 만듦 {made}건 · 실패 {fail}건')
+        except Exception as e:
+            print(f'[시안 미리보기] 오류: {e!r:.150}')
+        threading.Event().wait(6 * 3600)
+
+
+if not _IS_HOST_PC:
+    threading.Thread(target=_design_warm_loop, daemon=True, name='design-warm').start()
+
+
+@app.route('/api/spec_design_preview/<item_id>/<asset_id>', methods=['GET'])
+def api_spec_design_preview(item_id, asset_id):
+    """시안 .ai/.pdf 쪽별 JPG 미리보기 (2026-10-28). data/design_preview/에 쪽당 수백 KB로 보관해 두 번째부터 바로 보냄.
+    Monday에서 파일을 바꾸면 asset id가 달라져 새로 만듦.
+    ?check=1 → 만들기만 하고 JSON {ok, pages(전체 쪽), rendered(만든 쪽, 최대 8), hd(고해상도 쪽), error} / ?page=n → n쪽 JPG(기본 1쪽).
+    &hd=1 → 확대용 고해상도(긴 변 6000px, 없으면 이때 만듦)."""
+    from flask import send_file
+    if not (str(item_id).isdigit() and str(asset_id).isdigit()):
+        return jsonify({'ok': False, 'error': '잘못된 요청'}), 400
+    # GCP에선 호스트 PC가 토큰으로 받아 가는 것만 허용 (부자재 규격 패널은 호스트 전용)
+    if not _IS_HOST_PC and not (os.environ.get('RELOAD_TOKEN') and request.args.get('token') == os.environ.get('RELOAD_TOKEN')):
+        return jsonify({'ok': False, 'error': '호스트 PC에서만 볼 수 있습니다'}), 403
+    hd = request.args.get('hd') == '1'
+    err = _design_preview_make(item_id, asset_id, hd=hd)
+    if err:
+        return jsonify({'ok': False, 'error': err[0]}), err[1]
+    m = _design_preview_meta(asset_id) or {}
+    if request.args.get('check') == '1':
+        return jsonify({'ok': True, 'pages': m.get('pages'), 'rendered': m.get('rendered'), 'hd': m.get('hd') or 0})
+    page = request.args.get('page', '1')
+    page = int(page) if page.isdigit() else 1
+    jpg = _design_preview_paths(asset_id, page, hd)[0]
+    if not os.path.exists(jpg):
+        return jsonify({'ok': False, 'error': f'{page}쪽 미리보기 없음'}), 404
+    return send_file(jpg, mimetype='image/jpeg', max_age=30 * 86400)
+
+
 @app.route('/api/monday-item/<item_id>', methods=['GET'])
 def monday_item_detail(item_id):
     """Monday.com 아이템 상세 조회 (실시간 API 호출)"""
@@ -11384,6 +11632,8 @@ def _mat_sort_key(m):
 @cached_api()
 def api_materials():
     """부자재 규격 재질별 역산 단가 목록 (단가 0원 제외, 숫자→영어→한글 순)"""
+    if not _IS_HOST_PC:   # 부자재 단가가 그대로 나가므로 호스트 PC 전용 (2026-10-29, 사용자 "예상 단가 계산기도 막고")
+        return jsonify({'locked': True, 'materials': [], 'total_samples': 0})
     d = _get_material_data()
     mats = [m for m in d['materials'] if m['price'] > 0]
     mats.sort(key=_mat_sort_key)
@@ -11398,6 +11648,8 @@ _ROLL_RE = re.compile(r'\d+\s*[mM]\b|자동롤|롤파우치|두께\s*\d+|이지�
 @app.route('/api/material_estimate', methods=['POST'])
 def api_material_estimate():
     """선택한 재질 + 사이즈 → 예상 단가 + 유사 샘플 (계층 kNN)."""
+    if not _IS_HOST_PC:   # 유사 샘플에 실제 품목·단가가 담김 → 호스트 PC 전용 (2026-10-29)
+        return jsonify({'locked': True, 'estimate': 0, 'breakdown': [], 'similar': [], 'method': 'locked'})
     payload = request.get_json(silent=True) or {}
     selected = [s.strip() for s in (payload.get('materials') or []) if s and s.strip()]
     req_cat = (payload.get('category') or '').strip()
@@ -11985,6 +12237,8 @@ def api_outsource_pending():
 @cached_api()
 def api_spec_list():
     """부자재 규격 보드 전체 항목 — 대시보드 하단 패널용."""
+    if not _IS_HOST_PC:   # 호스트 PC 전용 패널 (2026-10-28, 사용자 "host만 볼 수 있도록 잠가 줘") — GCP에선 내용 안 보냄
+        return jsonify({'locked': True, 'items': [], 'total': 0})
     if MONDAY_DF is None or MONDAY_DF.empty:
         return jsonify({'items': [], 'total': 0})
     spec = MONDAY_DF[MONDAY_DF['보드명'] == '부자재 규격']
@@ -12017,6 +12271,9 @@ def api_spec_list():
             'material': material, 'moq': moq, 'price': price,
             'vendor': vendor, 'category': cat, 'div': div,
             'tokens': _material_tokens(material, cat),  # 단가계산기 연동용 (서버 동일 토큰)
+            # 시안 파일 수 — Monday 파일 칸 텍스트는 'URL, URL' (2026-10-28). 열어 볼 때 /api/spec_design/<item_id>
+            'item_id': str(r.get('아이템ID', '')).strip(),
+            'design': str(r.get('시안', '') or '').count('http'),
         })
     items.sort(key=lambda x: x['code'])  # 품번 오름차순
     return jsonify({'items': items, 'total': len(items)})
@@ -12136,6 +12393,8 @@ def _ipsu_boxes_list():
 @cached_api()
 def api_ipsu_specs():
     """입수 테스트 패널용 — 부자재 규격(파우치/단상자/외박스 치수) + 박스입수 적재량."""
+    if not _IS_HOST_PC:   # 부자재 규격이 그대로 나가므로 호스트 PC 전용 (2026-10-29, 사용자 "A도 막자")
+        return jsonify({'locked': True, 'specs': [], 'boxes': [], 'total': 0, 'parsed': 0, 'box_total': 0})
     specs, boxes = _ipsu_specs_list(), _ipsu_boxes_list()
     parsed = sum(1 for s in specs if s['dim'])
     return jsonify({'specs': specs, 'boxes': boxes,
@@ -12153,6 +12412,8 @@ def api_ipsu_bom():
     - 상자류(form='상자')는 C코드=외박스, B코드=단상자로 구분
     - 파우치는 depth 0=2차, depth 1 이상=1차 (품명의 '1차/2차' 표기가 있으면 우선)
     """
+    if not _IS_HOST_PC:   # 규격 치수·품명이 포함됨 → 호스트 PC 전용 (2026-10-29)
+        return jsonify({'locked': True, 'products': [], 'total': 0})
     if BOM_DF is None or BOM_DF.empty:
         return jsonify({'products': [], 'total': 0})
 
@@ -12269,6 +12530,8 @@ def _ipsu_norm(s: str) -> str:
 def api_ipsu_calib():
     """실측 캘리브레이션용 — 부자재 규격(파우치 치수) ↔ 박스입수 적재량(실측 입수) 매칭 쌍.
     프론트에서 실측 입수와 기하 계산치를 비교해 눌림(압축)계수를 역산한다."""
+    if not _IS_HOST_PC:   # 호스트 PC 전용 (2026-10-29)
+        return jsonify({'locked': True, 'pairs': [], 'total': 0})
     if MONDAY_DF is None or MONDAY_DF.empty:
         return jsonify({'pairs': [], 'total': 0})
 
@@ -13305,7 +13568,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .spec-list::-webkit-scrollbar { width: 6px; }
   .spec-list::-webkit-scrollbar-thumb { background: rgba(15,23,42,0.12); border-radius: 6px; }
   .spec-row {
-    display: grid; grid-template-columns: 70px 1.4fr 60px 132px 1.1fr 28px 76px 76px 92px;
+    display: grid; grid-template-columns: 70px 1.4fr 60px 132px 1.1fr 34px 28px 76px 76px 92px;
     align-items: center; gap: 8px;
     padding: 6px 8px; border-radius: 6px;
     font-size: 11px; line-height: 1.3;
@@ -13342,7 +13605,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .spec-row .sc-check { display: flex; align-items: center; justify-content: center; }
   .spec-row .sc-check input[type=checkbox] { width: 14px; height: 14px; cursor: pointer; accent-color: #6366f1; }
   .spec-head {
-    display: grid; grid-template-columns: 70px 1.4fr 60px 132px 1.1fr 28px 76px 76px 92px;
+    display: grid; grid-template-columns: 70px 1.4fr 60px 132px 1.1fr 34px 28px 76px 76px 92px;
     gap: 8px; padding: 4px 8px;
     font-size: 10px; font-weight: 700; color: var(--text-3);
     border-bottom: 1px solid var(--border); margin-bottom: 4px;
@@ -13352,6 +13615,73 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   }
   .spec-head .h-moq, .spec-head .h-price { text-align: right; }
   .spec-head .h-check { text-align: center; color: #6366f1; font-size: 12px; cursor: default; }
+  .spec-head .h-design { text-align: center; }
+  /* 시안 아이콘 (2026-10-28) — Monday '시안' 파일 칸, 클릭하면 시안 보기 창 */
+  .spec-row .sc-design { display: flex; align-items: center; justify-content: center; color: #cbd5e1; }
+  .sc-design-btn {
+    position: relative; display: inline-flex; align-items: center; justify-content: center;
+    width: 24px; height: 22px; padding: 0; border: 1px solid #ddd6fe; border-radius: 6px;
+    background: #f5f3ff; color: #7c3aed; cursor: pointer; transition: background 0.12s, transform 0.12s;
+  }
+  .sc-design-btn:hover { background: #ede9fe; transform: scale(1.08); }
+  .sc-design-btn svg { width: 13px; height: 13px; }
+  .sc-design-btn .n {
+    position: absolute; top: -5px; right: -6px; min-width: 13px; height: 13px; padding: 0 3px;
+    border-radius: 7px; background: #7c3aed; color: #fff; font-size: 9px; font-weight: 700; line-height: 13px;
+  }
+  /* 시안 보기 창 */
+  /* 화면을 꽉 채워서 봄 (2026-10-29 사용자 "꽉 차게 보는 게 훨씬 좋아") */
+  #design-modal { padding: 10px; }
+  #design-modal .dsg-modal { max-width: none; width: calc(100vw - 20px); height: calc(100vh - 20px); max-height: none; position: relative; border-radius: 14px; }
+  #design-modal .dsg-stage { margin: 10px 12px 0; }
+  .dsg-badge {
+    position: absolute; top: 120px; right: 34px; z-index: 3; pointer-events: none;
+    background: rgba(15,23,42,0.75); color: #fff; font-size: 12px; font-weight: 600;
+    padding: 6px 12px; border-radius: 999px;
+  }
+  #design-modal .modal-header { padding: 12px 20px 10px; }
+  .dsg-stage {
+    position: relative; flex: 1; min-height: 0; margin: 14px 18px 0; border-radius: 12px;
+    background: #f1f5f9; display: flex; align-items: center; justify-content: center; overflow: hidden;
+  }
+  /* 그림은 .dsg-box(돌린 뒤의 크기) 안에 절대 위치 + rotate — 확대·이동·회전을 함께 쓰려고 크기를 JS로 계산 (2026-10-29) */
+  .dsg-box { position: relative; flex: none; margin: auto; }
+  .dsg-box img { position: absolute; max-width: none; max-height: none; transform-origin: center center; cursor: zoom-in; }
+  .dsg-stage.zoom { overflow: auto; align-items: flex-start; justify-content: flex-start; }
+  .dsg-stage.zoom .dsg-box img { cursor: grab; }
+  .dsg-stage.zoom.drag .dsg-box img { cursor: grabbing; }
+  .dsg-rot { display: flex; gap: 4px; }
+  .dsg-rot button {
+    font-size: 11.5px; font-weight: 700; color: #6d28d9; background: #f5f3ff; border: 1px solid #ddd6fe;
+    border-radius: 7px; padding: 3px 9px; cursor: pointer; white-space: nowrap;
+  }
+  .dsg-rot button:hover { background: #ede9fe; }
+  .dsg-stage img { user-select: none; -webkit-user-drag: none; }
+  .dsg-stage iframe { width: 100%; height: 100%; border: 0; background: #fff; }
+  .dsg-nav {
+    position: absolute; top: 50%; transform: translateY(-50%); z-index: 2;
+    width: 38px; height: 38px; border-radius: 50%; border: 0; cursor: pointer;
+    background: rgba(15,23,42,0.55); color: #fff; font-size: 18px; line-height: 38px;
+  }
+  .dsg-nav:hover { background: rgba(15,23,42,0.75); }
+  .dsg-note {
+    position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%);
+    background: rgba(15,23,42,0.7); color: #fff; font-size: 11.5px; font-weight: 600;
+    padding: 5px 12px; border-radius: 999px; white-space: nowrap;
+  }
+  .dsg-nav.prev { left: 12px; } .dsg-nav.next { right: 12px; }
+  .dsg-thumbs { display: flex; gap: 8px; padding: 10px 18px 14px; overflow-x: auto; flex: none; }
+  .dsg-thumbs:empty { padding: 0 0 14px; }
+  .dsg-thumbs button {
+    flex: none; width: 60px; height: 60px; padding: 0; border-radius: 8px; overflow: hidden; cursor: pointer;
+    border: 2px solid transparent; background: #e2e8f0; color: #475569; font-size: 10px; font-weight: 700;
+  }
+  .dsg-thumbs button.on { border-color: #7c3aed; }
+  .dsg-thumbs img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .dsg-dl {
+    font-size: 12px; font-weight: 700; color: #fff; background: #7c3aed; padding: 7px 14px;
+    border-radius: 8px; text-decoration: none; white-space: nowrap;
+  }
   .chart-panel {
     background: var(--surface); border: 1px solid var(--border);
     border-radius: 12px; padding: 12px 16px 10px;
@@ -14317,18 +14647,20 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     /* ───── 부자재 규격 → 카드 형태 ───── */
     .spec-head { display: none; }
     .spec-row {
-      grid-template-columns: 1fr auto;
+      grid-template-columns: 1fr auto auto;
       grid-template-areas:
-        "code price"
-        "name name"
-        "div check"
-        "size size"
-        "mat mat"
-        "vendor moq";
+        "code code price"
+        "name name name"
+        "div design check"
+        "size size size"
+        "mat mat mat"
+        "vendor vendor moq";
       gap: 4px 8px; padding: 10px 12px;
       font-size: 11.5px;
     }
     .spec-row .sc-check  { grid-area: check; display: flex; align-items: center; justify-content: flex-end; }
+    .spec-row .sc-design { grid-area: design; }
+    #design-modal .dsg-modal { height: calc(100vh - 16px); }
     .spec-row .sc-code   { grid-area: code; }
     .spec-row .sc-name   { grid-area: name; white-space: normal; }
     .spec-row .sc-div    { grid-area: div; justify-self: start; }
@@ -15270,6 +15602,33 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     <div id="spec-preview-content" style="flex:1;display:flex;overflow:auto;min-height:300px">
       <div class="loading" style="margin:auto">로딩 중...</div>
     </div>
+  </div>
+</div>
+
+<!-- 부자재 시안 보기 (2026-10-28) -->
+<div class="modal-overlay" id="design-modal" style="z-index:131">
+  <div class="modal dsg-modal">
+    <div class="modal-header">
+      <div style="min-width:0">
+        <div style="display:flex;align-items:center;gap:8px">
+          <div class="code-badge" style="background:linear-gradient(135deg,#7c3aed,#a78bfa);margin-bottom:0">시안</div>
+          <div class="dsg-rot">
+            <button onclick="dsgRotate(-90)" title="왼쪽으로 90° 돌리기">⟲ 왼쪽</button>
+            <button onclick="dsgRotate(90)" title="오른쪽으로 90° 돌리기">⟳ 오른쪽</button>
+            <button onclick="dsgRotate(180)" title="거꾸로 뒤집기 (180°)">↻ 180°</button>
+          </div>
+        </div>
+        <h2 id="dsg-title" style="margin-top:8px"></h2>
+        <div id="dsg-sub" style="color:var(--text-2);margin-top:4px"></div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <a id="dsg-dl" class="dsg-dl" href="#" rel="noopener" style="display:none">⬇ 원본 받기</a>
+        <button class="modal-close" onclick="closeDesign()">&times;</button>
+      </div>
+    </div>
+    <div class="dsg-stage" id="dsg-stage"></div>
+    <div class="dsg-badge" id="dsg-badge" style="display:none"></div>
+    <div class="dsg-thumbs" id="dsg-thumbs"></div>
   </div>
 </div>
 
@@ -18550,6 +18909,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     try {
       const res = await fetch('/api/materials');
       const d = await res.json();
+      if (d.locked) {   // GCP — 호스트 PC 전용 (2026-10-29)
+        panelLockNote(document.querySelector('.pcalc-panel'), '단가의 잦은 변동으로 인한 안정화 시 오픈', '단가가 안정되면 다시 열립니다');
+        return;
+      }
       _pcalcMaterials = d.materials || [];
       document.getElementById('pcalc-samples').textContent = d.total_samples || 0;
       document.querySelectorAll('.pcalc-cat-tab').forEach(t => {
@@ -19423,7 +19786,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const b = sec.querySelector('.col-btn'); if (b) b.textContent = c ? '▸ 펼치기' : '▾ 접기';
     try { const s = colState(); s[id] = c; localStorage.setItem('mhCollapsed', JSON.stringify(s)); } catch (e) {}
     if (!c) {   // 펼칠 때 지연 초기화 (3D 뷰어·차트 리사이즈)
-      if (id === 'sec-ipsu' && typeof ipsuInitViewers === 'function') { ipsuInitViewers(); setTimeout(() => [_ipsuV1, _ipsuV2, _ipsuV3].forEach(v => v && v.resize && v.resize()), 50); }
+      if (id === 'sec-ipsu' && typeof ipsuInitViewers === 'function' && !window._ipsuLocked) { ipsuInitViewers(); setTimeout(() => [_ipsuV1, _ipsuV2, _ipsuV3].forEach(v => v && v.resize && v.resize()), 50); }
       if (id === 'sec-sales' && typeof _sbChart !== 'undefined' && _sbChart) setTimeout(() => _sbChart.resize(), 50);
       window.dispatchEvent(new Event('resize'));
     }
@@ -20195,6 +20558,13 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     try {
       const res = await fetch('/api/spec_list');
       const d = await res.json();
+      if (d.locked) {   // 호스트 PC 전용 패널 — GCP에선 잠금 표시만 (2026-10-28)
+        _specItems = [];
+        document.getElementById('spec-search').style.display = 'none';
+        document.getElementById('spec-count').textContent = '🔒 호스트 전용';
+        document.getElementById('spec-list').innerHTML = '<div class="alert-empty" style="padding:22px 12px;line-height:1.7">🔒 부자재 규격은 <b>호스트 PC</b>(사무실 대시보드)에서만 볼 수 있습니다.</div>';
+        return;
+      }
       _specItems = d.items || [];
       renderSpecList();
     } catch (e) {
@@ -20219,6 +20589,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     try {
       const res = await fetch('/api/ipsu_specs');
       const d = await res.json();
+      if (d.locked) { ipsuShowLocked(); return; }   // GCP — 호스트 PC 전용 (2026-10-29)
       _ipsuSpecs = (d.specs || []).filter(s => s.dim);   // 치수 파싱된 것만
       _ipsuBoxes = d.boxes || [];
       // 외박스(RRP/전용박스) — 3차원 규격 중 단상자(B코드)를 뺀 것
@@ -20237,6 +20608,24 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     // 접힌 상태면 3D 뷰어 초기화를 펼칠 때로 미룸 (display:none 상태에선 캔버스 크기 0)
     const _sec = document.getElementById('sec-ipsu');
     if (!_sec || !_sec.classList.contains('collapsed')) ipsuInitViewers();
+  }
+  // 잠금 안내 — 패널 머리만 남기고 입력·3D 영역은 숨김 (사용자 "정확도를 위해 추후 배포예정으로 보이게")
+  function ipsuShowLocked() {
+    window._ipsuLocked = true;
+    document.getElementById('ipsu-stat').textContent = '';
+    panelLockNote(document.querySelector('.ipsu-panel'), '정확도를 위해 추후 배포 예정', '실측 데이터 보정이 끝나면 다시 열립니다');
+  }
+  // 호스트 전용 패널(GCP) — 머리만 남기고 본문은 숨긴 뒤 안내 문구 표시
+  function panelLockNote(panel, title, sub) {
+    if (!panel || panel.querySelector('.panel-lock-note')) return;
+    Array.from(panel.children).forEach(c => { if (!c.classList.contains('chart-head')) c.style.display = 'none'; });
+    const m = document.createElement('div');
+    m.className = 'panel-lock-note';
+    m.style.cssText = 'padding:34px 16px;text-align:center;color:var(--text-3);font-size:13px;line-height:1.7';
+    m.innerHTML = '<div style="font-size:26px;margin-bottom:6px">🛠️</div>'
+      + '<div style="font-weight:700;color:var(--text-2);font-size:14px">' + title + '</div>'
+      + '<div style="font-size:11.5px;margin-top:2px">' + sub + '</div>';
+    panel.appendChild(m);
   }
 
   // ── 검색/자동 채움 ──
@@ -21479,6 +21868,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     }
     let html = '<div class="spec-head">'
       + '<div>품번</div><div>품명</div><div>구분</div><div>사이즈</div><div>재질</div>'
+      + '<div class="h-design" title="Monday 시안 파일 — 아이콘을 누르면 보기">시안</div>'
       + '<div class="h-check" title="단가 계산기 연동">↑</div>'
       + '<div class="h-moq">MOQ</div><div class="h-price">단가</div><div>업체</div>'
       + '</div>';
@@ -21503,6 +21893,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         + '<span class="sc-div ' + divCls + '" title="' + escapeHtml(divVal) + '">' + escapeHtml(divVal || '-') + '</span>'
         + '<span class="sc-size" title="' + escapeHtml(it.size || '') + '">' + escapeHtml(it.size || '-') + '</span>'
         + '<span class="sc-mat" title="' + escapeHtml(it.material) + '">' + escapeHtml(it.material) + '</span>'
+        + '<span class="sc-design">' + (it.design && it.item_id
+            ? '<button class="sc-design-btn" title="시안 보기' + (it.design > 1 ? ' (' + it.design + '개)' : '') + '" onclick="event.stopPropagation();openDesign(\\'' + escapeHtml(it.item_id) + '\\',\\'' + escapeHtml(it.code) + '\\')">' + dsgIcon() + (it.design > 1 ? '<span class="n">' + it.design + '</span>' : '') + '</button>'
+            : '-') + '</span>'
         + '<span class="sc-check" onclick="event.stopPropagation()">'
         + '<input type="checkbox" class="spec-calc-cb" ' + cbAttrs + ' onchange="specLinkToCalc(this)" title="단가 계산기에 연동">'
         + '</span>'
@@ -21513,6 +21906,204 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     }).join('');
     list.innerHTML = html;
   }
+
+  // ───── 부자재 시안 보기 (2026-10-28) — Monday 부자재 규격 보드 '시안' 파일 칸 ─────
+  function dsgIcon() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2.5"/><circle cx="8.5" cy="8.5" r="1.6"/><path d="M21 15l-5-5L5 21"/></svg>'; }
+  let _dsgFiles = [], _dsgIdx = 0, _dsgSeq = 0;
+  const _dsgMB = n => n >= 1e6 ? Math.round(n / 1e6) + 'MB' : Math.max(1, Math.round(n / 1e3)) + 'KB';
+  async function openDesign(itemId, code) {
+    const it = (_specItems || []).find(x => x.item_id === itemId) || {};
+    const modal = document.getElementById('design-modal');
+    _dsgRot = 0;   // 회전은 창을 열 때마다 처음 방향으로 (같은 시안의 다음 쪽으로 넘길 땐 유지)
+    document.getElementById('dsg-title').textContent = (code || '') + (it.name ? ' · ' + it.name : '');
+    const sub = document.getElementById('dsg-sub');
+    sub.dataset.base = sub.textContent = [it.div, it.size, it.vendor].filter(Boolean).join(' · ');
+    document.getElementById('dsg-stage').innerHTML = '<div class="loading" style="margin:auto">시안 불러오는 중...</div>';
+    document.getElementById('dsg-thumbs').innerHTML = '';
+    document.getElementById('dsg-dl').style.display = 'none';
+    modal.classList.add('show');
+    try {
+      const d = await (await fetch('/api/spec_design/' + itemId)).json();
+      if (!d.ok) throw new Error(d.error || '불러오기 실패');
+      _dsgFiles = d.files || []; _dsgIdx = 0;
+      dsgThumbs();
+      showDesign(0);
+    } catch (e) {
+      document.getElementById('dsg-stage').innerHTML = '<div class="search-empty" style="margin:auto;color:#ef4444">시안을 불러오지 못했습니다: ' + escapeHtml(e.message) + '</div>';
+    }
+  }
+  // 미리보기 쪽 주소 — .ai는 대지마다 한 쪽(최대 8쪽), 쪽마다 목록 한 칸으로 펼쳐 화살표·썸네일로 넘김
+  const dsgSrc = (f, hd) => f.preview + '?page=' + (f.page || 1) + (hd ? '&hd=1' : '');
+  function dsgThumbs() {
+    document.getElementById('dsg-thumbs').innerHTML = _dsgFiles.length > 1 ? _dsgFiles.map((f, i) =>
+      '<button onclick="showDesign(' + i + ')" title="' + escapeHtml(f.name) + (f.page ? ' · ' + f.page + '쪽' : '') + '">'
+      + (f.kind === 'image' ? '<img src="' + escapeHtml(f.url) + '" alt="" loading="lazy">'
+        : (f.preview && f.expanded ? '<img src="' + escapeHtml(dsgSrc(f)) + '" alt="" loading="lazy">' : escapeHtml((f.ext || f.kind).toUpperCase())))
+      + '</button>').join('') : '';
+  }
+  function showDesign(i) {
+    if (!_dsgFiles.length) return;
+    _dsgIdx = (i + _dsgFiles.length) % _dsgFiles.length;
+    const f = _dsgFiles[_dsgIdx], stage = document.getElementById('dsg-stage');
+    const nav = _dsgFiles.length > 1
+      ? '<button class="dsg-nav prev" onclick="showDesign(_dsgIdx - 1)" title="이전 (←)">‹</button><button class="dsg-nav next" onclick="showDesign(_dsgIdx + 1)" title="다음 (→)">›</button>' : '';
+    stage.classList.remove('zoom');
+    const seq = ++_dsgSeq;
+    _dsgZ = 1;
+    document.getElementById('dsg-badge').style.display = 'none';
+    _dsgFiles.forEach(x => { if (x.hdState === 'shown') x.hdState = 'ready'; });   // 새로 그릴 땐 기본 그림부터
+    const imgTag = src => '<div class="dsg-box"><img src="' + escapeHtml(src) + '" alt="' + escapeHtml(f.name) + '" draggable="false" onload="dsgOnLoad(this)" title="마우스 휠: 확대·축소 · 끌기: 이동 · 클릭: 크게 보기/맞춤"></div>';
+    if (f.kind === 'image') {
+      stage.innerHTML = nav + imgTag(f.url);
+    } else if (f.preview && f.expanded) {
+      stage.innerHTML = nav + imgTag(dsgSrc(f))
+        + (f.pages > f.rendered && f.page === f.rendered ? '<div class="dsg-note">' + f.pages + '쪽 중 앞 ' + f.rendered + '쪽까지만 보입니다 — 전체는 [원본 받기]</div>' : '');
+    } else if (f.preview) {
+      // .ai(PDF 호환)·.pdf — 서버가 쪽별 JPG로 만들어 둔 것을 보여 줌. 처음 한 번은 원본을 받아 변환하느라 시간이 걸림
+      stage.innerHTML = nav + '<div class="loading" style="margin:auto;text-align:center;line-height:1.7">'
+        + (f.ready ? '시안 불러오는 중...' : '미리보기 만드는 중...<br><span style="font-size:11.5px;color:var(--text-3)">원본 ' + _dsgMB(f.size) + ' · 처음 한 번만 시간이 걸리고 다음부터는 바로 열립니다</span>') + '</div>';
+      fetch(f.preview + '?check=1').then(r => r.json()).then(d => {
+        if (seq !== _dsgSeq) return;   // 그사이 다른 파일로 넘겼거나 창을 닫음
+        if (!d.ok) throw new Error(d.error || '미리보기 실패');
+        const n = d.rendered || 1;
+        Object.assign(f, {ready: true, expanded: true, page: 1, pages: d.pages || n, rendered: n});
+        if (n > 1) {   // 쪽마다 한 칸씩 펼침
+          const extra = [];
+          for (let p = 2; p <= n; p++) extra.push(Object.assign({}, f, {page: p}));
+          _dsgFiles.splice(_dsgIdx + 1, 0, ...extra);
+        }
+        dsgThumbs();
+        showDesign(_dsgIdx);
+      }).catch(e => {
+        if (seq !== _dsgSeq) return;
+        stage.innerHTML = nav + '<div class="search-empty" style="margin:auto;text-align:center">미리보기를 만들지 못했습니다: ' + escapeHtml(e.message) + '<br>오른쪽 위 [원본 받기]로 받아서 열어 주세요.</div>';
+      });
+    } else {
+      stage.innerHTML = nav + '<div class="search-empty" style="margin:auto;text-align:center">' + escapeHtml((f.ext || '').toUpperCase() || '링크') + ' 파일은 화면에서 바로 볼 수 없습니다.<br>오른쪽 위 버튼으로 받아서 열어 주세요.</div>';
+    }
+    document.querySelectorAll('#dsg-thumbs button').forEach((b, k) => b.classList.toggle('on', k === _dsgIdx));
+    const sub = document.getElementById('dsg-sub');
+    sub.textContent = (sub.dataset.base ? sub.dataset.base + ' │ ' : '') + f.name
+      + (f.page && f.pages > 1 ? ' · ' + f.page + '/' + f.pages + '쪽' : (_dsgFiles.length > 1 ? ' (' + (_dsgIdx + 1) + '/' + _dsgFiles.length + ')' : ''));
+    const dl = document.getElementById('dsg-dl');
+    dl.href = f.url; dl.target = f.kind === 'link' ? '_blank' : '_self';
+    dl.textContent = f.kind === 'link' ? '↗ 링크 열기' : '⬇ 원본 받기' + (f.size ? ' (' + (f.ext || '').toUpperCase() + ' ' + _dsgMB(f.size) + ')' : '');
+    dl.style.display = '';
+  }
+  function closeDesign() {
+    document.getElementById('design-modal').classList.remove('show');
+    document.getElementById('dsg-stage').innerHTML = '';
+    _dsgFiles = []; _dsgSeq++;
+  }
+  document.getElementById('design-modal').addEventListener('click', e => { if (e.target.id === 'design-modal') closeDesign(); });
+  // 시안 확대·축소 (2026-10-29) — 휠은 커서 위치를 기준으로 확대, 확대 중엔 끌어서 이동, 클릭은 크게 보기 ↔ 맞춤
+  let _dsgZ = 1, _dsgDrag = null, _dsgMoved = false;
+  // 크기·회전은 처음 불러온 기본 그림 크기(nw0·nh0) 기준으로 계산 → 확대 중 고해상도로 바꿔 끼워도 화면 크기가 튀지 않음
+  let _dsgRot = 0;
+  function dsgGeom() {
+    const st = document.getElementById('dsg-stage'), box = st.querySelector('.dsg-box'), img = box && box.querySelector('img');
+    if (!img || !box.dataset.nw0) return null;
+    const nw0 = +box.dataset.nw0, nh0 = +box.dataset.nh0, side = _dsgRot % 180 !== 0;
+    const rw = side ? nh0 : nw0, rh = side ? nw0 : nh0;   // 돌린 뒤 가로·세로
+    if (!box.dataset.fit) box.dataset.fit = Math.min(st.clientWidth / rw, st.clientHeight / rh, 1);
+    return { st, box, img, nw0, nh0, rw, rh, fit: +box.dataset.fit };
+  }
+  function dsgApply() {
+    const g = dsgGeom(); if (!g) return;
+    const s = g.fit * _dsgZ;
+    g.box.style.width = g.rw * s + 'px'; g.box.style.height = g.rh * s + 'px';
+    Object.assign(g.img.style, { width: g.nw0 * s + 'px', height: g.nh0 * s + 'px',
+      left: (g.rw - g.nw0) * s / 2 + 'px', top: (g.rh - g.nh0) * s / 2 + 'px', transform: 'rotate(' + _dsgRot + 'deg)' });
+    g.st.classList.toggle('zoom', _dsgZ > 1.001);
+  }
+  function dsgOnLoad(img) {
+    const box = img.parentNode;
+    if (!box.dataset.nw0) { box.dataset.nw0 = img.naturalWidth; box.dataset.nh0 = img.naturalHeight; }
+    dsgApply();
+  }
+  function dsgRotate(d) {
+    _dsgRot = (_dsgRot + d + 360) % 360;
+    const g = dsgGeom(); if (!g) return;
+    delete g.box.dataset.fit; _dsgZ = 1; dsgApply();
+    g.st.scrollLeft = 0; g.st.scrollTop = 0;
+  }
+  function dsgZoomTo(z, cx, cy) {
+    const g = dsgGeom(); if (!g) return;
+    const f = _dsgFiles[_dsgIdx] || {};
+    // 최대: 시안 미리보기는 고해상도(2.5배)의 1.25배, 사진(jpg)은 원본의 2배
+    z = Math.min(Math.max(z, 1), Math.max((f.preview ? 2.5 * 1.25 : 2) / g.fit, 2));
+    const r0 = g.box.getBoundingClientRect();
+    const px = Math.min(Math.max((cx - r0.left) / r0.width, 0), 1), py = Math.min(Math.max((cy - r0.top) / r0.height, 0), 1);
+    _dsgZ = z <= 1.001 ? 1 : z;
+    dsgApply();
+    if (_dsgZ === 1) return;
+    const r1 = g.box.getBoundingClientRect();   // 커서 아래 지점이 그대로 커서 아래 있도록 스크롤 보정
+    g.st.scrollLeft += r1.left + px * r1.width - cx;
+    g.st.scrollTop += r1.top + py * r1.height - cy;
+    if (f.preview && g.fit * _dsgZ > 1.05) dsgLoadHd();   // 기본 그림보다 크게 보이면 고해상도로
+  }
+  window.addEventListener('resize', () => {
+    const g = document.getElementById('design-modal').classList.contains('show') && dsgGeom();
+    if (g) { delete g.box.dataset.fit; dsgApply(); }
+  });
+  // 확대용 고해상도(긴 변 6000px) — 처음 필요할 때 받아 와서 같은 자리에 바꿔 끼움. 없으면 서버가 이때 만듦(큰 파일은 1~2분)
+  function dsgLoadHd() {
+    const f = _dsgFiles[_dsgIdx];
+    if (!f || !f.preview || f.hdState === 'loading' || f.hdState === 'shown') return;
+    const seq = _dsgSeq, badge = document.getElementById('dsg-badge');
+    const swap = () => {
+      const pre = new Image(), src = dsgSrc(f, true);
+      pre.onload = () => {
+        const img = document.querySelector('#dsg-stage img');
+        if (seq !== _dsgSeq || !img) return;
+        img.src = src; f.hdState = 'shown'; badge.style.display = 'none';
+      };
+      pre.onerror = () => { f.hdState = ''; badge.textContent = '고해상도를 불러오지 못했습니다'; };
+      pre.src = src;
+    };
+    if (f.hdState === 'ready') { swap(); return; }
+    f.hdState = 'loading';
+    badge.textContent = '🔍 선명한 고해상도로 바꾸는 중…'; badge.style.display = '';
+    fetch(f.preview + '?check=1&hd=1').then(r => r.json()).then(d => {
+      if (!d.ok || !d.hd) throw new Error(d.error || '고해상도 없음');
+      _dsgFiles.forEach(x => { if (x.preview === f.preview && x.hdState !== 'shown') x.hdState = 'ready'; });
+      if (seq !== _dsgSeq) return;
+      f.hdState = 'ready'; swap();
+    }).catch(e => { f.hdState = ''; if (seq === _dsgSeq) badge.textContent = '고해상도 실패: ' + e.message; });
+  }
+  (() => {
+    const st = document.getElementById('dsg-stage');
+    st.addEventListener('wheel', e => {
+      if (!st.querySelector('img')) return;
+      e.preventDefault();
+      dsgZoomTo(_dsgZ * Math.exp(-e.deltaY * 0.0015), e.clientX, e.clientY);
+    }, { passive: false });
+    st.addEventListener('mousedown', e => {
+      if (!st.classList.contains('zoom') || e.button !== 0 || e.target.tagName !== 'IMG') return;
+      e.preventDefault();
+      _dsgDrag = { x: e.clientX, y: e.clientY, sl: st.scrollLeft, stp: st.scrollTop, moved: false };
+      st.classList.add('drag');
+    });
+    window.addEventListener('mousemove', e => {
+      if (!_dsgDrag) return;
+      const dx = e.clientX - _dsgDrag.x, dy = e.clientY - _dsgDrag.y;
+      if (Math.abs(dx) + Math.abs(dy) > 4) _dsgDrag.moved = true;
+      st.scrollLeft = _dsgDrag.sl - dx; st.scrollTop = _dsgDrag.stp - dy;
+    });
+    window.addEventListener('mouseup', () => { if (_dsgDrag) { _dsgMoved = _dsgDrag.moved; _dsgDrag = null; st.classList.remove('drag'); } });
+    st.addEventListener('click', e => {
+      if (e.target.tagName !== 'IMG') return;
+      if (_dsgMoved) { _dsgMoved = false; return; }   // 끌어서 옮긴 뒤의 클릭은 무시
+      if (_dsgZ > 1) dsgZoomTo(1, e.clientX, e.clientY);
+      else { const g = dsgGeom(); if (g) dsgZoomTo(Math.max(1 / g.fit, 2.5), e.clientX, e.clientY); }
+    });
+  })();
+  document.addEventListener('keydown', e => {
+    if (!document.getElementById('design-modal').classList.contains('show')) return;
+    if (e.key === 'Escape') closeDesign();
+    else if (e.key === 'ArrowLeft' && _dsgFiles.length > 1) showDesign(_dsgIdx - 1);
+    else if (e.key === 'ArrowRight' && _dsgFiles.length > 1) showDesign(_dsgIdx + 1);
+  });
 </script>
 </body>
 </html>'''
