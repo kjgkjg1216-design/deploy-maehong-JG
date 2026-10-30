@@ -6291,7 +6291,7 @@ def index():
             session['_last_visit_log'] = _t.time()
             _log_visit('visit')
     import json as _json
-    return render_template_string(DASHBOARD_TEMPLATE, public_mode=public_mode,
+    return render_template_string(DASHBOARD_TEMPLATE, public_mode=public_mode, host_pc=_IS_HOST_PC,
                                   user_json=_json.dumps(current_user()))
 
 
@@ -6543,13 +6543,16 @@ def api_spec_design(item_id):
             if a:
                 ext = (a.get('file_extension') or '').lower().lstrip('.')
                 aid = str(a.get('id'))
+                pm = _design_preview_meta(aid) if ext in ('ai', 'pdf') else None
                 files.append({'name': a.get('name') or f.get('name') or '', 'ext': ext, 'id': aid,
                               'size': int(a.get('file_size') or 0),
                               'kind': 'image' if ext in img_ext else ('pdf' if ext == 'pdf' else 'file'),
                               'url': a.get('public_url') or '',
                               # .ai(PDF 호환)·.pdf는 서버가 첫 페이지 JPG 미리보기를 만들어 보여 줌 (원본은 받기 버튼)
                               'preview': f'/api/spec_design_preview/{item_id}/{aid}' if ext in ('ai', 'pdf') else '',
-                              'ready': ext in ('ai', 'pdf') and bool(_design_preview_meta(aid))})
+                              'ready': bool(pm),
+                              'nopdf': bool((pm or {}).get('nopdf')),   # 'PDF 호환' 없이 저장된 .ai (안내문뿐)
+                              'thumb': bool((pm or {}).get('thumb'))})   # 그 1쪽 = 파일 속 작은 썸네일
             elif f.get('linkToFile'):   # 구글 드라이브 등 링크로 붙인 파일
                 files.append({'name': f.get('name') or '링크', 'ext': '', 'kind': 'link', 'url': f.get('linkToFile')})
     if not files:
@@ -6631,29 +6634,19 @@ def _design_preview_make(item_id, asset_id, low=False, hd=False):
                     m = dict(m0, pages=c.get('pages'), rendered=n, src='cloud')
                     if need_hd:
                         m['hd'] = int(c.get('hd') or 0)
+                    if c.get('chk'):
+                        m.update(chk=1, nopdf=bool(c.get('nopdf')))
+                    if c.get('thumb') is not None:
+                        m['thumb'] = bool(c.get('thumb'))
                     json.dump(m, open(meta, 'w', encoding='utf-8'), ensure_ascii=False)
                     return None
             except Exception as e:
                 print(f'[시안 미리보기] GCP에서 받기 실패 → 직접 만듦: {e!r:.120}')
-        try:
-            q = '{ items(ids: [%s]) { assets { id name public_url file_extension } } }' % item_id
-            r = _req.post('https://api.monday.com/v2', json={'query': q},
-                          headers={'Authorization': os.getenv('MONDAY_API_KEy') or '', 'API-Version': '2024-10'}, timeout=20)
-            its = (r.json().get('data') or {}).get('items') or []
-            a = next((x for x in (its[0].get('assets') or []) if str(x.get('id')) == str(asset_id)), None) if its else None
-        except Exception as e:
-            return f'Monday 조회 실패: {e}'[:200], 502
-        if a is None:
-            return '시안 파일을 찾을 수 없음', 404
         tmp_dir = tempfile.mkdtemp(prefix='dsgsrc_')
         try:
-            src = os.path.join(tmp_dir, 'src' + (a.get('file_extension') or '.pdf'))
-            with _req.get(a.get('public_url') or '', stream=True, timeout=(15, 120)) as resp:
-                if resp.status_code != 200:
-                    return f'원본 내려받기 실패 (HTTP {resp.status_code})', 502
-                with open(src, 'wb') as fp:
-                    for chunk in resp.iter_content(1 << 20):
-                        fp.write(chunk)
+            src, a = _design_fetch_src(item_id, asset_id, tmp_dir)
+            if src is None:
+                return a
             m = dict(m0, name=a.get('name', ''))
             for k in ([False] if need_std else []) + ([True] if need_hd else []):
                 prefix = os.path.join(tmp_dir, 'hd' if k else 'out')
@@ -6672,6 +6665,10 @@ def _design_preview_make(item_id, asset_id, low=False, hd=False):
                     m['hd'] = n
                 else:
                     m.update(pages=res.get('pages'), rendered=n)
+                if res.get('chk'):   # 'PDF 호환' 없이 저장된 .ai(안내문뿐) 여부 — pdftotext 있는 GCP만
+                    m.update(chk=1, nopdf=bool(res.get('nopdf')))
+                    if res.get('nopdf'):   # thumb = 1쪽을 파일 속 작은 썸네일로 바꿔 끼움
+                        m['thumb'] = bool(res.get('thumb'))
             json.dump(m, open(meta, 'w', encoding='utf-8'), ensure_ascii=False)
             return None
         except _sp.TimeoutExpired:
@@ -6680,6 +6677,109 @@ def _design_preview_make(item_id, asset_id, low=False, hd=False):
             return f'미리보기 실패: {e}'[:200], 500
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _design_fetch_src(item_id, asset_id, tmp_dir):
+    """시안 원본을 tmp_dir에 받음(수백 MB도 메모리에 안 올리고 디스크로) → (경로, Monday asset) 또는 (None, (오류 문구, 상태코드))."""
+    import requests as _req
+    try:
+        q = '{ items(ids: [%s]) { assets { id name public_url file_extension } } }' % item_id
+        r = _req.post('https://api.monday.com/v2', json={'query': q},
+                      headers={'Authorization': os.getenv('MONDAY_API_KEy') or '', 'API-Version': '2024-10'}, timeout=20)
+        its = (r.json().get('data') or {}).get('items') or []
+        a = next((x for x in (its[0].get('assets') or []) if str(x.get('id')) == str(asset_id)), None) if its else None
+    except Exception as e:
+        return None, (f'Monday 조회 실패: {e}'[:200], 502)
+    if a is None:
+        return None, ('시안 파일을 찾을 수 없음', 404)
+    src = os.path.join(tmp_dir, 'src' + (a.get('file_extension') or '.pdf'))
+    with _req.get(a.get('public_url') or '', stream=True, timeout=(15, 120)) as resp:
+        if resp.status_code != 200:
+            return None, (f'원본 내려받기 실패 (HTTP {resp.status_code})', 502)
+        with open(src, 'wb') as fp:
+            for chunk in resp.iter_content(1 << 20):
+                fp.write(chunk)
+    return src, a
+
+
+def _design_need_chk(m):
+    """안내문 여부를 아직 안 봤거나, 안내문뿐인데 썸네일 처리(2026-10-30 추가) 전인 미리보기."""
+    return bool(m) and (not m.get('chk') or (m.get('nopdf') and 'thumb' not in m))
+
+
+def _design_put_thumb(asset_id, data):
+    """안내문뿐인 .ai의 1쪽(기본·고해상도)을 파일 속 썸네일 JPG로 바꿔 끼움 (2026-10-30, 사용자 "작은 미리보기라도")."""
+    for hd in (False, True):
+        p = _design_preview_paths(asset_id, 1, hd)[0]
+        if not hd or os.path.exists(p):
+            with open(p, 'wb') as fp:
+                fp.write(data)
+
+
+def _design_check_nopdf(item_id, asset_id):
+    """이미 만든 미리보기에 'PDF 호환 없이 저장된 .ai'(그림 대신 일러스트레이터 안내문뿐) 여부를 채움 (2026-10-30, GCP 미리 만들기가 돌림).
+    그런 파일은 늘 1쪽이라 1쪽짜리만 원본을 받아 pdftotext로 보고, 안내문뿐이면 1쪽을 파일 속 썸네일로 바꿈. 나머지는 확인한 것으로 표시.
+    → None 또는 (오류 문구, 상태코드)"""
+    import subprocess as _sp
+    import shutil, tempfile
+    with _DSG_LOCKS_GUARD:
+        lk = _DSG_LOCKS.setdefault(asset_id, threading.Lock())
+    with lk:
+        m = _design_preview_meta(asset_id)
+        if not _design_need_chk(m):
+            return None
+        if int(m.get('rendered') or 0) == 1:
+            tmp_dir = tempfile.mkdtemp(prefix='dsgchk_')
+            try:
+                src, a = _design_fetch_src(item_id, asset_id, tmp_dir)
+                if src is None:
+                    return a
+                thumb = os.path.join(tmp_dir, 'thumb.jpg')
+                cmd = [sys.executable, os.path.join(BASE_DIR, 'design_preview.py'), '--check', src, '1', thumb]
+                if os.name != 'nt':
+                    cmd = ['nice', '-n', '19'] + cmd
+                pr = _sp.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=600, cwd=BASE_DIR)
+                lines = (pr.stdout or '').strip().splitlines()
+                res = json.loads(lines[-1]) if lines else {}
+                if not res.get('chk'):
+                    return '안내문 여부 확인 실패', 500
+                m['nopdf'] = bool(res.get('nopdf'))
+                if m['nopdf']:
+                    m['thumb'] = bool(res.get('thumb')) and os.path.exists(thumb)
+                    if m['thumb']:
+                        _design_put_thumb(asset_id, open(thumb, 'rb').read())
+            except Exception as e:
+                return f'안내문 여부 확인 실패: {e}'[:200], 500
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+        m['chk'] = 1
+        json.dump(m, open(_design_preview_paths(asset_id)[1], 'w', encoding='utf-8'), ensure_ascii=False)
+        return None
+
+
+def _design_sync_chk(item_id, asset_id):
+    """호스트 PC: GCP에서 받아 온 미리보기에 안내문 여부(chk·nopdf·thumb)가 없으면 GCP 것을 받아 채움 (GCP가 확인을 마친 뒤부터).
+    안내문뿐이면 GCP가 썸네일로 바꿔 둔 1쪽도 다시 받음."""
+    import requests as _req
+    m = _design_preview_meta(asset_id)
+    if not _design_need_chk(m):
+        return
+    base, tok = f'{_VENDOR_CLOUD}/api/spec_design_preview/{item_id}/{asset_id}', _vendor_secret()
+    try:
+        c = _req.get(base, params={'check': '1', 'token': tok}, timeout=20).json()
+        if not (c.get('ok') and c.get('chk')) or (c.get('nopdf') and c.get('thumb') is None):
+            return   # GCP도 아직 확인 전
+        m.update(chk=1, nopdf=bool(c.get('nopdf')))
+        if m['nopdf']:
+            m['thumb'] = bool(c.get('thumb'))
+            if m['thumb']:
+                r = _req.get(base, params={'token': tok, 'page': 1, 'hd': '0'}, timeout=60)
+                if r.status_code != 200 or r.content[:2] != b'\xff\xd8':
+                    return
+                _design_put_thumb(asset_id, r.content)
+    except Exception:
+        return
+    json.dump(m, open(_design_preview_paths(asset_id)[1], 'w', encoding='utf-8'), ensure_ascii=False)
 
 
 def _design_warm_todo():
@@ -6701,10 +6801,14 @@ def _design_warm_loop():
     while True:
         try:
             made = fail = 0
-            for item_id, asset_id in _design_warm_todo():
-                if not item_id.isdigit() or (_design_preview_meta(asset_id) or {}).get('hd'):
+            # 다 만든 것의 안내문·썸네일 확인(가벼움)을 먼저 — 새로 만들기는 큰 파일이 15분 시간 초과로 막기도 해서 나중에
+            todo = sorted(_design_warm_todo(), key=lambda x: not (_design_preview_meta(x[1]) or {}).get('hd'))
+            for item_id, asset_id in todo:
+                m = _design_preview_meta(asset_id) or {}
+                if not item_id.isdigit() or (m.get('hd') and not _design_need_chk(m)):
                     continue
-                err = _design_preview_make(item_id, asset_id, low=True)
+                # 다 만든 것은 안내문 여부·썸네일만 채움(2026-10-30 이전에 만든 것), 아니면 만들기(만들면서 함께 확인)
+                err = _design_check_nopdf(item_id, asset_id) if m.get('hd') else _design_preview_make(item_id, asset_id, low=True)
                 if err:
                     fail += 1
                     print(f'[시안 미리보기] {item_id}/{asset_id} 실패: {err[0]}')
@@ -6738,9 +6842,14 @@ def api_spec_design_preview(item_id, asset_id):
     err = _design_preview_make(item_id, asset_id, hd=hd)
     if err:
         return jsonify({'ok': False, 'error': err[0]}), err[1]
+    if request.args.get('check') == '1' and _IS_HOST_PC:
+        _design_sync_chk(item_id, asset_id)
     m = _design_preview_meta(asset_id) or {}
     if request.args.get('check') == '1':
-        return jsonify({'ok': True, 'pages': m.get('pages'), 'rendered': m.get('rendered'), 'hd': m.get('hd') or 0})
+        # nopdf = 'PDF 호환' 없이 저장된 .ai — 미리보기가 일러스트레이터 안내문뿐이라 화면은 그림 대신 안내를 보여 줌
+        # thumb = 안내문 대신 1쪽에 파일 속 작은 썸네일(256px)을 넣어 둠 / None = 아직 안 봄
+        return jsonify({'ok': True, 'pages': m.get('pages'), 'rendered': m.get('rendered'), 'hd': m.get('hd') or 0,
+                        'chk': m.get('chk') or 0, 'nopdf': bool(m.get('nopdf')), 'thumb': m.get('thumb')})
     page = request.args.get('page', '1')
     page = int(page) if page.isdigit() else 1
     jpg = _design_preview_paths(asset_id, page, hd)[0]
@@ -13342,12 +13451,19 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .rc-src.po { background:#ecfdf5; color:#047857; } .rc-src.tbl { background:#eff6ff; color:#1d4ed8; } .rc-src.bom { background:#fef3c7; color:#92400e; } .rc-src.none { background:#fee2e2; color:#b91c1c; }
   @media (max-width:900px) { .return-strip { padding:0 12px; } .rc-summary { grid-template-columns:repeat(2,minmax(0,1fr)); } }
 
-  /* ── 패널 접기 ── */
-  .col-btn { border:1px solid #e2e8f0; background:#f8fafc; color:#475569; font-size:11px; font-weight:700; padding:3px 9px; border-radius:7px; cursor:pointer; font-family:inherit; white-space:nowrap; margin-left:8px; }
-  .col-btn:hover { background:#eef2ff; color:#4f46e5; }
-  section.collapsed .chart-panel > *:not(.chart-head) { display:none !important; }
-  section.collapsed .chart-panel { padding-bottom:12px; }
-  section.collapsed .chart-head { margin-bottom:0; }
+  /* ── 패널 클릭 시 열기 (2026-10-29) — 닫혀 있어도 크기는 그대로, 머리 아래 내용만 가리고 안내 문구 ── */
+  .chart-panel.p-closed { position:relative; cursor:pointer; }
+  .chart-panel.p-closed > *:not(.chart-head):not(.pnl-hint) { visibility:hidden; }
+  .pnl-hint { display:none; }
+  .chart-panel.p-closed > .pnl-hint { display:flex; position:absolute; left:0; right:0; bottom:0; max-height:420px;
+    align-items:center; justify-content:center; pointer-events:none; }
+  .pnl-hint span { font-size:12px; font-weight:600; color:var(--text-3); background:#f1f5f9; padding:6px 14px; border-radius:999px; transition:all .15s; }
+  .chart-panel.p-closed:hover .pnl-hint span { background:#eef2ff; color:#4f46e5; }
+  /* 호스트 전용 패널(GCP) — 머리 한 줄로 접고 🔒 문구 (2026-10-30) */
+  .chart-panel.p-locked > *:not(.chart-head) { display:none !important; }
+  .chart-panel.p-locked { padding-bottom:12px; }
+  .chart-panel.p-locked .chart-head { margin-bottom:0; align-items:center; flex-wrap:wrap; gap:6px; }
+  .pnl-lock { margin-left:auto; font-size:11.5px; font-weight:700; color:#64748b; background:#f1f5f9; border:1px solid #e2e8f0; padding:4px 12px; border-radius:999px; white-space:nowrap; }
   .sc-pill { display:inline-block; min-width:34px; text-align:center; padding:2px 7px; border-radius:7px; font-weight:800; font-size:12px; }
   .sc-a { background:#f0fdf4; color:#16a34a } .sc-b { background:#fefce8; color:#ca8a04 } .sc-c { background:#fef2f2; color:#dc2626 } .sc-n { background:#f1f5f9; color:#94a3b8 }
   .ck-overlay { display:none; position:fixed; inset:0; z-index:140; background:rgba(10,10,16,.55); backdrop-filter:blur(2px); align-items:flex-start; justify-content:center; padding-top:12vh }
@@ -14213,6 +14329,27 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     padding: 4px 9px; border-radius: 8px; }
   .pocal-drow .dqty:empty { display: none; }
   .pocal-empty { color: var(--text-3); font-size: 12.5px; padding: 40px 0; text-align: center; }
+  /* 입고 캘린더 창 크게 (2026-10-30, 사용자 "크기가 작은데 넓혀줘") — 1280px↑에선 창을 키우고 달력이 창 높이를 채움.
+     범례·전월·다음월은 달력 왼쪽 세로 칸으로 옮겨 날짜 칸이 커지고, 오른쪽 목록은 창 높이만큼 */
+  .modal.pocal-modal { max-width: 1140px; }
+  @media (min-width: 1280px) {
+    .modal.pocal-modal { max-width: 1760px; height: min(100vh - 48px, 960px); max-height: none; }
+    .pocal-modal .modal-body { display: flex; flex-direction: column; }
+    .pocal-modal .pocal-wrap { flex: 1 0 auto; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
+    .pocal-modal .pocal-cal { display: grid; grid-template-columns: 232px minmax(0, 1fr); grid-template-rows: auto 1fr; column-gap: 22px; }
+    .pocal-modal .pocal-nav { grid-column: 2; grid-row: 1; }
+    .pocal-modal .pocal-grid { grid-column: 2; grid-row: 2; grid-template-rows: auto; grid-auto-rows: minmax(52px, 1fr); }
+    .pocal-modal .pocal-cell { aspect-ratio: auto; min-height: 0; padding: 11px 0 0 13px; }
+    .pocal-modal .pocal-cell .dnum { font-size: 16px; min-width: 26px; height: 26px; }
+    .pocal-modal .pocal-dot { width: 8px; height: 8px; }
+    .pocal-modal .pocal-cnt { right: 9px; bottom: 9px; min-width: 20px; height: 20px; font-size: 12px; border-radius: 10px; }
+    .pocal-modal .pocal-legend { grid-column: 1; grid-row: 1; margin: 0 0 18px; gap: 6px; align-self: center; }
+    .pocal-modal .pocal-legend span { padding: 4px 9px; }
+    .pocal-modal .pocal-mini { grid-column: 1; grid-row: 2; flex-direction: column; justify-content: flex-start;
+      margin: 0; padding: 0; border-top: none; }
+    .pocal-modal .pmini { flex: none; }
+    .pocal-modal .pocal-detail { contain: size; max-height: none; }
+  }
 
   /* ───── Search ───── */
   .search-bar { position: relative; margin-bottom: 24px; }
@@ -14697,8 +14834,11 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     .pocal-cal { padding: 14px 12px 16px; border-radius: 16px; }
     .pocal-nav .pocal-ym { font-size: 17px; }
     .pocal-nav button { width: 34px; height: 34px; }
-    .pocal-grid { gap: 4px; }
-    .pocal-cell { min-height: 46px; border-radius: 11px; padding: 6px 0 0 7px; }
+    /* 칸이 46px 아래로 안 줄어 금·토가 잘리고 옆으로 밀어야 보이던 것 (2026-10-30) */
+    .pocal-grid { gap: 4px; grid-template-columns: repeat(7, minmax(0, 1fr)); }
+    .pocal-cell { min-height: 46px; border-radius: 11px; padding: 6px 0 0 7px; aspect-ratio: auto; }
+    .pmini { min-width: 0; padding: 8px 6px 9px; }
+    .pmini-grid { grid-template-columns: repeat(7, minmax(0, 1fr)); }
     .pocal-cell .dnum { font-size: 13px; min-width: 21px; height: 21px; }
     .pocal-dots { margin-top: 4px; gap: 2px; }
     .pocal-dot { width: 6px; height: 6px; }
@@ -14811,7 +14951,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     <div class="chart-head">
       <div style="display:flex;align-items:center;gap:12px">
         <div><span class="chart-title">🚚 원/부자재 예상입고일</span><span class="chart-sub">부자재·원료·수입현황</span></div>
-        <button class="po-cal-btn" onclick="openPoCalModal()" title="입고일정 캘린더 보기">📅 입고 캘린더</button>
+        <button class="po-cal-btn" onclick="panelLoad('.po-inline').then(openPoCalModal)" title="입고일정 캘린더 보기">📅 입고 캘린더</button>
       </div>
       <div id="po-inline-count" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
     </div>
@@ -14822,7 +14962,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     <div class="chart-head">
       <div style="display:flex;align-items:center;gap:12px">
         <div><span class="chart-title">🏭 외주 입고 물량</span><span class="chart-sub">외주 생산 요청 · 발주완료·생산요청·확인필요</span></div>
-        <button class="po-cal-btn" onclick="openOsCalModal()" title="외주 입고일정 캘린더 보기">📅 입고 캘린더</button>
+        <button class="po-cal-btn" onclick="panelLoad('.os-inline').then(openOsCalModal)" title="외주 입고일정 캘린더 보기">📅 입고 캘린더</button>
       </div>
       <div id="os-inline-count" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
     </div>
@@ -15690,7 +15830,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
 
 <!-- 원/부자재 입고일정 캘린더 모달 -->
 <div class="modal-overlay" id="po-cal-modal" style="z-index:116">
-  <div class="modal" style="max-width:1140px">
+  <div class="modal pocal-modal">
     <div class="modal-header">
       <div>
         <div class="code-badge" style="background:linear-gradient(135deg,#0ea5e9,#0369a1)">입고일정</div>
@@ -15703,7 +15843,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       </div>
       <button class="modal-close" onclick="closePoCalModal()">&times;</button>
     </div>
-    <div class="modal-body" style="max-width:1140px">
+    <div class="modal-body">
       <div class="pocal-wrap">
         <div class="pocal-cal">
           <div class="pocal-nav">
@@ -15729,7 +15869,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
 
 <!-- 외주 입고일정 캘린더 모달 -->
 <div class="modal-overlay" id="os-cal-modal" style="z-index:116">
-  <div class="modal" style="max-width:1140px">
+  <div class="modal pocal-modal">
     <div class="modal-header">
       <div>
         <div class="code-badge" style="background:linear-gradient(135deg,#7c3aed,#5b21b6)">외주입고</div>
@@ -15742,7 +15882,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       </div>
       <button class="modal-close" onclick="closeOsCalModal()">&times;</button>
     </div>
-    <div class="modal-body" style="max-width:1140px">
+    <div class="modal-body">
       <div class="pocal-wrap">
         <div class="pocal-cal">
           <div class="pocal-nav">
@@ -15858,8 +15998,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
             label.textContent = '갱신 완료 ' + (s.last_run || '').slice(11, 16);
             setTimeout(() => { btn.classList.remove('success'); label.textContent = 'Monday 새로고침'; }, 5000);
             // 패널 자동 새로고침
-            if (typeof loadPoInline === 'function') loadPoInline();
-            if (typeof loadOsInline === 'function') loadOsInline();
+            if (typeof panelRefresh === 'function') { panelRefresh('.po-inline'); panelRefresh('.os-inline'); }
           } else {
             btn.classList.add('error');
             label.textContent = '실패';
@@ -19565,30 +19704,93 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     if (e.target.id === 'os-modal') closeOsModal();
   });
 
-  loadAlerts('jasa');
-  loadAlerts('outsource');
-  loadReorder();
-  loadPriceChanges();
+  // ───── 패널은 닫힌 채로 시작 → 클릭해서 열 때 처음 한 번 데이터 로드 ─────
+  // (2026-10-29 사용자 "모든 패널이 한번에 열리면 로딩이 오래 걸리니 클릭 시 오픈" → "패널 크기는 그대로 두고 눌렀을 때 보이게,
+  //  닫혀 있을 땐 클릭하면 보인다는 설명"). 이전엔 시작 시 20여 개 API를 한꺼번에 호출.
+  // 닫힌 패널 = 크기 그대로, 머리 아래 내용만 visibility:hidden + 안내 문구. 회송 원가 역산은 미리 받는 자료가 없는 입력 패널이라 제외.
+  // 세 번째 값 = 처음 방문 때 닫힌 패널 높이(px, 1920px 화면 실측 — 자료가 들어오면 커지는 패널만).
+  // 한 번 열면 실제 높이를 브라우저에 기억(mhPanelH)해 다음부터 그 높이로 닫혀 있음.
+  // loadSalesSummary()는 2026-09-23 매출 현황 패널 제거 — 월 매출·판매 추이 [채널별] 모드가 /api/sales_summary 사용
+  const PANEL_LOADERS = [
+    ['.po-inline', () => loadPoInline()], ['.os-inline', () => loadOsInline()],
+    ['.scope-jasa', () => loadAlerts('jasa')], ['.scope-outsource', () => loadAlerts('outsource')],
+    ['.reorder-panel', () => loadReorder()], ['.plan-panel', () => loadPlan()], ['.chstock-panel', () => loadChStock()],
+    ['.vendor-panel', () => loadVendors()], ['.price-span', () => loadPriceChanges()], ['.pcalc-panel', () => loadPriceCalc()],
+    ['.spec-panel', () => loadSpecList(), 404], ['.ipsu-panel', () => loadIpsuSpecs()],
+    ['.salesbase-panel', () => loadSalesBased(), 523], ['.prod-panel', () => loadOrderReceipt(), 523],
+    ['.lens-gap', () => loadSalesGap(), 516], ['.lens-price', () => loadChannelPrice(), 516], ['.lens-wd', () => loadWeekday(), 516],
+    ['.lens-shift', () => loadDemandShift(), 410], ['.lens-dormant', () => loadDormant(), 410],
+    ['.lens-gaps', () => loadDeliveryGaps(), 530], ['.lens-new', () => loadNewProducts(), 530], ['.lens-abc', () => loadAbc(), 530],
+  ];
+  // 호스트 PC 전용 패널 — GCP에선 서버가 빈 값만 주므로 클릭해서 여는 형태가 아니라 처음부터 잠긴 모양으로
+  // (2026-10-30 사용자 "입수 테스트가 로그인 후 첫 화면에 너무 길게 자리잡음 → 잠궈뒀으니 접힌 상태로, 그냥 잠궈둔 형태로")
+  // 값 = 머리 한 줄로 접고 오른쪽에 붙일 잠금 문구. 예상 단가 계산기는 단가 변동과 한 줄이라 접지 않고 본문에 안내(높이는 옆 패널 따라감)
+  const HOST_PC = {{ host_pc|tojson }};
+  const PANEL_LOCKS = HOST_PC ? {} : { '.ipsu-panel': '정확도를 위해 추후 배포 예정', '.spec-panel': '호스트 PC 전용' };
+  function _pnl(x) { return typeof x === 'string' ? document.querySelector('.chart-panel' + x) : x; }
+  function _pnlKey(p) { return p._pnlSel + (window.innerWidth > 900 ? '@w' : '@n'); }   // PC·모바일 높이 따로
+  function _pnlH() { try { return JSON.parse(localStorage.getItem('mhPanelH') || '{}'); } catch (e) { return {}; } }
+  function initPanels() {
+    if (!HOST_PC) {
+      Object.entries(PANEL_LOCKS).forEach(([sel, msg]) => panelLockStrip(_pnl(sel), msg));
+      window._ipsuLocked = true;
+      panelLockNote(_pnl('.pcalc-panel'), '단가의 잦은 변동으로 인한 안정화 시 오픈', '단가가 안정되면 다시 열립니다');
+      const est = document.getElementById('pcalc-est-inline'); if (est) est.style.display = 'none';   // 머리의 '0원'
+    }
+    const saved = _pnlH(), wide = window.innerWidth > 900;
+    PANEL_LOADERS.forEach(([sel, fn, defH]) => {
+      const p = _pnl(sel); if (!p || p.classList.contains('p-locked') || p.querySelector('.panel-lock-note')) return;   // 잠긴 패널은 열기 대상 아님
+      p._pnlSel = sel; p._pnlLoad = fn;
+      const h = saved[_pnlKey(p)] || (wide ? defH : 0);
+      if (h) p.style.minHeight = h + 'px';
+      const hint = document.createElement('div'); hint.className = 'pnl-hint';
+      hint.innerHTML = '<span>👆 클릭하면 내용이 표시됩니다</span>';
+      p.appendChild(hint);
+      // 닫힌 패널은 어디를 눌러도 열림 (머리 안 필터 칩·버튼은 열면서 제 기능까지)
+      p.addEventListener('click', () => { if (p.classList.contains('p-closed')) panelOpen(p); });
+      p.classList.add('p-closed');
+    });
+    pnlHintPos();
+    window.addEventListener('resize', pnlHintPos);
+    window.addEventListener('load', pnlHintPos);
+  }
+  // 안내 문구 = 머리 아래 영역 가운데 (머리 높이는 화면 폭에 따라 줄바꿈으로 달라짐)
+  function pnlHintPos() {
+    document.querySelectorAll('.chart-panel.p-closed > .pnl-hint').forEach(el => {
+      const head = el.parentElement.querySelector('.chart-head');
+      el.style.top = (head ? head.offsetTop + head.offsetHeight : 0) + 'px';
+    });
+  }
+  // 열기 — 처음 열 때만 로더 실행, 로드 완료 Promise 반환
+  function panelOpen(x) {
+    const p = _pnl(x); if (!p || !p._pnlSel) return Promise.resolve();
+    p.classList.remove('p-closed');
+    return panelLoad(p);
+  }
+  // 보이게 하지 않고 데이터만 (입고 캘린더 버튼 등 패널 데이터를 쓰는 곳)
+  function panelLoad(x) {
+    const p = _pnl(x); if (!p || !p._pnlSel) return Promise.resolve();
+    if (!p._pnlPromise) {
+      p._pnlPromise = Promise.resolve().then(() => p._pnlLoad()).catch(() => {});
+      p._pnlPromise.then(() => setTimeout(() => pnlRemember(p), 400));
+    }
+    return p._pnlPromise;
+  }
+  // 다 그린 뒤 임시 최소 높이를 풀고, 자기 내용 높이를 기억 (같은 줄 이웃 때문에 늘어난 높이가 아니게 align-self:start로 잼)
+  function pnlRemember(p) {
+    p.style.minHeight = '';
+    const a = p.style.alignSelf; p.style.alignSelf = 'start';
+    const h = p.offsetHeight; p.style.alignSelf = a;
+    if (h >= 60) try { const s = _pnlH(); s[_pnlKey(p)] = h; localStorage.setItem('mhPanelH', JSON.stringify(s)); } catch (e) {}
+    pnlHintPos();
+  }
+  // 이미 불러온 패널만 다시 로드 (Monday 새로고침 후 등). 안 연 패널은 열 때 최신으로 받음
+  function panelRefresh(x) {
+    const p = _pnl(x); if (!p || !p._pnlPromise || !p._pnlLoad) return;
+    p._pnlPromise = Promise.resolve().then(() => p._pnlLoad()).catch(() => {});
+  }
+  initPanels();
   loadNotifyBadge();
-  loadPlan();
-  loadChStock();
-  loadSalesGap();
-  loadChannelPrice();
-  loadWeekday();
-  loadDemandShift();
-  loadDormant();
-  loadDeliveryGaps();
-  loadNewProducts();
-  loadAbc();
-  loadVendors();
-  loadPoInline();
-  loadOsInline();
-  loadPriceCalc();
-  loadSpecList();
-  loadIpsuSpecs();
-  // loadSalesSummary();   // 2026-09-23 매출 현황 패널 제거 — 월 매출·판매 추이 [채널별] 모드가 /api/sales_summary 사용
-  loadOrderReceipt();
-  loadSalesBased();
   loadKpi();
 
   // ───── KPI 요약 띠 ─────
@@ -19644,7 +19846,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const go = t.dataset.go;
     if (go === 'health') { if (typeof openDataHealth === 'function') openDataHealth(); return; }
     const el = document.querySelector(go); if (!el) return;
-    const sec = el.closest('section'); if (sec && sec.classList.contains('collapsed')) toggleSection(sec, false);
+    panelOpen(el.closest('.chart-panel') || el);
     scrollToPanel(el, true);
   }));
 
@@ -19776,43 +19978,13 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     navigator.clipboard.writeText(lines.join(NL)).then(() => { const m = document.getElementById('rc-msg'); m.textContent = '복사됨 (엑셀에 붙여넣기)'; setTimeout(() => m.textContent = '', 2000); });
   }
 
-  // ───── 패널 접기 (상태는 브라우저에 기억) ─────
-  const COL_DEFAULT = { 'sec-ipsu': true };   // 기본 접힘: 3D 입수 (월 매출 추이는 2026-09-23 매출 섹션으로 통합, 기본 펼침)
-  function colState() { try { return JSON.parse(localStorage.getItem('mhCollapsed') || '{}'); } catch (e) { return {}; } }
-  function isCollapsed(id) { const s = colState(); return id in s ? !!s[id] : !!COL_DEFAULT[id]; }
-  function toggleSection(sec, collapse) {
-    const id = sec.id; const c = collapse == null ? !sec.classList.contains('collapsed') : collapse;
-    sec.classList.toggle('collapsed', c);
-    const b = sec.querySelector('.col-btn'); if (b) b.textContent = c ? '▸ 펼치기' : '▾ 접기';
-    try { const s = colState(); s[id] = c; localStorage.setItem('mhCollapsed', JSON.stringify(s)); } catch (e) {}
-    if (!c) {   // 펼칠 때 지연 초기화 (3D 뷰어·차트 리사이즈)
-      if (id === 'sec-ipsu' && typeof ipsuInitViewers === 'function' && !window._ipsuLocked) { ipsuInitViewers(); setTimeout(() => [_ipsuV1, _ipsuV2, _ipsuV3].forEach(v => v && v.resize && v.resize()), 50); }
-      if (id === 'sec-sales' && typeof _sbChart !== 'undefined' && _sbChart) setTimeout(() => _sbChart.resize(), 50);
-      window.dispatchEvent(new Event('resize'));
-    }
-  }
+  // ───── 섹션 id (내비용) — 섹션 통째 접기는 2026-10-29 패널별 '클릭 시 열기'(initPanels)로 대체 ─────
   function initCollapsibles() {
     const map = [['.chart-grid', 'sec-alerts'], ['.spec-strip', 'sec-spec'], ['.return-strip', 'sec-return'], ['.ipsu-strip', 'sec-ipsu'], ['.sales-npd-strip', 'sec-sales'], ['.lens-strip', 'sec-lens'], ['.cal-strip', 'sec-cal']];
     map.forEach(([sel, id]) => { const s = document.querySelector('section' + sel); if (s && !s.id) s.id = id; });
     // 그리드 내부 앵커 (내비용)
     const pr = document.querySelector('.price-span'); if (pr) pr.id = pr.id || 'sec-price';
     const pl = document.querySelector('.plan-panel'); if (pl) pl.id = pl.id || 'sec-plan';
-    ['sec-spec', 'sec-return', 'sec-ipsu', 'sec-sales', 'sec-lens'].forEach(id => {
-      const sec = document.getElementById(id); if (!sec) return;
-      const head = sec.querySelector('.chart-head'); if (!head) return;
-      const b = document.createElement('button'); b.className = 'col-btn'; b.type = 'button';
-      b.onclick = () => toggleSection(sec);
-      // 헤더 오른쪽 요소(spec-count 등)는 로더가 textContent로 덮어쓰므로 그 안에 넣지 말고 래퍼로 감싼다
-      const right = head.children[1];
-      if (right) {
-        const wrap = document.createElement('div'); wrap.style.cssText = 'display:flex;align-items:center;gap:8px';
-        head.insertBefore(wrap, right); wrap.appendChild(right); wrap.appendChild(b);
-      } else { head.appendChild(b); }
-      const c = isCollapsed(id); sec.classList.toggle('collapsed', c); b.textContent = c ? '▸ 펼치기' : '▾ 접기';
-    });
-    // 캘린더 스트립은 접기 헤더 없음 (2026-09-04 사용자 요청: 공간만 차지) — 항상 펼침
-    const cal = document.getElementById('sec-cal');
-    if (cal) cal.classList.remove('collapsed');
   }
   initCollapsibles();
   initSecNav();   // 섹션 id 부여(initCollapsibles) 이후에 실행
@@ -19823,7 +19995,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const links = [...nav.querySelectorAll('a')];
     links.forEach(a => a.addEventListener('click', e => {
       e.preventDefault(); const id = a.dataset.sec; const el = document.getElementById(id); if (!el) return;
-      const sec = el.closest('section') || el; if (sec.classList.contains('collapsed')) toggleSection(sec, false);
+      // 패널이면 열고, 패널 하나뿐인 섹션(규격·회송·입수)이면 그 패널을 엶. 여러 패널 섹션은 스크롤만
+      const pnls = el.classList.contains('chart-panel') ? [el] : [...el.querySelectorAll('.chart-panel')];
+      if (pnls.length === 1) panelOpen(pnls[0]);
       if (id === 'kpi-strip') { window.scrollTo({ top: 0, behavior: 'smooth' }); return; }
       scrollToPanel(el, false);
     }));
@@ -20615,13 +20789,20 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     document.getElementById('ipsu-stat').textContent = '';
     panelLockNote(document.querySelector('.ipsu-panel'), '정확도를 위해 추후 배포 예정', '실측 데이터 보정이 끝나면 다시 열립니다');
   }
-  // 호스트 전용 패널(GCP) — 머리만 남기고 본문은 숨긴 뒤 안내 문구 표시
+  // 호스트 전용 패널(GCP) — 머리 한 줄로 접고 오른쪽에 🔒 문구. 클릭해도 열리지 않음 (2026-10-30)
+  function panelLockStrip(panel, msg) {
+    const head = panel && panel.querySelector('.chart-head'); if (!head) return;
+    panel.classList.add('p-locked');
+    const pill = document.createElement('span'); pill.className = 'pnl-lock'; pill.textContent = '🔒 ' + msg;
+    head.appendChild(pill);
+  }
+  // 호스트 전용 패널(GCP) — 머리만 남기고 본문은 숨긴 뒤 안내 문구 표시 (같은 줄 패널 높이로 늘어나면 세로 가운데)
   function panelLockNote(panel, title, sub) {
     if (!panel || panel.querySelector('.panel-lock-note')) return;
     Array.from(panel.children).forEach(c => { if (!c.classList.contains('chart-head')) c.style.display = 'none'; });
     const m = document.createElement('div');
     m.className = 'panel-lock-note';
-    m.style.cssText = 'padding:34px 16px;text-align:center;color:var(--text-3);font-size:13px;line-height:1.7';
+    m.style.cssText = 'flex:1;display:flex;flex-direction:column;justify-content:center;padding:34px 16px;text-align:center;color:var(--text-3);font-size:13px;line-height:1.7';
     m.innerHTML = '<div style="font-size:26px;margin-bottom:6px">🛠️</div>'
       + '<div style="font-weight:700;color:var(--text-2);font-size:14px">' + title + '</div>'
       + '<div style="font-size:11.5px;margin-top:2px">' + sub + '</div>';
@@ -21739,7 +21920,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   }
 
   // ───── 부자재 규격 → 단가 계산기 연동 ─────
-  function specLinkToCalc(cb) {
+  async function specLinkToCalc(cb) {
+    if (cb.checked) await panelOpen('.pcalc-panel');   // 계산기 패널을 아직 안 열었으면 열고 재질 목록부터 받음
     // 단일 선택: 다른 체크 해제 + 행 하이라이트
     document.querySelectorAll('.spec-calc-cb').forEach(c => {
       c.checked = (c === cb && cb.checked);
@@ -21926,19 +22108,37 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       const d = await (await fetch('/api/spec_design/' + itemId)).json();
       if (!d.ok) throw new Error(d.error || '불러오기 실패');
       _dsgFiles = d.files || []; _dsgIdx = 0;
+      dsgFoldNopdf(null);
       dsgThumbs();
-      showDesign(0);
+      showDesign(_dsgIdx);
     } catch (e) {
       document.getElementById('dsg-stage').innerHTML = '<div class="search-empty" style="margin:auto;color:#ef4444">시안을 불러오지 못했습니다: ' + escapeHtml(e.message) + '</div>';
     }
   }
+  // 'PDF 호환' 없이 저장된 .ai (2026-10-30, 사용자 "1페이지 메시지는 왜 있어? 2페이지 시안만 보이면 될 것 같은데")
+  // — 미리보기가 그림 대신 일러스트레이터 안내문뿐. 같은 이름의 그림(.jpg 등)이 있으면 그 그림 한 칸으로 합치고
+  //   [원본 받기]는 .ai로, 짝이 없으면 맨 뒤로 보내 파일 속 작은 썸네일(없으면 안내만). cur = 보던 칸
+  function dsgFoldNopdf(cur) {
+    const stem = n => (n || '').replace(/\\.[^.]*$/, '').trim().toLowerCase();
+    const keep = [], tail = [];
+    _dsgFiles.forEach(f => {
+      if (!f.nopdf) { keep.push(f); return; }
+      const img = _dsgFiles.find(x => x.kind === 'image' && !x.orig && stem(x.name) === stem(f.name));
+      if (img) img.orig = f; else tail.push(f);
+    });
+    _dsgFiles = keep.concat(tail);
+    // 보던 .ai가 짝 그림에 합쳐졌으면 그 그림, 썸네일이 있으면 그대로, 안내만 남으면 다른 시안 첫 칸
+    const show = cur && cur.nopdf ? (_dsgFiles.find(x => x.orig === cur) || (cur.thumb ? cur : keep[0] || cur)) : cur;
+    _dsgIdx = Math.max(0, _dsgFiles.indexOf(show));
+  }
   // 미리보기 쪽 주소 — .ai는 대지마다 한 쪽(최대 8쪽), 쪽마다 목록 한 칸으로 펼쳐 화살표·썸네일로 넘김
-  const dsgSrc = (f, hd) => f.preview + '?page=' + (f.page || 1) + (hd ? '&hd=1' : '');
+  // &t=1 = 안내문뿐인 .ai의 1쪽을 썸네일로 바꾼 뒤 주소 (브라우저가 30일 보관한 옛 안내문 그림을 안 쓰게)
+  const dsgSrc = (f, hd) => f.preview + '?page=' + (f.page || 1) + (hd ? '&hd=1' : '') + (f.nopdf && f.thumb ? '&t=1' : '');
   function dsgThumbs() {
     document.getElementById('dsg-thumbs').innerHTML = _dsgFiles.length > 1 ? _dsgFiles.map((f, i) =>
       '<button onclick="showDesign(' + i + ')" title="' + escapeHtml(f.name) + (f.page ? ' · ' + f.page + '쪽' : '') + '">'
       + (f.kind === 'image' ? '<img src="' + escapeHtml(f.url) + '" alt="" loading="lazy">'
-        : (f.preview && f.expanded ? '<img src="' + escapeHtml(dsgSrc(f)) + '" alt="" loading="lazy">' : escapeHtml((f.ext || f.kind).toUpperCase())))
+        : (f.preview && (f.expanded || (f.nopdf && f.thumb)) ? '<img src="' + escapeHtml(dsgSrc(f)) + '" alt="" loading="lazy">' : escapeHtml((f.ext || f.kind).toUpperCase())))
       + '</button>').join('') : '';
   }
   function showDesign(i) {
@@ -21955,6 +22155,11 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const imgTag = src => '<div class="dsg-box"><img src="' + escapeHtml(src) + '" alt="' + escapeHtml(f.name) + '" draggable="false" onload="dsgOnLoad(this)" title="마우스 휠: 확대·축소 · 끌기: 이동 · 클릭: 크게 보기/맞춤"></div>';
     if (f.kind === 'image') {
       stage.innerHTML = nav + imgTag(f.url);
+    } else if (f.nopdf && f.thumb) {   // 파일 속 작은 썸네일(256px) — 조금 키워서 보여 줌
+      stage.innerHTML = nav + imgTag(dsgSrc(f))
+        + '<div class="dsg-note">\\'PDF 호환\\' 없이 저장된 AI라 파일 속 작은 미리보기만 있습니다 — 크게 보려면 [원본 받기]</div>';
+    } else if (f.nopdf) {
+      stage.innerHTML = nav + '<div class="search-empty" style="margin:auto;text-align:center;line-height:1.7">이 AI 파일은 일러스트레이터에서 \\'PDF 호환 파일 만들기\\'를 끄고 저장해서<br>화면 미리보기가 없습니다. 오른쪽 위 [원본 받기]로 받아 일러스트레이터에서 열어 주세요.</div>';
     } else if (f.preview && f.expanded) {
       stage.innerHTML = nav + imgTag(dsgSrc(f))
         + (f.pages > f.rendered && f.page === f.rendered ? '<div class="dsg-note">' + f.pages + '쪽 중 앞 ' + f.rendered + '쪽까지만 보입니다 — 전체는 [원본 받기]</div>' : '');
@@ -21965,6 +22170,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       fetch(f.preview + '?check=1').then(r => r.json()).then(d => {
         if (seq !== _dsgSeq) return;   // 그사이 다른 파일로 넘겼거나 창을 닫음
         if (!d.ok) throw new Error(d.error || '미리보기 실패');
+        if (d.nopdf) {   // 안내문뿐인 .ai — 짝 그림으로 합치거나 맨 뒤로(파일 속 썸네일이 있으면 그것을 보여 줌)
+          f.nopdf = true; f.thumb = !!d.thumb; dsgFoldNopdf(f); dsgThumbs(); showDesign(_dsgIdx);
+          return;
+        }
         const n = d.rendered || 1;
         Object.assign(f, {ready: true, expanded: true, page: 1, pages: d.pages || n, rendered: n});
         if (n > 1) {   // 쪽마다 한 칸씩 펼침
@@ -21985,9 +22194,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const sub = document.getElementById('dsg-sub');
     sub.textContent = (sub.dataset.base ? sub.dataset.base + ' │ ' : '') + f.name
       + (f.page && f.pages > 1 ? ' · ' + f.page + '/' + f.pages + '쪽' : (_dsgFiles.length > 1 ? ' (' + (_dsgIdx + 1) + '/' + _dsgFiles.length + ')' : ''));
-    const dl = document.getElementById('dsg-dl');
-    dl.href = f.url; dl.target = f.kind === 'link' ? '_blank' : '_self';
-    dl.textContent = f.kind === 'link' ? '↗ 링크 열기' : '⬇ 원본 받기' + (f.size ? ' (' + (f.ext || '').toUpperCase() + ' ' + _dsgMB(f.size) + ')' : '');
+    const dl = document.getElementById('dsg-dl'), o = f.orig || f;   // 짝 그림이면 받기는 .ai 원본
+    dl.href = o.url; dl.target = o.kind === 'link' ? '_blank' : '_self';
+    dl.textContent = o.kind === 'link' ? '↗ 링크 열기' : '⬇ 원본 받기' + (o.size ? ' (' + (o.ext || '').toUpperCase() + ' ' + _dsgMB(o.size) + ')' : '');
     dl.style.display = '';
   }
   function closeDesign() {
@@ -22005,7 +22214,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     if (!img || !box.dataset.nw0) return null;
     const nw0 = +box.dataset.nw0, nh0 = +box.dataset.nh0, side = _dsgRot % 180 !== 0;
     const rw = side ? nh0 : nw0, rh = side ? nw0 : nh0;   // 돌린 뒤 가로·세로
-    if (!box.dataset.fit) box.dataset.fit = Math.min(st.clientWidth / rw, st.clientHeight / rh, 1);
+    const f = _dsgFiles[_dsgIdx] || {}, cap = f.nopdf && f.thumb ? 2.5 : 1;   // 256px 썸네일은 2.5배까지 키워 맞춤
+    if (!box.dataset.fit) box.dataset.fit = Math.min(st.clientWidth / rw, st.clientHeight / rh, cap);
     return { st, box, img, nw0, nh0, rw, rh, fit: +box.dataset.fit };
   }
   function dsgApply() {
@@ -22040,7 +22250,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const r1 = g.box.getBoundingClientRect();   // 커서 아래 지점이 그대로 커서 아래 있도록 스크롤 보정
     g.st.scrollLeft += r1.left + px * r1.width - cx;
     g.st.scrollTop += r1.top + py * r1.height - cy;
-    if (f.preview && g.fit * _dsgZ > 1.05) dsgLoadHd();   // 기본 그림보다 크게 보이면 고해상도로
+    if (f.preview && !f.nopdf && g.fit * _dsgZ > 1.05) dsgLoadHd();   // 기본 그림보다 크게 보이면 고해상도로 (썸네일뿐인 .ai는 없음)
   }
   window.addEventListener('resize', () => {
     const g = document.getElementById('design-modal').classList.contains('show') && dsgGeom();
