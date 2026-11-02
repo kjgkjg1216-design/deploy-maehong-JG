@@ -6552,7 +6552,8 @@ def api_spec_design(item_id):
                               'preview': f'/api/spec_design_preview/{item_id}/{aid}' if ext in ('ai', 'pdf') else '',
                               'ready': bool(pm),
                               'nopdf': bool((pm or {}).get('nopdf')),   # 'PDF 호환' 없이 저장된 .ai (안내문뿐)
-                              'thumb': bool((pm or {}).get('thumb'))})   # 그 1쪽 = 파일 속 작은 썸네일
+                              'thumb': bool((pm or {}).get('thumb')),   # 그 1쪽 = 파일 속 작은 썸네일
+                              'conv': bool((pm or {}).get('conv'))})   # Scribus로 변환해 제대로 그림
             elif f.get('linkToFile'):   # 구글 드라이브 등 링크로 붙인 파일
                 files.append({'name': f.get('name') or '링크', 'ext': '', 'kind': 'link', 'url': f.get('linkToFile')})
     if not files:
@@ -6588,18 +6589,21 @@ def _design_preview_meta(asset_id):
     return m if m.get('rendered') else None
 
 
-def _design_preview_make(item_id, asset_id, low=False, hd=False):
+def _design_preview_make(item_id, asset_id, low=False, hd=False, force=False):
     """시안 .ai/.pdf를 쪽별 JPG(최대 8쪽)로 data/design_preview/에 만듦 → None(성공) 또는 (오류 문구, 상태코드).
     기본 = 긴 변 2400px. hd=True면 확대용 6000px도 만듦(원본을 받은 김에 둘 다). 미리 만들기(low)는 늘 둘 다.
     로컬 PC는 먼저 GCP에서 받아 옴(GCP는 원본을 초당 십수 MB로 받고 미리 만들어 두기도 함 — 사무실 회선으론 133MB에 90초).
     직접 만들 땐 원본을 디스크로 바로 받아(수백 MB도 메모리에 안 올림) design_preview.py로 변환하고 원본은 버림.
-    쪽 파일을 먼저 쓰고 정보 json을 맨 마지막에 써서 '다 만들어짐' 표시로 씀. low=True면 낮은 CPU 우선순위로."""
+    쪽 파일을 먼저 쓰고 정보 json을 맨 마지막에 써서 '다 만들어짐' 표시로 씀. low=True면 낮은 CPU 우선순위로.
+    force=True면 이미 있어도 다시 만듦(GCP 미리 만들기 — 안내문뿐인 .ai를 Scribus로 변환할 때)."""
     import requests as _req
     import subprocess as _sp
     import shutil, tempfile
     hd = hd or low
 
     def need():
+        if force:
+            return True, bool(hd)
         m = _design_preview_meta(asset_id)
         return (not m), bool(hd and not (m or {}).get('hd'))
 
@@ -6638,6 +6642,8 @@ def _design_preview_make(item_id, asset_id, low=False, hd=False):
                         m.update(chk=1, nopdf=bool(c.get('nopdf')))
                     if c.get('thumb') is not None:
                         m['thumb'] = bool(c.get('thumb'))
+                    if c.get('conv') is not None:
+                        m['conv'] = bool(c.get('conv'))
                     json.dump(m, open(meta, 'w', encoding='utf-8'), ensure_ascii=False)
                     return None
             except Exception as e:
@@ -6648,12 +6654,15 @@ def _design_preview_make(item_id, asset_id, low=False, hd=False):
             if src is None:
                 return a
             m = dict(m0, name=a.get('name', ''))
+            if force:
+                m.pop('thumb', None); m.pop('conv', None)
             for k in ([False] if need_std else []) + ([True] if need_hd else []):
                 prefix = os.path.join(tmp_dir, 'hd' if k else 'out')
                 cmd = [sys.executable, os.path.join(BASE_DIR, 'design_preview.py'), src, prefix, str(_DSG_HD if k else 2400), '8']
                 if low and os.name != 'nt':
                     cmd = ['nice', '-n', '19'] + cmd
-                pr = _sp.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=1200, cwd=BASE_DIR)
+                # 안내문뿐인 .ai는 Scribus 변환(최대 15분)까지 하므로 넉넉히
+                pr = _sp.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=1800, cwd=BASE_DIR)
                 lines = (pr.stdout or '').strip().splitlines()
                 res = json.loads(lines[-1]) if lines else {'ok': False, 'error': (pr.stderr or '')[-300:]}
                 n = int(res.get('rendered') or 0)
@@ -6669,6 +6678,8 @@ def _design_preview_make(item_id, asset_id, low=False, hd=False):
                     m.update(chk=1, nopdf=bool(res.get('nopdf')))
                     if res.get('nopdf'):   # thumb = 1쪽을 파일 속 작은 썸네일로 바꿔 끼움
                         m['thumb'] = bool(res.get('thumb'))
+                if 'conv' in res:   # 안내문뿐인 .ai를 Scribus로 변환해 그렸는지 (False면 썸네일)
+                    m['conv'] = bool(res['conv'])
             json.dump(m, open(meta, 'w', encoding='utf-8'), ensure_ascii=False)
             return None
         except _sp.TimeoutExpired:
@@ -6703,8 +6714,8 @@ def _design_fetch_src(item_id, asset_id, tmp_dir):
 
 
 def _design_need_chk(m):
-    """안내문 여부를 아직 안 봤거나, 안내문뿐인데 썸네일 처리(2026-10-30 추가) 전인 미리보기."""
-    return bool(m) and (not m.get('chk') or (m.get('nopdf') and 'thumb' not in m))
+    """안내문 여부를 아직 안 봤거나, 안내문뿐인데 썸네일·Scribus 변환(2026-10-30 추가)을 아직 안 해 본 미리보기."""
+    return bool(m) and (not m.get('chk') or (m.get('nopdf') and ('thumb' not in m or 'conv' not in m)))
 
 
 def _design_put_thumb(asset_id, data):
@@ -6758,8 +6769,8 @@ def _design_check_nopdf(item_id, asset_id):
 
 
 def _design_sync_chk(item_id, asset_id):
-    """호스트 PC: GCP에서 받아 온 미리보기에 안내문 여부(chk·nopdf·thumb)가 없으면 GCP 것을 받아 채움 (GCP가 확인을 마친 뒤부터).
-    안내문뿐이면 GCP가 썸네일로 바꿔 둔 1쪽도 다시 받음."""
+    """호스트 PC: GCP에서 받아 온 미리보기에 안내문 여부(chk·nopdf·thumb·conv)가 없으면 GCP 것을 받아 채움 (GCP가 확인을 마친 뒤부터).
+    안내문뿐인데 GCP가 Scribus로 변환했으면 이쪽 미리보기를 지워 새로 받게 하고, 변환 못 했으면 썸네일로 바꾼 1쪽을 받음."""
     import requests as _req
     m = _design_preview_meta(asset_id)
     if not _design_need_chk(m):
@@ -6767,10 +6778,14 @@ def _design_sync_chk(item_id, asset_id):
     base, tok = f'{_VENDOR_CLOUD}/api/spec_design_preview/{item_id}/{asset_id}', _vendor_secret()
     try:
         c = _req.get(base, params={'check': '1', 'token': tok}, timeout=20).json()
-        if not (c.get('ok') and c.get('chk')) or (c.get('nopdf') and c.get('thumb') is None):
-            return   # GCP도 아직 확인 전
+        if not (c.get('ok') and c.get('chk')) or (c.get('nopdf') and (c.get('thumb') is None or c.get('conv') is None)):
+            return   # GCP도 아직 확인·변환 전
+        if c.get('nopdf') and c.get('conv'):
+            os.remove(_design_preview_paths(asset_id)[1])   # 정보 json이 없으면 '안 만든 것' → 바로 GCP에서 새로 받음
+            return
         m.update(chk=1, nopdf=bool(c.get('nopdf')))
         if m['nopdf']:
+            m['conv'] = False
             m['thumb'] = bool(c.get('thumb'))
             if m['thumb']:
                 r = _req.get(base, params={'token': tok, 'page': 1, 'hd': '0'}, timeout=60)
@@ -6808,7 +6823,14 @@ def _design_warm_loop():
                 if not item_id.isdigit() or (m.get('hd') and not _design_need_chk(m)):
                     continue
                 # 다 만든 것은 안내문 여부·썸네일만 채움(2026-10-30 이전에 만든 것), 아니면 만들기(만들면서 함께 확인)
-                err = _design_check_nopdf(item_id, asset_id) if m.get('hd') else _design_preview_make(item_id, asset_id, low=True)
+                err = None
+                if m.get('hd') and not m.get('chk'):
+                    err = _design_check_nopdf(item_id, asset_id)
+                    m = _design_preview_meta(asset_id) or {}
+                if not err and m.get('nopdf') and 'conv' not in m:   # 안내문뿐 → Scribus 변환으로 다시 만듦
+                    err = _design_preview_make(item_id, asset_id, low=True, force=True)
+                elif not err and not m.get('hd'):
+                    err = _design_preview_make(item_id, asset_id, low=True)
                 if err:
                     fail += 1
                     print(f'[시안 미리보기] {item_id}/{asset_id} 실패: {err[0]}')
@@ -6839,17 +6861,18 @@ def api_spec_design_preview(item_id, asset_id):
     if not _IS_HOST_PC and not (os.environ.get('RELOAD_TOKEN') and request.args.get('token') == os.environ.get('RELOAD_TOKEN')):
         return jsonify({'ok': False, 'error': '호스트 PC에서만 볼 수 있습니다'}), 403
     hd = request.args.get('hd') == '1'
+    if request.args.get('check') == '1' and _IS_HOST_PC:   # GCP가 변환해 뒀으면 이쪽 것을 지워 아래에서 새로 받게
+        _design_sync_chk(item_id, asset_id)
     err = _design_preview_make(item_id, asset_id, hd=hd)
     if err:
         return jsonify({'ok': False, 'error': err[0]}), err[1]
-    if request.args.get('check') == '1' and _IS_HOST_PC:
-        _design_sync_chk(item_id, asset_id)
     m = _design_preview_meta(asset_id) or {}
     if request.args.get('check') == '1':
-        # nopdf = 'PDF 호환' 없이 저장된 .ai — 미리보기가 일러스트레이터 안내문뿐이라 화면은 그림 대신 안내를 보여 줌
-        # thumb = 안내문 대신 1쪽에 파일 속 작은 썸네일(256px)을 넣어 둠 / None = 아직 안 봄
+        # nopdf = 'PDF 호환' 없이 저장된 .ai — 원래 미리보기가 일러스트레이터 안내문뿐
+        # conv = 그걸 Scribus로 변환해 제대로 그림(이때 화면은 보통 시안처럼) / thumb = 변환 못 해 1쪽에 파일 속 작은 썸네일(256px)
+        # None = 아직 안 봄
         return jsonify({'ok': True, 'pages': m.get('pages'), 'rendered': m.get('rendered'), 'hd': m.get('hd') or 0,
-                        'chk': m.get('chk') or 0, 'nopdf': bool(m.get('nopdf')), 'thumb': m.get('thumb')})
+                        'chk': m.get('chk') or 0, 'nopdf': bool(m.get('nopdf')), 'thumb': m.get('thumb'), 'conv': m.get('conv')})
     page = request.args.get('page', '1')
     page = int(page) if page.isdigit() else 1
     jpg = _design_preview_paths(asset_id, page, hd)[0]
@@ -13739,8 +13762,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     width: 24px; height: 22px; padding: 0; border: 1px solid #ddd6fe; border-radius: 6px;
     background: #f5f3ff; color: #7c3aed; cursor: pointer; transition: background 0.12s, transform 0.12s;
   }
-  .sc-design-btn:hover { background: #ede9fe; transform: scale(1.08); }
-  .sc-design-btn svg { width: 13px; height: 13px; }
+  .sc-design-btn:hover { background: #ede9fe; transform: scale(1.08); }  .sc-design-btn svg { width: 13px; height: 13px; }
   .sc-design-btn .n {
     position: absolute; top: -5px; right: -6px; min-width: 13px; height: 13px; padding: 0 3px;
     border-radius: 7px; background: #7c3aed; color: #fff; font-size: 9px; font-weight: 700; line-height: 13px;
@@ -22117,28 +22139,30 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   }
   // 'PDF 호환' 없이 저장된 .ai (2026-10-30, 사용자 "1페이지 메시지는 왜 있어? 2페이지 시안만 보이면 될 것 같은데")
   // — 미리보기가 그림 대신 일러스트레이터 안내문뿐. 같은 이름의 그림(.jpg 등)이 있으면 그 그림 한 칸으로 합치고
-  //   [원본 받기]는 .ai로, 짝이 없으면 맨 뒤로 보내 파일 속 작은 썸네일(없으면 안내만). cur = 보던 칸
+  //   [원본 받기]는 .ai로, 짝이 없으면 — 서버가 Scribus로 변환했으면(conv) 보통 시안처럼, 못 했으면 맨 뒤로 보내
+  //   파일 속 작은 썸네일(없으면 안내만). cur = 보던 칸
+  const dsgStub = f => f.nopdf && !f.conv;   // 변환 못 한 안내문뿐 .ai
   function dsgFoldNopdf(cur) {
     const stem = n => (n || '').replace(/\\.[^.]*$/, '').trim().toLowerCase();
     const keep = [], tail = [];
     _dsgFiles.forEach(f => {
       if (!f.nopdf) { keep.push(f); return; }
       const img = _dsgFiles.find(x => x.kind === 'image' && !x.orig && stem(x.name) === stem(f.name));
-      if (img) img.orig = f; else tail.push(f);
+      if (img) img.orig = f; else (f.conv ? keep : tail).push(f);
     });
     _dsgFiles = keep.concat(tail);
-    // 보던 .ai가 짝 그림에 합쳐졌으면 그 그림, 썸네일이 있으면 그대로, 안내만 남으면 다른 시안 첫 칸
-    const show = cur && cur.nopdf ? (_dsgFiles.find(x => x.orig === cur) || (cur.thumb ? cur : keep[0] || cur)) : cur;
+    // 보던 .ai가 짝 그림에 합쳐졌으면 그 그림, 변환·썸네일이 있으면 그대로, 안내만 남으면 다른 시안 첫 칸
+    const show = cur && cur.nopdf ? (_dsgFiles.find(x => x.orig === cur) || (cur.conv || cur.thumb ? cur : keep[0] || cur)) : cur;
     _dsgIdx = Math.max(0, _dsgFiles.indexOf(show));
   }
   // 미리보기 쪽 주소 — .ai는 대지마다 한 쪽(최대 8쪽), 쪽마다 목록 한 칸으로 펼쳐 화살표·썸네일로 넘김
-  // &t=1 = 안내문뿐인 .ai의 1쪽을 썸네일로 바꾼 뒤 주소 (브라우저가 30일 보관한 옛 안내문 그림을 안 쓰게)
-  const dsgSrc = (f, hd) => f.preview + '?page=' + (f.page || 1) + (hd ? '&hd=1' : '') + (f.nopdf && f.thumb ? '&t=1' : '');
+  // &t=1·2 = 안내문뿐인 .ai의 1쪽을 썸네일·변환 그림으로 바꾼 뒤 주소 (브라우저가 30일 보관한 옛 안내문 그림을 안 쓰게)
+  const dsgSrc = (f, hd) => f.preview + '?page=' + (f.page || 1) + (hd ? '&hd=1' : '') + (f.nopdf ? (f.conv ? '&t=2' : f.thumb ? '&t=1' : '') : '');
   function dsgThumbs() {
     document.getElementById('dsg-thumbs').innerHTML = _dsgFiles.length > 1 ? _dsgFiles.map((f, i) =>
       '<button onclick="showDesign(' + i + ')" title="' + escapeHtml(f.name) + (f.page ? ' · ' + f.page + '쪽' : '') + '">'
       + (f.kind === 'image' ? '<img src="' + escapeHtml(f.url) + '" alt="" loading="lazy">'
-        : (f.preview && (f.expanded || (f.nopdf && f.thumb)) ? '<img src="' + escapeHtml(dsgSrc(f)) + '" alt="" loading="lazy">' : escapeHtml((f.ext || f.kind).toUpperCase())))
+        : (f.preview && (f.expanded || (dsgStub(f) && f.thumb)) ? '<img src="' + escapeHtml(dsgSrc(f)) + '" alt="" loading="lazy">' : escapeHtml((f.ext || f.kind).toUpperCase())))
       + '</button>').join('') : '';
   }
   function showDesign(i) {
@@ -22155,10 +22179,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const imgTag = src => '<div class="dsg-box"><img src="' + escapeHtml(src) + '" alt="' + escapeHtml(f.name) + '" draggable="false" onload="dsgOnLoad(this)" title="마우스 휠: 확대·축소 · 끌기: 이동 · 클릭: 크게 보기/맞춤"></div>';
     if (f.kind === 'image') {
       stage.innerHTML = nav + imgTag(f.url);
-    } else if (f.nopdf && f.thumb) {   // 파일 속 작은 썸네일(256px) — 조금 키워서 보여 줌
+    } else if (dsgStub(f) && f.thumb) {   // 파일 속 작은 썸네일(256px) — 조금 키워서 보여 줌
       stage.innerHTML = nav + imgTag(dsgSrc(f))
         + '<div class="dsg-note">\\'PDF 호환\\' 없이 저장된 AI라 파일 속 작은 미리보기만 있습니다 — 크게 보려면 [원본 받기]</div>';
-    } else if (f.nopdf) {
+    } else if (dsgStub(f)) {
       stage.innerHTML = nav + '<div class="search-empty" style="margin:auto;text-align:center;line-height:1.7">이 AI 파일은 일러스트레이터에서 \\'PDF 호환 파일 만들기\\'를 끄고 저장해서<br>화면 미리보기가 없습니다. 오른쪽 위 [원본 받기]로 받아 일러스트레이터에서 열어 주세요.</div>';
     } else if (f.preview && f.expanded) {
       stage.innerHTML = nav + imgTag(dsgSrc(f))
@@ -22170,10 +22194,11 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       fetch(f.preview + '?check=1').then(r => r.json()).then(d => {
         if (seq !== _dsgSeq) return;   // 그사이 다른 파일로 넘겼거나 창을 닫음
         if (!d.ok) throw new Error(d.error || '미리보기 실패');
-        if (d.nopdf) {   // 안내문뿐인 .ai — 짝 그림으로 합치거나 맨 뒤로(파일 속 썸네일이 있으면 그것을 보여 줌)
-          f.nopdf = true; f.thumb = !!d.thumb; dsgFoldNopdf(f); dsgThumbs(); showDesign(_dsgIdx);
-          return;
-        }
+        if (d.nopdf) {   // 안내문뿐인 .ai — 짝 그림으로 합치거나, 변환 못 했으면 맨 뒤로(썸네일·안내)
+          Object.assign(f, {nopdf: true, conv: !!d.conv, thumb: !!d.thumb});
+          dsgFoldNopdf(f);
+          if (dsgStub(f) || _dsgFiles.indexOf(f) < 0) { dsgThumbs(); showDesign(_dsgIdx); return; }
+        }   // Scribus로 변환한 것은 아래에서 보통 시안처럼 쪽을 펼침
         const n = d.rendered || 1;
         Object.assign(f, {ready: true, expanded: true, page: 1, pages: d.pages || n, rendered: n});
         if (n > 1) {   // 쪽마다 한 칸씩 펼침
@@ -22214,7 +22239,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     if (!img || !box.dataset.nw0) return null;
     const nw0 = +box.dataset.nw0, nh0 = +box.dataset.nh0, side = _dsgRot % 180 !== 0;
     const rw = side ? nh0 : nw0, rh = side ? nw0 : nh0;   // 돌린 뒤 가로·세로
-    const f = _dsgFiles[_dsgIdx] || {}, cap = f.nopdf && f.thumb ? 2.5 : 1;   // 256px 썸네일은 2.5배까지 키워 맞춤
+    const f = _dsgFiles[_dsgIdx] || {}, cap = dsgStub(f) && f.thumb ? 2.5 : 1;   // 256px 썸네일은 2.5배까지 키워 맞춤
     if (!box.dataset.fit) box.dataset.fit = Math.min(st.clientWidth / rw, st.clientHeight / rh, cap);
     return { st, box, img, nw0, nh0, rw, rh, fit: +box.dataset.fit };
   }
@@ -22250,7 +22275,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const r1 = g.box.getBoundingClientRect();   // 커서 아래 지점이 그대로 커서 아래 있도록 스크롤 보정
     g.st.scrollLeft += r1.left + px * r1.width - cx;
     g.st.scrollTop += r1.top + py * r1.height - cy;
-    if (f.preview && !f.nopdf && g.fit * _dsgZ > 1.05) dsgLoadHd();   // 기본 그림보다 크게 보이면 고해상도로 (썸네일뿐인 .ai는 없음)
+    if (f.preview && !dsgStub(f) && g.fit * _dsgZ > 1.05) dsgLoadHd();   // 기본 그림보다 크게 보이면 고해상도로 (썸네일뿐인 .ai는 없음)
   }
   window.addEventListener('resize', () => {
     const g = document.getElementById('design-modal').classList.contains('show') && dsgGeom();
