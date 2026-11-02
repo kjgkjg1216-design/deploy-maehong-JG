@@ -11361,7 +11361,21 @@ def api_price_change_detail():
             m = PRICE_DF[PRICE_DF[cc].astype(str).str.strip().str.upper() == code]
             if len(m):
                 ref = _num(m[pc].iloc[-1]) or None
-    return jsonify({'code': code, 'name': name, 'item': it, 'orders': orders[::-1][:60], 'n_orders': len(orders),
+    # 발주 이력 = 최근 2개월 (2026-11-02, 사용자 "60건 말고 최근 2개월 기준") — 2개월 안에 발주가 없으면 마지막 발주일 기준 2개월
+    def _months_back(d, n=2):
+        y, m = d.year, d.month - n
+        while m <= 0:
+            m += 12; y -= 1
+        import calendar as _cal
+        return f'{y:04d}-{m:02d}-{min(d.day, _cal.monthrange(y, m)[1]):02d}'
+    o_from, o_basis = _months_back(_dtm.now()), 'today'
+    recent = [o for o in orders[::-1] if o['date'] >= o_from]
+    if not recent:
+        o_from, o_basis = _months_back(_dtm.strptime(orders[-1]['date'], '%Y-%m-%d')), 'last'
+        recent = [o for o in orders[::-1] if o['date'] >= o_from]
+    return jsonify({'code': code, 'name': name, 'item': it, 'orders': recent[:500], 'orders_from': o_from, 'orders_basis': o_basis,
+                    'n_orders': len(orders), 'last_price': orders[-1]['price'],
+                    'price_min': min(o['price'] for o in orders), 'price_max': max(o['price'] for o in orders),
                     'segments': segs[::-1], 'vendors': sorted(vend.values(), key=lambda x: x['last'], reverse=True),
                     'months': months, 'qty3m': qty3m, 'ref_price': ref,
                     'first': orders[0]['date'], 'last': orders[-1]['date'], 'unit': orders[-1]['unit']})
@@ -12688,11 +12702,12 @@ def api_ipsu_bom():
                     inner_box = inner_box or s  # 단상자
             else:
                 pouches.append((depth, s))
-        # 품명 표기(1차/2차) 우선, 없으면 BOM 깊이로 판정 — 깊을수록 안쪽(1차)
+        # 품명 표기(1차/2차) 우선, 없으면 완제품당 소요량이 많은 쪽이 안쪽(1차) — 5번들이면 낱개 파우치 5 / 묶음 파우치 1.
+        # 소요량이 같으면 BOM 깊이로 판정(깊을수록 안쪽). 깊이만 보던 때는 같은 깊이의 번들 제품에서 1차·2차가 뒤바뀌었음 (2026-11-02)
         a = next((s for _, s in pouches if s['tier'] == '1차'), None)
         b = next((s for _, s in pouches if s['tier'] == '2차'), None)
         rest = [(d, s) for d, s in pouches if s is not a and s is not b]
-        rest.sort(key=lambda x: -x[0])
+        rest.sort(key=lambda x: (-round(qty.get(x[1]['code']) or 0, 6), -x[0]))
         for _, s in rest:
             if a is None:
                 a = s                           # 가장 안쪽 = 1차파우치
@@ -12707,20 +12722,26 @@ def api_ipsu_bom():
         qb = qty.get(b['code']) if b else None
         qc = qty.get(c['code']) if c else None
         bom_n1 = _ratio(qa, qb)                       # 내부용기당 1차 입수
-        # 박스당 내부용기(없으면 1차, 그마저 없으면 완제품 1개 기준) 입수
+        # 박스당 내부용기(없으면 1차, 그마저 없으면 완제품 1개 기준) 입수 — 3D 배치용
         bom_n2 = _ratio(qb or qa or 1.0, qc)
+        # 박스당 완제품 수 = 외박스 소요량 역수. Monday '박스입수 적재량'(완제품 기준)과 같은 단위라 대조는 이 값으로
+        # (5번들처럼 완제품 하나에 파우치가 여러 개면 bomN2는 파우치 수라 Monday와 단위가 달라 거짓 불일치가 났음, 2026-11-02)
+        bom_per = _ratio(1.0, qc)
         bx = box_by.get(mo.upper(), {})
         products.append({
             'code': mo, 'name': name_map.get(mo, ''),
             'ipsu': bx.get('ipsu'), 'pallet': bx.get('pallet'),
-            'bomN1': bom_n1, 'bomN2': bom_n2,
+            'bomN1': bom_n1, 'bomN2': bom_n2, 'bomPer': bom_per,
+            'qa': round(qa, 6) if qa else None, 'qb': round(qb, 6) if qb else None, 'qc': round(qc, 6) if qc else None,
             'a': a, 'b': b, 'c': c,
         })
     products.sort(key=lambda x: x['code'])
     full = sum(1 for p in products if p['a'] and p['b'] and p['c'])
     return jsonify({'products': products, 'total': len(products), 'full': full,
                     'withIpsu': sum(1 for p in products if p['ipsu']),
-                    'withBomN2': sum(1 for p in products if p['bomN2'])})
+                    'withBomN2': sum(1 for p in products if p['bomN2']),
+                    'withBomPer': sum(1 for p in products if p['bomPer']),
+                    'mismatch': sum(1 for p in products if p['bomPer'] and p['ipsu'] and p['bomPer'] != p['ipsu'])})
 
 
 def _ipsu_norm(s: str) -> str:
@@ -13843,10 +13864,16 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   #design-modal { padding: 10px; }
   #design-modal .dsg-modal { max-width: none; width: calc(100vw - 20px); height: calc(100vh - 20px); max-height: none; position: relative; border-radius: 14px; }
   #design-modal .dsg-stage { margin: 10px 12px 0; }
+  /* 고해상도 바꾸는 중 안내 — 오른쪽 위 작은 알약은 눈에 안 띈다고 해서 화면 가운데 크게 + 도는 표시 (2026-11-02) */
   .dsg-badge {
-    position: absolute; top: 120px; right: 34px; z-index: 3; pointer-events: none;
-    background: rgba(15,23,42,0.75); color: #fff; font-size: 12px; font-weight: 600;
-    padding: 6px 12px; border-radius: 999px;
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 3; pointer-events: none;
+    display: flex; align-items: center; gap: 12px; max-width: calc(100% - 48px);
+    background: rgba(15,23,42,0.84); color: #fff; font-size: 17px; font-weight: 700;
+    padding: 16px 28px; border-radius: 14px; box-shadow: 0 10px 30px rgba(15,23,42,0.35);
+  }
+  .dsg-badge.busy::before {
+    content: ''; flex: none; width: 20px; height: 20px; border-radius: 50%;
+    border: 3px solid rgba(255,255,255,0.35); border-top-color: #fff; animation: spin 0.8s linear infinite;
   }
   #design-modal .modal-header { padding: 12px 20px 10px; }
   .dsg-stage {
@@ -14695,6 +14722,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   }
   .modal-close:hover { background: #f1f5f9; color: var(--text); }
   .modal-body { padding: 24px 28px; overflow-y: auto; flex: 1; }
+  /* 재고 비교 품번별 위치: 고정 영역 밑에 머리글 고정, 칸마다 불투명 배경 (2026-11-02) */
+  .sc-items thead th { position: sticky; top: var(--sc-top, 0); z-index: 2; background: #f8fafc; box-shadow: 0 1px 0 #e2e8f0, 0 4px 6px -4px rgba(15,23,42,.12); }
   /* 상세 창 제목·부제목 크기 통일 (창마다 15/16/18px로 달랐음 — 인라인 지정보다 우선, 2026-10-23) */
   .modal-header h2 { font-size: 18px !important; }
   .modal-header h2 + div { font-size: 12.5px !important; line-height: 1.5; }
@@ -17916,8 +17945,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     }
     if (d.ref_price) why += '<br><span style="color:var(--text-3)">단가표(보조) 값: ' + won(d.ref_price) + (x ? (Math.abs(d.ref_price - x.cur) > 0.01 ? ' — 현재 발주단가와 다름' : ' — 현재 발주단가와 같음') : '') + '</span>';
     let h = '<div class="npd-why" style="background:#f0fdfa;border-color:#99f6e4">' + why + '</div>';
-    const prices = d.orders.map(o => o.price);
-    h += '<div class="npd-kpis">' + _ld.kpi('현재 단가', won(x ? x.cur : d.orders[0].price), md(d.last) + ' 발주')
+    // 최저·최고는 전체 이력 기준 (발주 이력 표는 최근 2개월만 받음)
+    const prices = d.price_min != null ? [d.price_min, d.price_max] : d.orders.map(o => o.price);
+    h += '<div class="npd-kpis">' + _ld.kpi('현재 단가', won(x ? x.cur : (d.last_price != null ? d.last_price : d.orders[0].price)), md(d.last) + ' 발주')
       + _ld.kpi('이전 단가', x ? won(x.prev) : '-', x ? md(x.changed) + ' 전까지' : '')
       + _ld.kpi('변동', x ? (x.pct > 0 ? '+' : '') + x.pct + '%' : '-', '')
       + _ld.kpi('월 영향', x ? (x.impact > 0 ? '+' : '−') + fmtEok(Math.abs(x.impact)) + '원' : '-', '최근 3개월 발주량 기준')
@@ -17932,7 +17962,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     if (vs.length > 1) h += '<div class="npd-sec">거래처별</div><table class="npd-tbl"><thead><tr><th>거래처</th><th>마지막 단가</th><th>마지막 발주</th><th>최저~최고</th><th>발주</th><th>발주금액</th></tr></thead><tbody>'
       + vs.map(v => '<tr><td style="text-align:left">' + escapeHtml(v.vendor) + '</td><td><b>' + won(v.last_price) + '</b></td><td>' + md(v.last) + '</td><td>' + won(v.min) + ' ~ ' + won(v.max)
           + '</td><td>' + v.n + '건</td><td>' + fmtEok(v.amt) + '원</td></tr>').join('') + '</tbody></table>';
-    h += '<div class="npd-sec">발주 이력 (최신 ' + d.orders.length + '건)</div><table class="npd-tbl"><thead><tr><th>발주일</th><th>발주번호</th><th>거래처</th><th>단가</th><th>발주량</th><th>입고</th><th>금액</th></tr></thead><tbody>'
+    const ofrom = d.orders_from ? md(d.orders_from) + ' ~ ' : '';
+    h += '<div class="npd-sec">발주 이력 (' + (d.orders_basis === 'last' ? '최근 2개월 발주 없음 · 마지막 발주 ' + md(d.last) + ' 기준 2개월' : '최근 2개월')
+      + ' · ' + ofrom + md(d.last) + ' · ' + d.orders.length + '건)</div><table class="npd-tbl"><thead><tr><th>발주일</th><th>발주번호</th><th>거래처</th><th>단가</th><th>발주량</th><th>입고</th><th>금액</th></tr></thead><tbody>'
       + d.orders.map((o, i) => { const nx = d.orders[i + 1]; const ch = nx && Math.abs(nx.price - o.price) > 1e-9;
           return '<tr><td>' + escapeHtml(o.date) + '</td><td>' + escapeHtml(o.no) + '</td><td style="text-align:left">' + escapeHtml(o.vendor) + '</td><td' + (ch ? ' style="color:' + (o.price > nx.price ? '#dc2626' : '#16a34a') + ';font-weight:800"' : '') + '>'
             + won(o.price) + '</td><td>' + fmtInt(o.qty) + '</td><td>' + fmtInt(o.rcv) + '</td><td>' + fmtEok(o.amount) + '원</td></tr>'; }).join('')
@@ -18778,7 +18810,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const tabs = '<div style="display:flex;gap:6px;margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid #f1f5f9">'
       + chip(_scView === 'item', '📍 품번별 위치', "scSet('view','item')", '#7c3aed') + chip(_scView === 'vendor', '🏭 거래처별 비교', "scSet('view','vendor')", '#7c3aed') + '</div>';
     if (_scView === 'item') {
-      body.innerHTML = tabs + '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px">'
+      // 탭·필터·범례·표 머리글은 스크롤해도 위에 고정 (2026-11-02) — 상세 창 본문 패딩만큼 끌어올려 빈틈 없이 붙임
+      const pad = parseFloat(getComputedStyle(body).paddingTop) || 0, padX = parseFloat(getComputedStyle(body).paddingLeft) || 0;
+      body.innerHTML = '<div class="sc-sticky" style="position:sticky;top:' + (-pad) + 'px;z-index:3;background:var(--surface,#fff);margin:' + (-pad) + 'px ' + (-padX) + 'px 0;padding:' + pad + 'px ' + padX + 'px 0">' + tabs + '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px">'
         + chip(_scFilter === 'diff', '차이 나는 것만', "scSet('filter','diff')") + chip(_scFilter === 'all', '전체', "scSet('filter','all')")
         + '<span style="width:10px"></span>' + chip(_scKind === '', '원·부재료', "scSet('kind','')") + chip(_scKind === '원재료', '원재료', "scSet('kind','원재료')") + chip(_scKind === '부재료', '부재료', "scSet('kind','부재료')")
         + '<input id="sc-q" type="text" placeholder="품번/품명/거래처/창고 검색…" value="' + escapeHtml(_scQ) + '" oninput="_scQ=this.value;renderScItems()" style="margin-left:auto;padding:5px 9px;border:1px solid #e2e8f0;border-radius:8px;font-size:12px;width:200px"></div>'
@@ -18788,6 +18822,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         + '<span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#93c5fd"></span> 아마란스 자사창고</span>'
         + '<span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#5eead4"></span> 아마란스 물류창고</span>'
         + '<span style="color:#94a3b8">차이 = 아마란스 외주처 위치 합 − 재고 파일 합 (자사·물류창고 제외)</span></div>'
+        + '<div id="sc-count" style="font-size:11px;color:#94a3b8;padding-bottom:4px"></div></div>'
         + '<div id="sc-table"></div>';
       renderScItems();
       return;
@@ -18818,9 +18853,17 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       .sort((a, b) => Math.abs(b.diff) - Math.abs(a.diff));
     const cell = 'padding:7px 9px;border-bottom:1px solid #f1f5f9;vertical-align:top';
     const none = '<span style="color:#cbd5e1;font-size:11px">없음</span>';
+    const cntEl = document.getElementById('sc-count'); if (cntEl) cntEl.textContent = rows.length + '개 품번';
     if (!rows.length) { el.innerHTML = '<div class="alert-empty">' + (_scFilter === 'diff' ? '차이 나는 품번이 없습니다 ✓' : '품번 없음') + '</div>'; return; }
-    el.innerHTML = '<div style="font-size:11px;color:#94a3b8;margin-bottom:4px">' + rows.length + '개 품번</div>'
-      + '<table style="width:100%;font-size:12.5px;border-collapse:collapse"><thead><tr style="background:#f8fafc;color:#64748b;font-size:11px;position:sticky;top:0;white-space:nowrap">'
+    // 표 머리글은 고정 영역 바로 밑에 붙음
+    const sk = document.querySelector('#cd-body .sc-sticky'), body = document.getElementById('cd-body');
+    const top = sk ? sk.offsetHeight - (parseFloat(getComputedStyle(body).paddingTop) || 0) : 0;
+    body.style.setProperty('--sc-top', top + 'px');
+    if (sk && window.ResizeObserver && !sk._ro) {   // 창 너비가 바뀌어 고정 영역 높이가 달라져도 머리글이 겹치지 않게
+      sk._ro = new ResizeObserver(() => body.style.setProperty('--sc-top', (sk.offsetHeight - (parseFloat(getComputedStyle(body).paddingTop) || 0)) + 'px'));
+      sk._ro.observe(sk);
+    }
+    el.innerHTML = '<table class="sc-items" style="width:100%;font-size:12.5px;border-collapse:separate;border-spacing:0"><thead><tr style="color:#64748b;font-size:11px;white-space:nowrap">'
       + '<th style="' + cell + ';text-align:left">품번</th><th style="' + cell + ';text-align:left">품명</th><th style="' + cell + ';text-align:left">재고 파일 (외주처)</th><th style="' + cell + ';text-align:left">아마란스 (창고·위치)</th><th style="' + cell + ';text-align:right">차이</th></tr></thead><tbody>'
       + rows.map(r => {
         const ok = Math.abs(r.diff) < 0.5;
@@ -21039,7 +21082,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       list = _ipsuProducts.filter(p => (p.code + ' ' + p.name).toLowerCase().includes(q)).slice(0, 30);
       html = list.map(p => {
         const tag = [p.a ? '①' : '', p.b ? '②' : '', p.c ? '③' : ''].join('') || '-';
-        const n = p.bomN2 ? ' · 박스 ' + p.bomN2 + '입'
+        const per = p.bomPer || p.bomN2;   // 박스당 완제품 수 (Monday 박스입수와 같은 단위)
+        const n = per ? ' · 박스 ' + per + '입'
                 : (p.ipsu ? ' · 박스 ' + p.ipsu + '입(Monday)' : '');
         return `<div onmousedown="ipsuPickProduct('${p.code}')">` +
           `<span class="sg-c">${escapeHtml(p.code)}</span>${escapeHtml(p.name.slice(0, 30))}` +
@@ -21138,19 +21182,25 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     // 박스당 입수 — ★아마란스 BOM(소요량 역수)이 기준. Monday 박스입수는 폴백/대조용.
     // ※ '개수'만 알고 배열은 모르므로 개수 입력 모드로 전환해야 값이 보인다.
     //   (배열 모드에선 n1/n2 필드가 숨겨져 있어 채워도 화면에 반영되지 않음)
-    const n2 = p.bomN2 || p.ipsu;
+    // n2 = 박스당 내부용기(없으면 1차파우치) 수 — 3D 배치 단위. Monday 박스입수는 완제품 기준이라
+    //      완제품 하나에 든 내부용기(또는 1차) 수를 곱해야 같은 단위가 됨 (5번들 → ×5, 2026-11-02)
+    const unit = p.b ? (p.qb || 1) : (p.qa || 1);
+    const monN2 = p.ipsu && Number.isInteger(Math.round(unit * 1000) / 1000) ? p.ipsu * unit : null;
+    const n2 = p.bomN2 || monN2;
+    const per = p.bomPer || (p.bomN2 && unit === 1 ? p.bomN2 : null);   // 박스당 완제품 수
     if (n2) {
       document.getElementById('ipsu-n2').value = n2;
       document.getElementById('ipsu-mode').value = 'count';
       ipsuOnMode();
+      const inner = unit > 1 ? ` (${p.b ? '내부용기' : '1차파우치'} ${n2}개 = 완제품당 ${unit}개)` : '';
       const src = p.bomN2
-        ? `<b>아마란스 BOM ${p.bomN2}입</b> (외박스 소요량 역수)`
-        : `<span style="color:#b45309">Monday 박스입수 ${p.ipsu}입</span> (아마란스 BOM에 외박스 없음)`;
+        ? `<b>아마란스 BOM 박스당 ${per || n2}입</b>${inner} — 외박스 소요량 역수`
+        : `<span style="color:#b45309">Monday 박스입수 ${p.ipsu}입</span>${inner} (아마란스 BOM에 외박스 없음)`;
       done.push('④ ' + src + (p.pallet ? ` · PT ${p.pallet}박스` : '')
                 + ' <span style="color:#0369a1">→ 개수 입력 모드</span>');
-      // Monday 보드 값과 다르면 그쪽이 갱신 대상
-      if (p.bomN2 && p.ipsu && p.ipsu !== p.bomN2)
-        done.push(`<span style="color:#b45309">⚠ Monday 박스입수는 ${p.ipsu}입 — ${Math.abs(p.ipsu - p.bomN2)}입 차이(보드 갱신 필요)</span>`);
+      // Monday 보드 값(완제품 기준)과 다르면 그쪽이 갱신 대상
+      if (per && p.ipsu && p.ipsu !== per)
+        done.push(`<span style="color:#b45309">⚠ Monday 박스입수는 ${p.ipsu}입 — ${Math.abs(p.ipsu - per)}입 차이(보드 갱신 필요)</span>`);
     } else {
       // 이전 제품의 입수가 남아 잘못된 값으로 보이지 않도록 비움 (빈칸 = 최대치 자동계산)
       document.getElementById('ipsu-n2').value = '';
@@ -22491,18 +22541,23 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         if (seq !== _dsgSeq || !img) return;
         img.src = src; f.hdState = 'shown'; badge.style.display = 'none';
       };
-      pre.onerror = () => { f.hdState = ''; badge.textContent = '고해상도를 불러오지 못했습니다'; };
+      pre.onerror = () => { f.hdState = ''; dsgBadgeFail(badge, '고해상도를 불러오지 못했습니다'); };
       pre.src = src;
     };
     if (f.hdState === 'ready') { swap(); return; }
     f.hdState = 'loading';
-    badge.textContent = '🔍 선명한 고해상도로 바꾸는 중…'; badge.style.display = '';
+    badge.textContent = '선명한 고해상도로 바꾸는 중…'; badge.classList.add('busy'); badge.style.display = '';
     fetch(f.preview + '?check=1&hd=1').then(r => r.json()).then(d => {
       if (!d.ok || !d.hd) throw new Error(d.error || '고해상도 없음');
       _dsgFiles.forEach(x => { if (x.preview === f.preview && x.hdState !== 'shown') x.hdState = 'ready'; });
       if (seq !== _dsgSeq) return;
       f.hdState = 'ready'; swap();
-    }).catch(e => { f.hdState = ''; if (seq === _dsgSeq) badge.textContent = '고해상도 실패: ' + e.message; });
+    }).catch(e => { f.hdState = ''; if (seq === _dsgSeq) dsgBadgeFail(badge, '고해상도 실패: ' + e.message); });
+  }
+  // 실패 안내는 가운데에 계속 떠 있으면 시안을 가리므로 4초 뒤 닫음 (그사이 다시 불러오기 시작했으면 그대로 둠)
+  function dsgBadgeFail(badge, msg) {
+    badge.classList.remove('busy'); badge.textContent = msg;
+    setTimeout(() => { if (!badge.classList.contains('busy')) badge.style.display = 'none'; }, 4000);
   }
   (() => {
     const st = document.getElementById('dsg-stage');
