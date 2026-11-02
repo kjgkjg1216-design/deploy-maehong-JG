@@ -2309,6 +2309,77 @@ def api_vendor_links():
     return jsonify({'items': out, 'total': len(out), 'pull': _VENDOR_PULL_STATE})
 
 
+@app.route('/api/stock_compare', methods=['GET'])
+def api_stock_compare():
+    """외주처 재고 파일(재고일지 DF) vs 아마란스 현재고(위치=외주처) 원재료·부재료 품번별 비교 (2026-11-02, 사용자 "차이를 눈으로 확인").
+    거래처 이름은 아마란스 위치명이 재고일지 외주업체명에 들어 있으면 같은 곳(한조(경북친환경)=한조). 둘 다 0인 품번은 뺌."""
+    if DF is None or DF.empty or STOCK_DF is None or STOCK_DF.empty:
+        return jsonify({'ok': False, 'error': '재고일지 또는 아마란스 현재고 자료 없음'})
+    inv = DF[DF[COL_품목].astype(str).str.match(r'^[A-D]\d')]
+    st = STOCK_DF[STOCK_DF['품번'].astype(str).str.match(r'^[A-D]\d')]
+    locs = sorted(set(st['위치명']))
+    # 품번별 위치 (2026-11-02, 사용자 "외주처 어디·아마란스 어느 창고에 있는지가 중요") — 0인 위치는 뺌
+    f_loc, a_loc, names = {}, {}, {}
+    for _, r in inv.iterrows():
+        q = _num(r['현재고량']); v = r['외주업체']
+        names.setdefault(r[COL_품목], r[COL_품명])
+        if q and v and not any(x['vendor'] == v for x in f_loc.get(r[COL_품목], [])):
+            f_loc.setdefault(r[COL_품목], []).append({'vendor': v, 'q': round(q, 3)})
+    for (c, wh, lc), g in st.groupby(['품번', '창고명', '위치명']):
+        q = sum(_num(x) for x in g['현재고'])
+        names[c] = g['품명'].iloc[0]
+        if abs(q) >= 0.001:
+            a_loc.setdefault(c, []).append({'wh': wh, 'loc': lc, 'q': round(q, 3)})
+    for d in (f_loc, a_loc):
+        for v in d.values():
+            v.sort(key=lambda x: -abs(x['q']))
+    vendor_locs = {l for l in locs for v in set(inv['외주업체']) if l and v and (l == v or v.startswith(l))}
+    items = []
+    for c in sorted(set(f_loc) | {c for c, v in a_loc.items() if any(x['loc'] in vendor_locs for x in v)}):
+        fl, al = f_loc.get(c, []), a_loc.get(c, [])
+        ft = sum(x['q'] for x in fl)
+        av = sum(x['q'] for x in al if x['loc'] in vendor_locs)
+        items.append({'code': c, 'kind': '원재료' if c[0] == 'A' else '부재료', 'name': names.get(c, ''),
+                      'file': fl, 'ama': al, 'file_t': round(ft, 3), 'ama_v': round(av, 3),
+                      'ama_t': round(sum(x['q'] for x in al), 3), 'diff': round(av - ft, 3)})
+    vendors = []
+    for v in sorted(set(inv['외주업체']) - {''}, key=lambda x: (not any(a in x for a in ACTIVE_VENDORS), x)):
+        loc = next((l for l in locs if l and (l == v or v.startswith(l))), None)
+        f = {}
+        for _, r in inv[inv['외주업체'] == v].iterrows():
+            f.setdefault(r[COL_품목], {'q': _num(r['현재고량']), 'name': r[COL_품명], 'spec': r[COL_규격]})
+        a = {}
+        if loc:
+            for _, r in st[st['위치명'] == loc].iterrows():
+                x = a.setdefault(r['품번'], {'q': 0.0, 'name': r['품명'], 'unit': r['단위']})
+                x['q'] += _num(r['현재고'])
+        rows = []
+        for c in sorted(set(f) | set(a)):
+            fq = f[c]['q'] if c in f else None
+            aq = a[c]['q'] if c in a else None
+            if not (fq or aq):
+                continue
+            if fq is None:
+                s = 'amaonly'
+            elif aq is None:
+                s = 'fileonly'
+            else:
+                s = 'same' if abs(fq - aq) < 0.5 else 'diff'
+            rows.append({'code': c, 'kind': '원재료' if c[0] == 'A' else '부재료',
+                         'name': (a.get(c) or f.get(c))['name'], 'spec': f.get(c, {}).get('spec', ''), 'unit': a.get(c, {}).get('unit', ''),
+                         'file': None if fq is None else round(fq, 3), 'ama': None if aq is None else round(aq, 3),
+                         'diff': round((aq or 0) - (fq or 0), 3), 'st': s,
+                         'f_other': [x for x in f_loc.get(c, []) if x['vendor'] != v],
+                         'a_other': [x for x in a_loc.get(c, []) if x['loc'] != loc]})
+        cnt = {k: sum(r['st'] == k for r in rows) for k in ('same', 'diff', 'fileonly', 'amaonly')}
+        vendors.append({'vendor': v, 'loc': loc or '', 'active': any(x in v for x in ACTIVE_VENDORS), 'rows': rows, 'cnt': cnt})
+    sf = sorted(glob.glob(f'{DATA_DIR}/*_현재고.csv'))
+    return jsonify({'ok': True, 'vendors': vendors, 'items': items, 'vendor_locs': sorted(vendor_locs),
+                    'file_at': datetime.fromtimestamp(os.path.getmtime(CSV_PATH)).strftime('%Y-%m-%d %H:%M') if CSV_PATH and os.path.exists(CSV_PATH) else '',
+                    'file_name': os.path.basename(CSV_PATH or ''),
+                    'ama_at': datetime.fromtimestamp(os.path.getmtime(sf[-1])).strftime('%Y-%m-%d %H:%M') if sf else ''})
+
+
 def _row_type(code, spec):
     """재고일지 행 유형 → (type, 입력 라벨, 시트 부호). 자재(A~D)=사용량(+, 행 수식이 차감), 생산=+, 출고/풀고=−(시트에 음수), 그 외=증감."""
     c = (code or '')[:1].upper(); s = spec or ''
@@ -14923,6 +14994,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
             style="background:#f1f5f9;color:#475569;border-color:#cbd5e1"><span id="nav-menu-label">☰ 메뉴</span></button>
     <a href="/report/monthly" target="_blank" title="전월 월간 리포트 (인쇄→PDF)">📊 월간 리포트</a>
     <a href="#" onclick="openVendorLinks();return false;" title="더고은·정성·데이웰즈 담당자 입력 링크 · 입력 현황 · 마감 생성">📝 외주재고 입력</a>
+    <a href="#" onclick="openStockCompare();return false;" title="외주처 재고 파일 vs 아마란스 재고 차이 (원재료·부재료)">⚖️ 재고 비교</a>
     <a href="#" onclick="openHistory();return false;">채팅내역</a>
     {% if not public_mode %}
     <!-- 관리자 메뉴 제거(2026-09-02): 미사용. 라우트 /admin은 유지 -->
@@ -15002,6 +15074,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     <div class="chart-head">
       <div><span class="chart-title">🚨 외주 재고 경고</span><span class="chart-sub">외주처 기준 · 45일 이하 · 클릭=상세</span></div>
       <div style="display:flex;align-items:center;gap:8px">
+        <button class="po-cal-btn" onclick="openStockCompare()" title="외주처 재고 파일 vs 아마란스 재고 차이">⚖️ 아마란스 비교</button>
         <button class="po-cal-btn" onclick="openVendorLinks()" title="거래처 재고 입력 링크 · 입력 현황">👥 거래처 입력</button>
         <div id="alert-count-outsource" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
       </div>
@@ -18662,6 +18735,131 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
             + '<td style="' + cell + ';text-align:center;white-space:nowrap">' + st(o.status) + '</td></tr>';
         }).join('') + '</tbody></table></div>';
     } catch (e) { box.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
+  }
+
+  // ───── 외주처 재고 파일 vs 아마란스 비교 (2026-11-02) ─────
+  let _scData = null, _scVendor = '', _scFilter = 'diff', _scKind = '', _scQ = '';
+  async function openStockCompare() {
+    const modal = document.getElementById('chart-detail-modal'); modal.classList.add('show');
+    if (typeof _phChart !== 'undefined' && _phChart) { _phChart.destroy(); _phChart = null; }
+    const badge = document.getElementById('cd-badge'); badge.textContent = '재고 비교'; badge.style.background = 'linear-gradient(135deg,#7c3aed,#a78bfa)';
+    document.getElementById('cd-title').textContent = '외주처 재고 파일 vs 아마란스 재고';
+    document.getElementById('cd-sub').textContent = '원재료·부재료 품번별 · 아마란스는 위치(외주처)별 현재고';
+    const body = document.getElementById('cd-body'); body.innerHTML = '<div class="loading" style="padding:20px">로딩 중...</div>';
+    try {
+      const d = await (await fetch('/api/stock_compare')).json();
+      if (!d.ok) { body.innerHTML = '<div class="alert-empty">' + escapeHtml(d.error || '자료 없음') + '</div>'; return; }
+      _scData = d;
+      if (!d.vendors.some(v => v.vendor === _scVendor)) _scVendor = (d.vendors[0] || {}).vendor || '';
+      document.getElementById('cd-sub').textContent = '원재료·부재료 품번별 · 재고 파일 ' + (d.file_at || '-') + ' 기준 / 아마란스 ' + (d.ama_at || '-') + ' 수집 — 두 시점이 다르면 그 사이 입출고만큼 차이 날 수 있음';
+      renderStockCompare();
+    } catch (e) { body.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
+  }
+  let _scView = 'item';
+  function scSet(k, v) { if (k === 'vendor') _scVendor = v; else if (k === 'filter') _scFilter = v; else if (k === 'kind') _scKind = v; else if (k === 'view') _scView = v; renderStockCompare(); }
+  // 위치 칩: 파일=외주처(주황) / 아마란스=외주처 위치(보라)·자사창고(파랑)·물류(청록)
+  function scLoc(x, ama, vlocs) {
+    let label, bg, fg;
+    if (!ama) { label = x.vendor; bg = '#fff7ed'; fg = '#c2410c'; }
+    else {
+      const isV = vlocs.includes(x.loc), isJ = /자사/.test(x.loc);
+      label = (x.wh && x.wh !== '자사 및 외주창고' ? x.wh + '·' : '') + x.loc;
+      bg = isV ? '#f5f3ff' : isJ ? '#eff6ff' : '#f0fdfa'; fg = isV ? '#6d28d9' : isJ ? '#1d4ed8' : '#0f766e';
+    }
+    return '<span title="' + escapeHtml(ama ? (x.wh + ' / ' + x.loc) : '외주처 재고 파일 · ' + x.vendor) + '" style="display:inline-block;margin:1px 3px 1px 0;padding:2px 7px;border-radius:8px;font-size:11px;white-space:nowrap;background:' + bg + ';color:' + fg + '">'
+      + escapeHtml(label) + ' <b>' + fmtInt(Math.round(x.q * 10) / 10) + '</b></span>';
+  }
+  function renderStockCompare() {
+    const d = _scData, body = document.getElementById('cd-body'); if (!d) return;
+    const V = d.vendors.find(v => v.vendor === _scVendor) || d.vendors[0];
+    const ST = { same: ['일치', '#047857', '#ecfdf5'], diff: ['차이', '#b91c1c', '#fef2f2'], fileonly: ['파일에만', '#b45309', '#fffbeb'], amaonly: ['아마란스에만', '#6d28d9', '#f5f3ff'] };
+    const chip = (on, label, js, color) => '<button class="po-cal-btn" onclick="' + js + '" style="' + (on ? 'background:' + (color || '#4f46e5') + ';color:#fff;border-color:' + (color || '#4f46e5') : '') + '">' + label + '</button>';
+    const bad = v => v.cnt.diff + v.cnt.fileonly + v.cnt.amaonly;
+    const tabs = '<div style="display:flex;gap:6px;margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid #f1f5f9">'
+      + chip(_scView === 'item', '📍 품번별 위치', "scSet('view','item')", '#7c3aed') + chip(_scView === 'vendor', '🏭 거래처별 비교', "scSet('view','vendor')", '#7c3aed') + '</div>';
+    if (_scView === 'item') {
+      body.innerHTML = tabs + '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px">'
+        + chip(_scFilter === 'diff', '차이 나는 것만', "scSet('filter','diff')") + chip(_scFilter === 'all', '전체', "scSet('filter','all')")
+        + '<span style="width:10px"></span>' + chip(_scKind === '', '원·부재료', "scSet('kind','')") + chip(_scKind === '원재료', '원재료', "scSet('kind','원재료')") + chip(_scKind === '부재료', '부재료', "scSet('kind','부재료')")
+        + '<input id="sc-q" type="text" placeholder="품번/품명/거래처/창고 검색…" value="' + escapeHtml(_scQ) + '" oninput="_scQ=this.value;renderScItems()" style="margin-left:auto;padding:5px 9px;border:1px solid #e2e8f0;border-radius:8px;font-size:12px;width:200px"></div>'
+        + '<div style="font-size:11px;color:#64748b;margin-bottom:8px;display:flex;gap:10px;flex-wrap:wrap">'
+        + '<span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#fdba74"></span> 재고 파일 외주처</span>'
+        + '<span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#a78bfa"></span> 아마란스 외주처 위치</span>'
+        + '<span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#93c5fd"></span> 아마란스 자사창고</span>'
+        + '<span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#5eead4"></span> 아마란스 물류창고</span>'
+        + '<span style="color:#94a3b8">차이 = 아마란스 외주처 위치 합 − 재고 파일 합 (자사·물류창고 제외)</span></div>'
+        + '<div id="sc-table"></div>';
+      renderScItems();
+      return;
+    }
+    let h = tabs + '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">'
+      + d.vendors.map(v => chip(v.vendor === V.vendor, escapeHtml(v.vendor) + ' <span style="opacity:.8;font-size:11px">' + (v.loc ? (bad(v) ? '⚠ ' + bad(v) : '✓') : '아마란스 위치 없음') + '</span>', "scSet('vendor','" + escapeHtml(v.vendor) + "')")).join('') + '</div>';
+    if (!V) { body.innerHTML = h; return; }
+    const c = V.cnt, tot = c.same + c.diff + c.fileonly + c.amaonly;
+    h += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">'
+      + Object.keys(ST).map(k => '<div style="flex:1;min-width:110px;padding:8px 10px;border-radius:10px;background:' + ST[k][2] + '"><div style="font-size:11px;color:' + ST[k][1] + ';font-weight:700">' + ST[k][0] + '</div><div style="font-size:20px;font-weight:800;color:' + ST[k][1] + '">' + c[k] + '<span style="font-size:11px;color:#94a3b8;font-weight:600"> / ' + tot + '</span></div></div>').join('') + '</div>';
+    if (tot) h += '<div style="display:flex;height:8px;border-radius:4px;overflow:hidden;margin-bottom:12px">' + Object.keys(ST).map(k => c[k] ? '<div style="width:' + (c[k] / tot * 100) + '%;background:' + ST[k][1] + '"></div>' : '').join('') + '</div>';
+    h += '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px">'
+      + chip(_scFilter === 'diff', '차이 나는 것만', "scSet('filter','diff')") + chip(_scFilter === 'all', '전체', "scSet('filter','all')")
+      + '<span style="width:10px"></span>' + chip(_scKind === '', '원·부재료', "scSet('kind','')") + chip(_scKind === '원재료', '원재료', "scSet('kind','원재료')") + chip(_scKind === '부재료', '부재료', "scSet('kind','부재료')")
+      + '<input id="sc-q" type="text" placeholder="품번/품명 검색…" value="' + escapeHtml(_scQ) + '" oninput="_scQ=this.value;renderScTable()" style="margin-left:auto;padding:5px 9px;border:1px solid #e2e8f0;border-radius:8px;font-size:12px;width:170px"></div>'
+      + '<div id="sc-table"></div>'
+      + (V.loc ? '' : '<div class="alert-empty" style="margin-top:8px">아마란스에 이 외주처 위치(창고 위치명)가 없어 파일 재고만 보입니다.</div>');
+    body.innerHTML = h;
+    renderScTable();
+  }
+  function renderScItems() {
+    const d = _scData, el = document.getElementById('sc-table'); if (!d || !el) return;
+    const vl = d.vendor_locs || [], q = _scQ.trim().toLowerCase();
+    const isMoved = r => [...new Set(r.file.map(x => vl.find(l => x.vendor === l || x.vendor.startsWith(l)) || x.vendor))].sort().join(',')
+      !== [...new Set(r.ama.filter(x => vl.includes(x.loc)).map(x => x.loc))].sort().join(',');
+    const rows = (d.items || []).filter(r => (_scFilter === 'all' || Math.abs(r.diff) >= 0.5 || isMoved(r)) && (!_scKind || r.kind === _scKind)
+      && (!q || [r.code, r.name].concat(r.file.map(x => x.vendor), r.ama.map(x => x.wh + ' ' + x.loc)).join(' ').toLowerCase().includes(q)))
+      .sort((a, b) => Math.abs(b.diff) - Math.abs(a.diff));
+    const cell = 'padding:7px 9px;border-bottom:1px solid #f1f5f9;vertical-align:top';
+    const none = '<span style="color:#cbd5e1;font-size:11px">없음</span>';
+    if (!rows.length) { el.innerHTML = '<div class="alert-empty">' + (_scFilter === 'diff' ? '차이 나는 품번이 없습니다 ✓' : '품번 없음') + '</div>'; return; }
+    el.innerHTML = '<div style="font-size:11px;color:#94a3b8;margin-bottom:4px">' + rows.length + '개 품번</div>'
+      + '<table style="width:100%;font-size:12.5px;border-collapse:collapse"><thead><tr style="background:#f8fafc;color:#64748b;font-size:11px;position:sticky;top:0;white-space:nowrap">'
+      + '<th style="' + cell + ';text-align:left">품번</th><th style="' + cell + ';text-align:left">품명</th><th style="' + cell + ';text-align:left">재고 파일 (외주처)</th><th style="' + cell + ';text-align:left">아마란스 (창고·위치)</th><th style="' + cell + ';text-align:right">차이</th></tr></thead><tbody>'
+      + rows.map(r => {
+        const ok = Math.abs(r.diff) < 0.5;
+        // 위치 다름 = 재고 파일 외주처와 아마란스 외주처 위치가 서로 다른 곳 (예: 파일은 더고은, 아마란스는 정성)
+        const fv = [...new Set(r.file.map(x => vl.find(l => x.vendor === l || x.vendor.startsWith(l)) || x.vendor))].sort().join(','),
+              av = [...new Set(r.ama.filter(x => vl.includes(x.loc)).map(x => x.loc))].sort().join(',');
+        const moved = fv !== av ? '<div style="margin-top:3px"><span title="재고 파일: ' + escapeHtml(fv || '없음') + ' / 아마란스: ' + escapeHtml(av || '없음') + '" style="padding:1px 6px;border-radius:8px;font-size:10px;font-weight:700;background:#fef3c7;color:#92400e">위치 다름</span></div>' : '';
+        return '<tr style="' + (ok && !moved ? 'opacity:.6' : '') + '"><td style="' + cell + ';font-weight:700;white-space:nowrap">' + escapeHtml(r.code) + '<div style="font-size:10px;color:#94a3b8;font-weight:500">' + r.kind + '</div></td>'
+          + '<td style="' + cell + ';min-width:160px">' + escapeHtml(r.name) + '</td>'
+          + '<td style="' + cell + '">' + (r.file.length ? r.file.map(x => scLoc(x, false, vl)).join('') + (r.file.length > 1 ? '<div style="font-size:10.5px;color:#94a3b8">합 ' + fmtInt(Math.round(r.file_t)) + '</div>' : '') : none) + '</td>'
+          + '<td style="' + cell + '">' + (r.ama.length ? r.ama.map(x => scLoc(x, true, vl)).join('') + (r.ama.length > 1 ? '<div style="font-size:10.5px;color:#94a3b8">외주처 위치 합 ' + fmtInt(Math.round(r.ama_v)) + ' · 전체 ' + fmtInt(Math.round(r.ama_t)) + '</div>' : '') : none) + '</td>'
+          + '<td style="' + cell + ';text-align:right;white-space:nowrap;font-weight:800;color:' + (ok ? '#047857' : r.diff > 0 ? '#7c3aed' : '#dc2626') + '">' + (ok ? '일치' : (r.diff > 0 ? '+' : '') + fmtInt(Math.round(r.diff * 10) / 10)) + moved + '</td></tr>';
+      }).join('') + '</tbody></table>';
+  }
+  function renderScTable() {
+    const d = _scData, el = document.getElementById('sc-table'); if (!d || !el) return;
+    const V = d.vendors.find(v => v.vendor === _scVendor) || d.vendors[0];
+    const ST = { same: ['일치', '#047857', '#ecfdf5'], diff: ['차이', '#b91c1c', '#fef2f2'], fileonly: ['파일에만', '#b45309', '#fffbeb'], amaonly: ['아마란스에만', '#6d28d9', '#f5f3ff'] };
+    const q = _scQ.trim().toLowerCase();
+    const rows = V.rows.filter(r => (_scFilter === 'all' || r.st !== 'same') && (!_scKind || r.kind === _scKind)
+      && (!q || (r.code + ' ' + r.name).toLowerCase().includes(q)))
+      .sort((a, b) => (a.st === 'same') - (b.st === 'same') || Math.abs(b.diff) - Math.abs(a.diff));
+    const n = v => v == null ? '<span style="color:#cbd5e1">없음</span>' : fmtInt(Math.round(v * 10) / 10);
+    const cell = 'padding:7px 9px;border-bottom:1px solid #f1f5f9;vertical-align:middle';
+    if (!rows.length) { el.innerHTML = '<div class="alert-empty">' + (_scFilter === 'diff' ? '차이 나는 품번이 없습니다 ✓' : '품번 없음') + '</div>'; return; }
+    el.innerHTML = '<table style="width:100%;font-size:12.5px;border-collapse:collapse"><thead><tr style="background:#f8fafc;color:#64748b;font-size:11px;position:sticky;top:0;white-space:nowrap">'
+      + '<th style="' + cell + '">상태</th><th style="' + cell + ';text-align:left">품번</th><th style="' + cell + ';text-align:left">품명</th><th style="' + cell + ';text-align:right">재고 파일</th><th style="' + cell + ';text-align:right">아마란스</th><th style="' + cell + ';text-align:right">차이 (아마란스−파일)</th><th style="' + cell + ';width:130px"></th><th style="' + cell + ';text-align:left">다른 위치</th></tr></thead><tbody>'
+      + rows.map(r => {
+        const s = ST[r.st], base = Math.max(Math.abs(r.file || 0), Math.abs(r.ama || 0)) || 1, pct = Math.min(100, Math.abs(r.diff) / base * 100);
+        const bar = r.st === 'same' ? '' : '<div style="height:6px;background:#f1f5f9;border-radius:3px;overflow:hidden"><div style="height:100%;width:' + Math.max(pct, 3) + '%;background:' + (r.diff > 0 ? '#7c3aed' : '#dc2626') + '"></div></div><div style="font-size:10px;color:#94a3b8;margin-top:2px">' + (r.file && r.ama != null ? Math.round(r.diff / Math.abs(r.file) * 100) + '%' : '') + '</div>';
+        return '<tr style="' + (r.st === 'same' ? 'color:#94a3b8' : '') + '"><td style="' + cell + ';text-align:center"><span style="padding:2px 7px;border-radius:9px;font-size:10.5px;font-weight:700;white-space:nowrap;color:' + s[1] + ';background:' + s[2] + '">' + s[0] + '</span></td>'
+          + '<td style="' + cell + ';font-weight:700;white-space:nowrap">' + escapeHtml(r.code) + ' <span style="font-size:10px;color:#94a3b8;font-weight:500">' + r.kind + '</span></td>'
+          + '<td style="' + cell + ';min-width:180px">' + escapeHtml(r.name) + (r.spec &&!/^(원재료|부재료)$/.test(r.spec.trim()) ? ' <span style="font-size:10.5px;color:#94a3b8">' + escapeHtml(r.spec) + '</span>' : '') + '</td>'
+          + '<td style="' + cell + ';text-align:right;white-space:nowrap">' + n(r.file) + '</td>'
+          + '<td style="' + cell + ';text-align:right;white-space:nowrap">' + n(r.ama) + (r.unit ? ' <span style="font-size:10px;color:#94a3b8">' + escapeHtml(r.unit) + '</span>' : '') + '</td>'
+          + '<td style="' + cell + ';text-align:right;white-space:nowrap;font-weight:800;color:' + (r.st === 'same' ? '#94a3b8' : r.diff > 0 ? '#7c3aed' : '#dc2626') + '">' + (r.diff > 0 ? '+' : '') + fmtInt(Math.round(r.diff * 10) / 10) + '</td>'
+          + '<td style="' + cell + '">' + bar + '</td>'
+          + '<td style="' + cell + '">' + (r.f_other || []).map(x => scLoc(x, false, d.vendor_locs || [])).join('') + (r.a_other || []).map(x => scLoc(x, true, d.vendor_locs || [])).join('') + '</td></tr>';
+      }).join('') + '</tbody></table>';
   }
 
   // ───── 거래처 재고 입력 링크·현황 (2026-09-11) ─────
