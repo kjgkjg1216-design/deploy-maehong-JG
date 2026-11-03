@@ -131,6 +131,24 @@ try {
     if ($rootUp -gt 0) { $uploaded += $rootUp }
   }
 
+  # ③-3 거래처 화면 '지난 달' 보기용 월별 재고일지 원본(data\inv_month\YYYYMM.csv) 동기화 (2026-11-03)
+  #     앱이 요청 때 파일 수정시각으로 다시 읽으므로 리로드 불필요
+  $r3 = Invoke-Remote 'ssh' "-i `"$KEY`" $SSHOPT jgkim@$IP `"timeout 60 sh -c 'mkdir -p /opt/maehong/data/inv_month; md5sum /opt/maehong/data/inv_month/*.csv 2>/dev/null; true'`"" 90
+  if (-not $r3.ok) {
+    Log "  ⚠ 월별 재고일지 목록 조회 실패(시간 초과=$($r3.timeout)) → 건너뜀"
+  } else {
+    $monMap = @{}
+    foreach($line in $r3.lines){ if($line -match '^([0-9a-f]{32})\s+\S*/([^/]+\.csv)$'){ $monMap[$Matches[2]] = $Matches[1] } }
+    $monUp = 0
+    Get-ChildItem "$DIR\data\inv_month" -File -Filter *.csv -ErrorAction SilentlyContinue | ForEach-Object {
+      if ($monMap[$_.Name] -ne (Get-FileHash -Path $_.FullName -Algorithm MD5).Hash.ToLower()) {
+        $u = Invoke-Remote 'scp' "-i `"$KEY`" $SSHOPT `"$($_.FullName)`" jgkim@${IP}:/opt/maehong/data/inv_month/" 120
+        if ($u.ok) { $monUp++ } else { Log "  ⚠ 월별 재고일지 업로드 실패: $($_.Name)" }
+      }
+    }
+    if ($monUp) { Log "  월별 재고일지 업로드 $monUp 파일" }
+  }
+
   # ④ 업로드 있었으면 무중단 리로드
   if ($uploaded -gt 0) {
     $tok = (Get-Content "$DIR\.reload_token" -Raw).Trim()

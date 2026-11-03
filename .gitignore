@@ -51,6 +51,7 @@ data/*.json
 data/*.jsonl
 data/리포트/
 data/마감/
+data/inv_month/
 data/spec_pdf/
 data/design_preview/
 *.bak

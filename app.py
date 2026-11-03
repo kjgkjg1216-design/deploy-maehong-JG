@@ -466,16 +466,17 @@ def _find_inventory_xlsx():
     group = [f for f in cands if _mon(f) == top]
     return max(group, key=lambda f: (_typ(f), _pref(f), os.path.getmtime(f)))
 
-def _parse_inventory_excel(xlsx_path):
+def _parse_inventory_excel(xlsx_path, tmp_name='_inv_snapshot.xlsx'):
     """원자재부자재 재고파악 Excel → DataFrame (시트4, 헤더5행).
 
     ⚠️ 원본을 절대 직접 열지 않는다 — 항상 임시 복사본으로 읽는다.
     앱이 원본 핸들을 잡고 있으면 ①사용자 엑셀이 '읽기전용'으로 열리고
     ②OneDrive 동기화(업로드)가 막힌다(예전 최종본 읽기전용 사태의 원인).
-    복사(수십 ms)는 공유읽기라 잠금을 만들지 않는다."""
+    복사(수십 ms)는 공유읽기라 잠금을 만들지 않는다.
+    tmp_name: 지난 달 파일을 읽을 땐 다른 이름 — 현재 파일 리로드와 같은 임시 파일을 동시에 쓰지 않게."""
     import shutil as _sh
     import tempfile as _tf
-    tmp = os.path.join(_tf.gettempdir(), '_inv_snapshot.xlsx')
+    tmp = os.path.join(_tf.gettempdir(), tmp_name)
     _sh.copy2(xlsx_path, tmp)
     xls = pd.ExcelFile(tmp, engine='openpyxl')
     try:
@@ -2165,7 +2166,7 @@ def vendor_portal(token):
     vendor = _vendor_by_token(token)
     if not vendor:
         return '<meta charset="utf-8"><p style="font-family:sans-serif;padding:40px">유효하지 않은 링크입니다. 매홍 구매팀에 문의해 주세요.</p>', 404
-    return render_template_string(VENDOR_PORTAL_TEMPLATE, vendor=vendor, token=token)
+    return render_template_string(VENDOR_PORTAL_TEMPLATE, vendor=vendor, token=token, first_ym=VENDOR_PORTAL_FIRST_YM)
 
 
 @app.route('/api/v/<token>/items', methods=['GET'])
@@ -2417,11 +2418,12 @@ def _rk_parts(rk):
     return d, name, int(n)
 
 
-def _vendor_row_list(vendor):
+def _vendor_row_list(vendor, full=None):
     """거래처 재고일지 행 [(행, code, spec, rk)] — 엑셀과 같은 순서·같은 행 수(중복 제거 전 원본 행).
-    예전엔 (품번, 규격) 첫 행만 보여 반제품(제품별)·공용 자재(제품 블록별) 행이 빠졌음."""
-    full = _inv_full_df()
-    rows = full[full[COL_원산지].astype(str).str.strip() == vendor] if full is not None else None
+    예전엔 (품번, 규격) 첫 행만 보여 반제품(제품별)·공용 자재(제품 블록별) 행이 빠졌음.
+    full: 지난 달 파일 행(_month_inv_df) — 없으면 지금 재고일지. 열 이름은 모든 달 파일이 같음(2026년 1~10월 확인)."""
+    full = _inv_full_df() if full is None else full
+    rows = full[full[COL_원산지].astype(str).str.strip() == vendor] if full is not None and COL_원산지 in full.columns else None
     if rows is None or rows.empty:
         return []
     items = []
@@ -2450,12 +2452,14 @@ def _vendor_rows(vendor):
 ACTIVE_VENDORS = ['더고은', '정성', '데이웰즈']
 
 
-def _daily_col_map():
-    """재고일지 DF의 'N월DD일' 컬럼 → {day: 컬럼명}. 파일의 월(첫 컬럼 기준)도 반환."""
+def _daily_col_map(df=None):
+    """재고일지 DF의 'N월DD일' 컬럼 → {day: 컬럼명}. 파일의 월(첫 컬럼 기준)도 반환.
+    양식 복사 흔적('2월' 파일 끝의 '1월31일' 등)은 첫 컬럼의 월과 달라 빠짐."""
     m = {}; mon = None
-    if DF is None:
+    df = DF if df is None else df
+    if df is None:
         return {}, None
-    for c in DF.columns:
+    for c in df.columns:
         mm = re.fullmatch(r'(\d+)월(\d+)일', str(c).strip())
         if mm:
             if mon is None:
@@ -2465,9 +2469,83 @@ def _daily_col_map():
     return m, mon
 
 
+def _file_ym(df=None, path=None):
+    """재고일지 파일의 연월 'YYYYMM' — 월은 일별 열 이름, 연도는 경로의 'YYYY년'(없으면 올해, 12월 파일을 1월에 보면 작년)."""
+    _, mon = _daily_col_map(df)
+    if not mon:
+        return ''
+    yy = re.search(r'(20\d{2})년', str(path if path is not None else (CSV_PATH or '')).replace('\\', '/'))
+    now = datetime.now()
+    year = int(yy.group(1)) if yy else (now.year - 1 if mon - now.month > 1 else now.year)
+    return f'{year}{mon:02d}'
+
+
+def _month_inv_file(ym):
+    """그 달 재고파악 엑셀(로컬 OneDrive) — 마감 > 최종본 > 월 파일, 경로에 'YYYY년'이 맞는 것만(다른 해 같은 달 제외).
+    같은 종류면 작업 폴더(바탕 화면\\구매) > 최신 수정."""
+    mon, yr = int(ym[4:6]), ym[:4]
+    best = None
+    for f in _glob_cached(INVENTORY_ONEDRIVE_PATTERN):
+        b, p = os.path.basename(f), f.replace('\\', '/')
+        if b.startswith('~$') or '카카오톡' in p or (yr + '년') not in p:
+            continue
+        m = re.fullmatch(rf'원자재부자재 재고파악\({mon}월\)(?:\s*[-_]\s*(마감|최종본))?\.xlsx', b)
+        if not m or not os.path.exists(f):   # 목록은 10분 캐시라 그사이 지워진 파일이 있을 수 있음
+            continue
+        rank = (2 if m.group(1) == '마감' else 1 if m.group(1) == '최종본' else 0,
+                p.lower().startswith(INVENTORY_PREFERRED_DIR.lower()), os.path.getmtime(f))
+        if best is None or rank > best[0]:
+            best = (rank, f)
+    return best[1] if best else None
+
+
+_MONTH_INV = {}   # ym → (지문, 원본 행 DataFrame, 출처 이름)
+
+
+def _month_inv_df(ym):
+    """지난 달 재고일지 원본 행(중복 제거 전) — 거래처 화면에서 예전 달을 볼 때 (2026-11-03, 사용자 "9월 이전 자료도 적용").
+    로컬: 그 달 엑셀을 읽어 data/inv_month/{ym}.csv로 보관 / GCP(OneDrive 없음): update_cloud가 올린 그 CSV를 읽음.
+    (폴더 이름은 영문 — 원격 경로에 한글이 들어가면 ssh 인자 인코딩이 깨질 수 있음). 엑셀이 안 바뀌면 메모리 캐시 그대로."""
+    snap = f'{DATA_DIR}/inv_month/{ym}.csv'
+    src = _month_inv_file(ym)
+    fp = (src, os.path.getmtime(src) if src else None, os.path.getmtime(snap) if os.path.exists(snap) else None)
+    hit = _MONTH_INV.get(ym)
+    if hit and hit[0] == fp:
+        return hit[1], hit[2]
+    df, name = None, ''
+    if src:
+        try:
+            df = _parse_inventory_excel(src, tmp_name=f'_inv_month_{ym}.xlsx').reset_index(drop=True)
+            os.makedirs(os.path.dirname(snap), exist_ok=True)
+            df.to_csv(snap, index=False, encoding='utf-8-sig')
+            name = os.path.basename(src)
+        except Exception as e:
+            print(f'[지난 달 재고일지] {ym} 엑셀 읽기 실패: {e}')
+            df = None
+    if df is None and os.path.exists(snap):
+        df = pd.read_csv(snap, encoding='utf-8-sig', dtype=str).fillna('')
+        name = name or os.path.basename(snap)
+    fp = (src, os.path.getmtime(src) if src else None, os.path.getmtime(snap) if os.path.exists(snap) else None)
+    _MONTH_INV[ym] = (fp, df, name)
+    return df, name
+
+
+def _months_back_ym(n, base=None):
+    """base(기본 이번 달)에서 n달 전 'YYYYMM'."""
+    d = base or datetime.now()
+    y, m = d.year, d.month - n
+    while m <= 0:
+        m += 12; y -= 1
+    return f'{y}{m:02d}'
+
+
+VENDOR_PORTAL_FIRST_YM = '202601'   # 거래처 화면에서 고를 수 있는 가장 이른 달 (2026-11-03, 올해 1월부터)
+
+
 @app.route('/api/v/<token>/sheet', methods=['GET'])
 def api_vendor_portal_sheet(token):
-    """엑셀 '재고일지' 양식 그대로: 행=거래처 품목(파일 순서), 열=기초·입고·현재고·1~31일. 파일 값 + 거래처 입력값."""
+    """엑셀 '재고일지' 양식 그대로: 행=거래처 품목(파일 순서), 열=기초·입고·현재고·1~31일. 파일 값 + 거래처 입력값.
+    지금 재고일지와 다른 달이면 그 달 파일(마감 > 최종본 > 월 파일)의 행·일별 값을 씀. 3개월 지난 달은 보기 전용."""
     import calendar as _cal
     vendor = _vendor_by_token(token)
     if not vendor:
@@ -2475,12 +2553,19 @@ def api_vendor_portal_sheet(token):
     ym = (request.args.get('ym') or datetime.now().strftime('%Y%m'))[:6]
     y, mo = int(ym[:4]), int(ym[4:6])
     ndays = _cal.monthrange(y, mo)[1]
-    dcols, file_mon = _daily_col_map()
-    file_is_month = (file_mon == mo)
+    src_df, source = DF, os.path.basename(str(CSV_PATH)) if CSV_PATH else ''
+    full = None
+    file_is_month = (_file_ym() == ym)
+    if not file_is_month:
+        mdf, mname = _month_inv_df(ym)
+        if mdf is not None and _file_ym(mdf, ym[:4] + '년') == ym:
+            src_df, full, source, file_is_month = mdf, mdf, mname, True
+    dcols, _ = _daily_col_map(src_df)
     day, ins = _vendor_month_entries(vendor, ym)
     out = []
-    if DF is not None:
-        for r, code, spec, rk in _vendor_row_list(vendor):
+    if src_df is not None:
+        cols = list(src_df.columns)
+        for r, code, spec, rk in _vendor_row_list(vendor, full):
             t, label, sign = _row_type(code, spec)
             daily_file = {}
             if file_is_month:
@@ -2497,7 +2582,8 @@ def api_vendor_portal_sheet(token):
             out.append({'dest': str(r.get(COL_납품처, '')).strip(), 'code': code, 'spec': spec, 'rk': rk, 'name': str(r.get(COL_품명, '')).strip(),
                         'ipsu': str(r.get(COL_입수량, '')).strip(), 'type': t, 'label': label, 'sign': sign,
                         'unit': 'kg' if code.upper().startswith('A') else 'ea',
-                        'base': _xnum(r.get(DF.columns[7], 0)), 'inb_file': _xnum(r.get(DF.columns[8], 0)),
+                        # 기초재고·입고 = 그 달 파일 값 (그 달 파일이 아직 없으면 예전처럼 지금 재고일지 값)
+                        'base': _xnum(r.get(cols[7], 0)), 'inb_file': _xnum(r.get(cols[8], 0)),
                         'cur_file': _xnum(r.get('현재고량_일지', r.get(COL_재고량, 0))),
                         'daily_file': daily_file, 'daily_entry': daily_entry, 'entry_by': entry_by, 'entry_src': entry_src})
     inbound = sorted([{'id': e['id'], 'date': e['date'], 'code': e['code'], 'qty': e['qty'], 'unit': e.get('unit', ''), 'exp': e.get('exp', ''),
@@ -2505,7 +2591,8 @@ def api_vendor_portal_sheet(token):
                        'by': e.get('name', ''), 'name': next((x['name'] for x in out if x['code'].upper() == e['code']), ''),
                        'spec': next((x['spec'] for x in out if x['code'].upper() == e['code']), '')} for e in ins], key=lambda x: (x['date'], x['id']))
     return jsonify({'vendor': vendor, 'ym': ym, 'ndays': ndays, 'rows': out, 'inbound': inbound,
-                    'file_month_matches': file_is_month, 'source': os.path.basename(str(CSV_PATH)) if CSV_PATH else ''})
+                    'file_month_matches': file_is_month, 'source': source,
+                    'readonly': ym < _months_back_ym(2), 'first_ym': VENDOR_PORTAL_FIRST_YM})
 
 
 def _vendor_month_entries(vendor, ym):
@@ -3532,21 +3619,22 @@ table.inbg{min-width:1180px}
 <div class="foot"><span id="cnt" style="font-size:12px;color:#64748b">변경 0건</span><span><button class="btn g" onclick="reloadAll()">새로고침</button> <button class="btn p" id="save" onclick="save()">저장</button></span></div>
 <div class="toast" id="toast"></div>
 <script>
-const TOKEN = {{ token|tojson }};
+const TOKEN = {{ token|tojson }}, FIRST_YM = {{ first_ym|tojson }};
 let TAB = 'sheet', SHEET = null, CELL = {}, ITEMS = [], VALS = {};
 const esc = s => String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 const fmt = n => n == null || n === '' ? '' : (Math.round(n * 100) / 100).toLocaleString();
 function toast(m) { const t = document.getElementById('toast'); t.textContent = m; t.style.display = 'block'; setTimeout(() => t.style.display = 'none', 2600); }
 function who() { const w = document.getElementById('who').value.trim(); try { localStorage.setItem('mhVendorWho', w); } catch (e) {} return w; }
 function tab(t) { TAB = t; document.querySelectorAll('.tab').forEach(x => x.classList.toggle('on', x.dataset.t === t)); ['sheet', 'in', 'stock'].forEach(p => document.getElementById('pane-' + p).style.display = p === t ? '' : 'none'); upd(); }
-function ymOpts() { const s = document.getElementById('ym'); const d = new Date(); const opts = []; for (let i = 0; i < 3; i++) { const y = d.getFullYear(), m = d.getMonth() + 1; opts.push(String(y) + String(m).padStart(2, '0')); d.setMonth(d.getMonth() - 1); } s.innerHTML = opts.map((o, i) => '<option value="' + o + '"' + (i === 0 ? ' selected' : '') + '>' + o.slice(0, 4) + '년 ' + parseInt(o.slice(4)) + '월</option>').join(''); }
+// 이번 달부터 FIRST_YM(올해 1월)까지 — 지난 달은 그 달 마감 파일 값이 보이고, 3개월 지난 달은 보기 전용 (2026-11-03)
+function ymOpts() { const s = document.getElementById('ym'); const d = new Date(); d.setDate(1); const opts = []; for (let i = 0; i < 36; i++) { const y = d.getFullYear(), m = d.getMonth() + 1; const o = String(y) + String(m).padStart(2, '0'); if (o < FIRST_YM) break; opts.push(o); d.setMonth(d.getMonth() - 1); } s.innerHTML = opts.map((o, i) => '<option value="' + o + '"' + (i === 0 ? ' selected' : '') + '>' + o.slice(0, 4) + '년 ' + parseInt(o.slice(4)) + '월' + (i > 2 ? ' (보기)' : '') + '</option>').join(''); }
 async function init() { try { document.getElementById('who').value = localStorage.getItem('mhVendorWho') || ''; } catch (e) {} ymOpts(); await reloadAll(); }
 async function reloadAll() { CELL = {}; VALS = {}; await Promise.all([loadSheet(), loadStock()]); loadHist(); }
 // ── 재고일지 그리드 ──
 async function loadSheet() {
   const ym = document.getElementById('ym').value;
   SHEET = await (await fetch('/api/v/' + TOKEN + '/sheet?ym=' + ym)).json(); CELL = {}; SHEET.rows.forEach((r, i) => { r.i = i; });
-  document.getElementById('note').textContent = (SHEET.file_month_matches ? '기준 파일: ' + SHEET.source : '※ 매홍 마감 파일이 아직 ' + parseInt(ym.slice(4)) + '월이 아니라 파일 값은 비어 있습니다') + ' · 품목 ' + SHEET.rows.length + '개';
+  document.getElementById('note').textContent = (SHEET.file_month_matches ? '기준 파일: ' + SHEET.source : '※ 매홍 마감 파일이 아직 ' + parseInt(ym.slice(4)) + '월이 아니라 파일 값은 비어 있습니다') + ' · 품목 ' + SHEET.rows.length + '개' + (SHEET.readonly ? ' · 3개월 지난 달이라 보기만 할 수 있습니다' : '');
   renderSheet();
   INROWS = 8; renderIn();
 }
@@ -3570,7 +3658,7 @@ function renderSheet() {
     for (let d = 1; d <= SHEET.ndays; d++) {
       const k = r.i + ':' + d; const v = cellVal(r, d);
       const cls = cellCls(r, d);
-      h += '<td class="day ' + cls + '"><input type="text" inputmode="decimal" autocomplete="off" value="' + (v === '' ? '' : v) + '" data-k="' + esc(k) + '" title="' + (r.entry_by[d] ? (r.entry_src && r.entry_src[d] ? '' : '입력: ') + esc(r.entry_by[d]) : '') + '" onfocus="this.select()" onmouseup="return false" onchange="onCell(this)" onkeydown="navCell(event,this)"></td>';
+      h += '<td class="day ' + cls + '"><input type="text" inputmode="decimal" autocomplete="off"' + (SHEET.readonly ? ' readonly' : '') + ' value="' + (v === '' ? '' : v) + '" data-k="' + esc(k) + '" title="' + (r.entry_by[d] ? (r.entry_src && r.entry_src[d] ? '' : '입력: ') + esc(r.entry_by[d]) : '') + '" onfocus="this.select()" onmouseup="return false" onchange="onCell(this)" onkeydown="navCell(event,this)"></td>';
     }
     h += '<td class="tot">' + fmt(rowSum(r)) + '</td></tr>';
   });
@@ -3634,7 +3722,7 @@ async function confirmSame() { const w = who(); if (!w) { toast('작성자 이�
 // ── 공통 ──
 async function post(body) { const r = await fetch('/api/v/' + TOKEN + '/submit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); return await r.json(); }
 function upd() { if (TAB === 'in') { const p = pendingIn(); const bad = p.filter(x => x.invalid).length; document.getElementById('cnt').textContent = '저장된 입고 ' + (SHEET ? SHEET.inbound.length : 0) + '건 · 새 입력 ' + (p.length - bad) + '행' + (bad ? ' · 미완성 ' + bad + '행(일자·품번·수량 필요)' : ''); return; } const n = TAB === 'stock' ? changedStock().length : Object.keys(CELL).length; document.getElementById('cnt').textContent = '변경 ' + n + '칸'; }
-async function save() { let items; if (TAB === 'in') { const p = pendingIn(); if (p.some(x => x.invalid)) { toast('일자·품번·수량이 비었거나 품번이 목록에 없는 행이 있습니다'); return; } items = p; } else items = TAB === 'stock' ? changedStock() : changedSheet(); if (!items.length) { toast('저장할 내용이 없습니다'); return; } const w = who(); if (!w) { toast('작성자 이름을 적어 주세요'); document.getElementById('who').focus(); return; }
+async function save() { if (SHEET && SHEET.readonly && TAB !== 'stock') { toast('3개월 지난 달은 보기만 할 수 있습니다'); return; } let items; if (TAB === 'in') { const p = pendingIn(); if (p.some(x => x.invalid)) { toast('일자·품번·수량이 비었거나 품번이 목록에 없는 행이 있습니다'); return; } items = p; } else items = TAB === 'stock' ? changedStock() : changedSheet(); if (!items.length) { toast('저장할 내용이 없습니다'); return; } const w = who(); if (!w) { toast('작성자 이름을 적어 주세요'); document.getElementById('who').focus(); return; }
   document.getElementById('save').disabled = true;
   try { const d = await post({ name: w, items }); if (d.ok) { toast('저장 완료 · ' + d.saved + '칸'); await reloadAll(); } else toast('저장 실패: ' + (d.error || '')); } catch (e) { toast('오류: ' + e.message); }
   document.getElementById('save').disabled = false; }
@@ -9946,6 +10034,60 @@ def api_delivery_weekday():
     return jsonify({'days': days, 'channels': top_ch, 'from': (end - pd.Timedelta(days=83)).strftime('%Y-%m-%d'), 'to': end.strftime('%Y-%m-%d')})
 
 
+@app.route('/api/delivery_weekday_detail', methods=['GET'])
+@cached_api()
+def api_delivery_weekday_detail():
+    """납품 요일 패턴 상세 (2026-11-02, 사용자 "클릭 시 상세내역이 없는 게 아쉬움") — 패널과 같은 최근 12주.
+    요일 요약 + 채널×요일 + 주별×요일 + 요일별 많이 나간 품목(채널 상위 3곳 포함)."""
+    df = SALES_DAILY_DF
+    if df is None or df.empty:
+        return jsonify({'error': '판매 자료 없음'}), 404
+    end = pd.to_datetime(df['date'].max())
+    start = end - pd.Timedelta(days=83)
+    d = df[(pd.to_datetime(df['date']) >= start) & (df['dq'] > 0)].copy()
+    if d.empty:
+        return jsonify({'error': '최근 12주 납품 자료 없음'}), 404
+    dt = pd.to_datetime(d['date'])
+    d['wd'] = dt.dt.dayofweek
+    d['wk'] = (dt - pd.to_timedelta(d['wd'], unit='D')).dt.strftime('%Y-%m-%d')   # 주 = 월요일 시작
+    d['key'] = d['code'].where(d['code'] != '', d['sku'].astype(str))
+    labels = ['월', '화', '수', '목', '금', '토', '일']
+    tot = float(d['dq'].sum()) or 1
+
+    def row7(g):
+        s = g.groupby('wd')['dq'].sum()
+        return [int(s.get(w, 0)) for w in range(7)]
+
+    days = []
+    for w in range(7):
+        g = d[d['wd'] == w]
+        days.append({'wd': labels[w], 'qty': int(g['dq'].sum()), 'amt': int(g['amt'].sum()), 'share': round(float(g['dq'].sum()) / tot * 100, 1),
+                     'online': int(g[g['channel_type'] == 'online']['dq'].sum()), 'offline': int(g[g['channel_type'] == 'offline']['dq'].sum())})
+    channels = []
+    for (ch, tp), g in d.groupby(['channel_name', 'channel_type']):
+        r = row7(g)
+        channels.append({'name': ch, 'type': tp, 'by_wd': r, 'total': sum(r), 'amt': int(g['amt'].sum())})
+    channels.sort(key=lambda x: -x['total'])
+    weeks = []
+    for wk, g in d.groupby('wk'):
+        ws = pd.to_datetime(wk)
+        covered = min(7, (end - ws).days + 1) - max(0, (start - ws).days)   # 12주 범위에 든 날 수 (앞뒤 주는 일부만일 수 있음)
+        r = row7(g)
+        weeks.append({'w': wk, 'to': (ws + pd.Timedelta(days=6)).strftime('%Y-%m-%d'), 'days': int(covered), 'by_wd': r, 'total': sum(r)})
+    tops = []
+    for w in range(7):
+        g = d[d['wd'] == w]
+        t = g.groupby('key').agg(qty=('dq', 'sum'), amt=('amt', 'sum'), name=('name', 'first')).sort_values('qty', ascending=False).head(12)
+        items = []
+        for k, r in t.iterrows():
+            chs = g[g['key'] == k].groupby('channel_name')['dq'].sum().sort_values(ascending=False)
+            items.append({'code': k, 'name': str(r['name']), 'qty': int(r['qty']), 'amt': int(r['amt']),
+                          'ch': [[c, int(v)] for c, v in chs.head(3).items()]})
+        tops.append(items)
+    return jsonify({'days': days, 'channels': channels, 'weeks': weeks, 'tops': tops,
+                    'from': start.strftime('%Y-%m-%d'), 'to': end.strftime('%Y-%m-%d'), 'total': int(tot)})
+
+
 _FG_STOCK_CACHE = {}
 
 
@@ -13675,6 +13817,16 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .wd-bar i { display: block; height: 100%; }
   .wd-row .n { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-2); }
   .wd-row .p { text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
+  /* 요일 줄 클릭 = 상세 창 (2026-11-02) */
+  .wd-row.wd-click { cursor: pointer; border-radius: 6px; margin: 0 -6px; padding-left: 6px; padding-right: 6px; transition: background 0.12s; }
+  .wd-row.wd-click:hover { background: #f1f5f9; }
+  .wdd-tbl td.h { text-align: center; font-weight: 600; }
+  .wdd-tbl th.h { text-align: center; }
+  .wdd-tbl th.sel, .wdd-tbl td.sel { outline: 2px solid #2563eb; outline-offset: -2px; }
+  .wdd-tbl td .s { display: block; font-size: 9.5px; font-weight: 500; color: var(--text-3); }
+  .wdd-chips { display: flex; gap: 4px; flex-wrap: wrap; margin: 0 0 8px; }
+  .wdd-chips .vk-chip { border: 1px solid #e2e8f0; }
+  .wdd-chips .vk-chip.on { background: #2563eb; color: #fff; border-color: #2563eb; }
   .chart-panel.lens-shift { border-top: 3px solid #db2777; }
   .chart-panel.lens-dormant { border-top: 3px solid #a16207; grid-column: span 2; }
   .dorm-mats { font-size: 10.5px; color: var(--text-2); margin-top: 3px; line-height: 1.55; }
@@ -14721,7 +14873,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     border-radius: 8px; transition: all 0.15s;
   }
   .modal-close:hover { background: #f1f5f9; color: var(--text); }
-  .modal-body { padding: 24px 28px; overflow-y: auto; flex: 1; }
+  .modal-body { --mbp: 24px; padding: var(--mbp) 28px; overflow-y: auto; flex: 1; }
+  /* 상세 창 표 머리글: 본문 위쪽 여백만큼 끌어올려 창 맨 위에 붙임 — top:0이면 여백(24px) 사이로 지나가는 행이 비쳐 겹쳐 보였음 (2026-11-02) */
+  .modal-body > table th { top: calc(-1 * var(--mbp)); z-index: 1; }
   /* 재고 비교 품번별 위치: 고정 영역 밑에 머리글 고정, 칸마다 불투명 배경 (2026-11-02) */
   .sc-items thead th { position: sticky; top: var(--sc-top, 0); z-index: 2; background: #f8fafc; box-shadow: 0 1px 0 #e2e8f0, 0 4px 6px -4px rgba(15,23,42,.12); }
   /* 상세 창 제목·부제목 크기 통일 (창마다 15/16/18px로 달랐음 — 인라인 지정보다 우선, 2026-10-23) */
@@ -14945,7 +15099,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
 
     /* ───── 모달 ───── */
     .modal { max-width: 100vw !important; margin: 8px; max-height: calc(100vh - 16px); }
-    .modal-body { padding: 12px 14px; }
+    .modal-body { --mbp: 12px; padding: var(--mbp) 14px; }
 
     /* ───── 입고 캘린더 (모바일) ───── */
     .chart-head > div:first-child { flex-wrap: wrap; gap: 6px 8px !important; }
@@ -17609,7 +17763,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       const d = await (await fetch(url)).json();
       if (d.error) throw new Error(d.error);
       _lensd = d; _lensdKind = kind;
-      ({ shift: renderShiftDetail, dorm: renderDormDetail, dgap: renderDgapDetail, plan: renderPlanDetail, chs: renderChsDetail, price: renderPriceDetail })[kind]();
+      ({ shift: renderShiftDetail, dorm: renderDormDetail, dgap: renderDgapDetail, plan: renderPlanDetail, chs: renderChsDetail, price: renderPriceDetail, wd: renderWdDetail })[kind]();
     } catch (e) { body.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
   }
   const _ld = {   // 공용 조각
@@ -18594,21 +18748,73 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       const d = await (await fetch('/api/delivery_weekday')).json();
       const days = d.days || [];
       if (!days.length) { body.innerHTML = '<div class="alert-empty">자료 없음</div>'; return; }
-      if (d.from) document.getElementById('wd-sub').textContent = '최근 12주 (' + d.from.slice(5).replace('-', '/') + '~' + d.to.slice(5).replace('-', '/') + ') · 납품수량';
+      if (d.from) document.getElementById('wd-sub').textContent = '최근 12주 (' + d.from.slice(5).replace('-', '/') + '~' + d.to.slice(5).replace('-', '/') + ') · 납품수량 · 클릭=상세';
       const mx = Math.max(...days.map(x => x.qty), 1);
       body.innerHTML = '<div style="display:flex;gap:10px;font-size:10.5px;color:var(--text-3);margin-bottom:6px">'
         + '<span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#2563eb;margin-right:3px"></i>온라인</span>'
         + '<span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#f59e0b;margin-right:3px"></i>오프라인</span></div>'
-        + days.map(x => '<div class="wd-row" title="' + escapeHtml(Object.entries(x.by_ch).map(([k, v]) => k + ' ' + v.toLocaleString()).join(' / ')) + '">'
+        + days.map((x, i) => '<div class="wd-row wd-click" onclick="openWeekdayDetail(' + i + ')" title="' + escapeHtml(Object.entries(x.by_ch).map(([k, v]) => k + ' ' + v.toLocaleString()).join(' / ')) + ' · 클릭=상세">'
           + '<span style="font-weight:700;color:' + (x.wd === '일' ? '#dc2626' : (x.wd === '토' ? '#2563eb' : 'var(--text)')) + '">' + x.wd + '</span>'
           + '<div class="wd-bar"><i style="width:' + (x.online / mx * 100) + '%;background:#2563eb"></i><i style="width:' + (x.offline / mx * 100) + '%;background:#f59e0b"></i></div>'
           + '<span class="n">' + fmtInt(x.qty) + '</span><span class="p">' + x.share + '%</span>'
           + wdSplit(x.online, x.offline) + '</div>').join('')
         + (() => { const on = days.reduce((a, x) => a + x.online, 0), off = days.reduce((a, x) => a + x.offline, 0);
-             return '<div class="wd-row wd-total"><span style="font-weight:700">계</span><span style="font-size:11px;color:var(--text-2)">주간 합계</span>'
+             return '<div class="wd-row wd-total wd-click" onclick="openWeekdayDetail(-1)" title="클릭=상세"><span style="font-weight:700">계</span><span style="font-size:11px;color:var(--text-2)">주간 합계</span>'
                + '<span class="n">' + fmtInt(on + off) + '</span><span class="p">100%</span>' + wdSplit(on, off) + '</div>'; })()
         + '<div style="font-size:10.5px;color:var(--text-3);margin-top:10px;line-height:1.5">요일 아래 % = 그 요일 납품 중 온라인·오프라인 비중. 막대에 마우스를 올리면 주요 채널(' + escapeHtml((d.channels || []).join(', ')) + ')별 수량이 보입니다.</div>';
     } catch (e) { body.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>'; }
+  }
+  // 납품 요일 패턴 상세 (2026-11-02) — 요일 줄 클릭: 그 요일 선택, 계 줄 클릭: 가장 많은 요일
+  let _wdSel = -1;
+  function openWeekdayDetail(w) { _wdSel = w; _openLens('wd', '/api/delivery_weekday_detail', '📅 납품 요일 패턴', '#2563eb', '요일별 납품 상세'); }
+  function wdPick(w) { _wdSel = w; renderWdDetail(); }
+  function renderWdDetail() {
+    const d = _lensd, L = ['월', '화', '수', '목', '금', '토', '일'], md = _ld.md;
+    const days = d.days, tot = d.total || 1;
+    const maxI = days.reduce((a, x, i) => x.qty > days[a].qty ? i : a, 0), minI = days.reduce((a, x, i) => x.qty < days[a].qty ? i : a, 0);
+    const onI = days.reduce((a, x, i) => x.online > days[a].online ? i : a, 0), offI = days.reduce((a, x, i) => x.offline > days[a].offline ? i : a, 0);
+    if (_wdSel < 0 || _wdSel > 6) _wdSel = maxI;
+    const sel = _wdSel, wdc = i => i === 6 ? '#dc2626' : (i === 5 ? '#2563eb' : 'inherit');
+    document.getElementById('lensd-title').textContent = '요일별 납품 상세 · 최근 12주 (' + md(d.from) + '~' + md(d.to) + ')';
+    const top3 = days.map((x, i) => [i, x.share]).sort((a, b) => b[1] - a[1]).slice(0, 3);
+    let why = '<b>' + L[maxI] + '요일</b>에 가장 많이 나갑니다(' + days[maxI].share + '%). 많은 순서는 ' + top3.map(t => L[t[0]] + ' ' + t[1] + '%').join(' · ')
+      + ', 가장 적은 날은 ' + L[minI] + '요일(' + days[minI].share + '%)입니다.'
+      + '<br>온라인은 <b>' + L[onI] + '요일</b>, 오프라인은 <b>' + L[offI] + '요일</b>에 가장 많이 나갑니다. 아래 표에서 채널마다 납품 요일을 확인하세요.';
+    let h = '<div class="npd-why" style="background:#eff6ff;border-color:#bfdbfe">' + why + '</div>';
+    h += '<div class="npd-kpis">' + _ld.kpi('가장 많은 요일', L[maxI] + ' ' + days[maxI].share + '%', fmtInt(days[maxI].qty) + '개')
+      + _ld.kpi('가장 적은 요일', L[minI] + ' ' + days[minI].share + '%', fmtInt(days[minI].qty) + '개')
+      + _ld.kpi('온라인 최다', L[onI] + '요일', fmtInt(days[onI].online) + '개')
+      + _ld.kpi('오프라인 최다', L[offI] + '요일', fmtInt(days[offI].offline) + '개')
+      + _ld.kpi('주 평균 납품', fmtInt(Math.round(tot / 12)) + '개', '12주 합계 ' + fmtInt(tot) + '개') + '</div>';
+    // 채널 × 요일 — 칸 색 = 그 채널 안에서 많은 요일일수록 진하게 (온라인 파랑, 오프라인 주황)
+    const head = '<tr><th>' + '__FIRST__' + '</th>' + L.map((x, i) => '<th class="h' + (i === sel ? ' sel' : '') + '" style="color:' + wdc(i) + '">' + x + '</th>').join('') + '<th>합계</th></tr>';
+    const cellBg = (v, mx, on) => v ? 'background:rgba(' + (on ? '37,99,235' : '245,158,11') + ',' + (0.08 + 0.5 * v / (mx || 1)).toFixed(2) + ')' : '';
+    h += '<div class="npd-sec">채널별 납품 요일 <span style="font-weight:500;color:var(--text-3);font-size:11px">칸 아래 % = 그 채널 납품 중 비중</span></div>'
+      + '<table class="npd-tbl wdd-tbl"><thead>' + head.replace('__FIRST__', '채널') + '</thead><tbody>'
+      + d.channels.map(c => { const mx = Math.max(...c.by_wd), on = c.type === 'online';
+          return '<tr><td><b>' + escapeHtml(c.name) + '</b> <span style="font-size:10px;color:' + (on ? '#2563eb' : '#d97706') + '">' + (on ? '온라인' : '오프라인') + '</span></td>'
+            + c.by_wd.map((v, i) => '<td class="h' + (i === sel ? ' sel' : '') + '" style="' + cellBg(v, mx, on) + '">' + (v ? fmtInt(v) + '<span class="s">' + Math.round(v / (c.total || 1) * 100) + '%</span>' : '<span style="color:#cbd5e1">-</span>') + '</td>').join('')
+            + '<td><b>' + fmtInt(c.total) + '</b></td></tr>'; }).join('')
+      + '<tr style="font-weight:800"><td>합계</td>' + days.map((x, i) => '<td class="h' + (i === sel ? ' sel' : '') + '">' + fmtInt(x.qty) + '<span class="s">' + x.share + '%</span></td>').join('') + '<td>' + fmtInt(tot) + '</td></tr>'
+      + '</tbody></table>';
+    // 주별 × 요일 — 매주 같은 요일에 나가는지 (칸 색 = 12주 전체에서 많을수록 진하게)
+    const wmx = Math.max(...d.weeks.flatMap(w => w.by_wd), 1);
+    h += '<div class="npd-sec">주별 납품 <span style="font-weight:500;color:var(--text-3);font-size:11px">매주 같은 요일에 나가는지 확인 · 최신 주가 위</span></div>'
+      + '<table class="npd-tbl wdd-tbl"><thead>' + head.replace('__FIRST__', '주') + '</thead><tbody>'
+      + d.weeks.slice().reverse().map(w => '<tr' + (w.days < 7 ? ' class="part"' : '') + '><td>' + md(w.w) + ' ~ ' + md(w.to) + (w.days < 7 ? ' <span style="font-size:10px">(' + w.days + '일치)</span>' : '') + '</td>'
+          + w.by_wd.map((v, i) => '<td class="h' + (i === sel ? ' sel' : '') + '" style="' + (v ? 'background:rgba(37,99,235,' + (0.06 + 0.5 * v / wmx).toFixed(2) + ')' : '') + '">' + (v ? fmtInt(v) : '<span style="color:#cbd5e1">-</span>') + '</td>').join('')
+          + '<td><b>' + fmtInt(w.total) + '</b></td></tr>').join('')
+      + '</tbody></table>';
+    // 요일별 많이 나간 품목
+    const tops = d.tops[sel] || [], dq = days[sel].qty || 1;
+    h += '<div class="npd-sec">' + L[sel] + '요일에 많이 나간 품목 <span style="font-weight:500;color:var(--text-3);font-size:11px">12주 합계 · 상위 12개</span></div>'
+      + '<div class="wdd-chips">' + L.map((x, i) => '<button class="vk-chip' + (i === sel ? ' on' : '') + '" onclick="wdPick(' + i + ')">' + x + ' ' + days[i].share + '%</button>').join('') + '</div>'
+      + (tops.length ? '<table class="npd-tbl"><thead><tr><th>품목</th><th>납품</th><th>' + L[sel] + '요일 중</th><th style="text-align:left">주요 채널</th></tr></thead><tbody>'
+        + tops.map((t, k) => '<tr><td><span style="color:var(--text-3);font-size:10.5px;margin-right:4px">' + (k + 1) + '</span><b>' + escapeHtml(t.code) + '</b> ' + escapeHtml(t.name) + '</td><td><b>' + fmtInt(t.qty) + '</b></td><td>'
+            + Math.round(t.qty / dq * 100) + '%</td><td style="text-align:left;font-size:11px;color:var(--text-2)">' + t.ch.map(c => escapeHtml(c[0]) + ' ' + fmtInt(c[1])).join(' · ') + '</td></tr>').join('')
+        + '</tbody></table>' : '<div class="alert-empty">이 요일 납품 없음</div>')
+      + '<div style="font-size:10.5px;color:var(--text-3);margin-top:4px">판매 API 납품 수량(채널 단위) 기준 · 판매 API에 없는 채널(홀세일·B2B 등)은 빠져 있습니다.</div>';
+    document.getElementById('lensd-body').innerHTML = h;
   }
 
   // ───── 채널 품절 경보 (2026-09-23) ─────
@@ -24809,6 +25015,11 @@ def export_source_csv():
             DF.to_csv(f'{arch}/{ym}_재고일지_마감.csv', index=False, encoding='utf-8-sig')
         if JASA_DF is not None and not JASA_DF.empty:
             JASA_DF.to_csv(f'{arch}/{ym}_자사재고_마감.csv', index=False, encoding='utf-8-sig')
+        # 거래처 화면의 지난 달 보기용 — 파일의 달 이름으로 원본 행 전체 보관 (달이 바뀌면 GCP도 지난 달을 보여 줌, 2026-11-03)
+        fym = _file_ym()
+        if fym and DF is not None and not DF.empty:
+            os.makedirs(f'{DATA_DIR}/inv_month', exist_ok=True)
+            _inv_full_df().to_csv(f'{DATA_DIR}/inv_month/{fym}.csv', index=False, encoding='utf-8-sig')
         print(f"[export] OneDrive 소스 CSV 저장: {out} (+마감보관 {ym})")
         return jsonify({'ok': True, 'exported': out, 'date': today})
     except Exception as e:
