@@ -69,6 +69,17 @@ for x in ok:
 for c in sorted(by):
     report(by[c], c)
 
+# 2026-11-04: 학습 단가 = 아마란스 최신 발주단가(있으면) › 규격표. 최근 6개월 발주가 있는 품목 = '지금 사는 값' 정답
+import datetime as _dt
+_cut = (_dt.date.today() - _dt.timedelta(days=183)).isoformat()
+_src = {r['code']: r.get('price_src', '') for r in items}
+recent = [x for x in ok if _src.get(x['code'], '').startswith('발주') and _src[x['code']][3:] >= _cut]
+_n = lambda p: sum(1 for x in ok if _src.get(x['code'], '').startswith(p))
+print(f"\n=== 단가 출처별 (발주 {_n('발주')} / 구매팀 확인 {_n('확인')} / 규격표 {_n('규격표')}) ===")
+report(recent, "최근발주")
+report([x for x in ok if _src.get(x['code'], '').startswith('확인')], "확인")
+report([x for x in ok if _src.get(x['code'], '') == '규격표'], "규격표")
+
 print("\n=== 오차 TOP 12 ===")
 for x in sorted(ok, key=lambda v: -v['ape'])[:12]:
     print(f"  [{x['code']}] {x['cat']} 실제={x['actual']:>9,.0f} 예측={x['pred']:>10,.0f} 오차={x['ape']:6.1f}% ({x['method']})")

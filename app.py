@@ -11746,7 +11746,55 @@ def _predict_box_price(items, sel_set, area, is_carton=False):
 
 
 # 단가 계산기에서 제외할 품번 (단종/미사용 부재료, 동일스펙 가격불일치 등 노이즈 유발 항목)
+# 2026-11-04: B0120(규격표 103원)·B0368(160원)은 규격표 단가가 틀렸던 것 — 발주가 190·192원으로 일치 →
+#   아마란스 발주단가가 있으면 학습에 다시 넣고, 발주가 없을 때(규격표 단가뿐)만 제외.
 _PCALC_EXCLUDE_CODES = {'B0120', 'B0368'}
+
+
+def _spec_po_latest():
+    """품번(대문자) → ('YYYY-MM-DD', 최신 발주단가, 거래처) — 구매·외주 발주 중 EA 단위, 최신 발주일자 기준.
+    단가계산기 학습 라벨용 (2026-11-04): 규격 보드 단가는 갱신이 늦어(2026 인상분 미반영 등) 실제 발주단가를 우선.
+    검증(최근 6개월 발주가 정답, LOO 66건): MAPE 12.8→10.8%, 짝지은 부트스트랩 P(개선)=99.9%."""
+    out = {}
+    for df_ in (ORDER_DF, WP_ORDER_DF):
+        if df_ is None or df_.empty or not {'품번', '발주일자', '단가'}.issubset(df_.columns):
+            continue
+        units = df_['단위'] if '단위' in df_.columns else [''] * len(df_)
+        vend = df_['거래처명'] if '거래처명' in df_.columns else [''] * len(df_)
+        for c, d, p, u, v in zip(df_['품번'], df_['발주일자'], df_['단가'], units, vend):
+            if str(u).strip().upper() not in ('EA', '', 'NAN'):
+                continue
+            c = str(c).strip().upper(); d = str(d).replace('-', '')[:8]
+            try:
+                p = float(str(p).replace(',', '') or 0)
+            except ValueError:
+                continue
+            # 같은 날 여러 줄이면 높은 단가 (검증 스크립트와 동일 기준)
+            if c and p > 0 and len(d) == 8 and (c not in out or (d, p) > out[c][:2]):
+                out[c] = (d, p, '' if str(v) == 'nan' else str(v).strip())
+    return {c: (f'{d[:4]}-{d[4:6]}-{d[6:]}', p, v) for c, (d, p, v) in out.items()}
+
+
+def _spec_price_checks():
+    """사용자 단가 확인 결과 data/price_check_answers_YYYYMMDD.csv → 품번(대문자) → (확인 당시 규격표 단가, 확인 단가, 'YYYY-MM-DD').
+    2026-11-04: 발주 이력 없는 77개를 사용자가 한 건씩 확인(20건 변경). Monday 규격표는 그대로 두고 계산기 학습·'실제' 단가에만 씀.
+    쓰는 쪽에서 규격표 단가가 확인 당시와 같을 때만 적용(확인 뒤 Monday가 바뀌면 그게 더 새 정보). 파일이 여럿이면 최신 파일이 덮어씀."""
+    out = {}
+    for f in sorted(glob.glob(os.path.join(DATA_DIR, 'price_check_answers_*.csv'))):
+        m = re.search(r'(\d{8})', os.path.basename(f))
+        day = f'{m.group(1)[:4]}-{m.group(1)[4:6]}-{m.group(1)[6:]}' if m else ''
+        try:
+            df = pd.read_csv(f, encoding='utf-8-sig', dtype=str).fillna('')
+        except Exception as e:
+            print(f'[단가 확인] {os.path.basename(f)} 읽기 실패: {e}')
+            continue
+        for c, b, p in zip(df.get('품번', []), df.get('규격표단가', []), df.get('확인단가', [])):
+            try:
+                out[str(c).strip().upper()] = (float(b), float(p), day)
+            except ValueError:
+                continue
+    return out
+
 
 def _build_material_regression():
     """부자재 규격 보드를 파싱해 계층 kNN 예측에 필요한 형태로 정리.
@@ -11776,19 +11824,28 @@ def _build_material_regression():
     # 모듈 수준 함수 재사용
     _box_tokens = _box_tokens_from_raw
 
+    po_latest = _spec_po_latest()
+    checks = _spec_price_checks()
     rows = []
     for _, r in spec.iterrows():
-        if str(r.get('품번', '')).strip() in _PCALC_EXCLUDE_CODES:
-            continue  # 단종/미사용 부재료 제외
+        code_u = str(r.get('품번', '')).strip().upper()
+        po_hit = po_latest.get(code_u)
+        if code_u in _PCALC_EXCLUDE_CODES and not po_hit:
+            continue  # 규격표 단가만 있는 노이즈 항목 제외
         m_str = str(r.get('재질', '')).strip()
-        p = str(r.get('단가(원)', '')).strip()
-        if not m_str or not p:
-            continue
         try:
-            price = float(p)
+            board = float(str(r.get('단가(원)', '')).strip() or 0)
         except Exception:
-            continue
-        if price <= 0:
+            board = 0.0
+        # 학습 단가 = 아마란스 최신 발주단가 › 구매팀 확인 단가(확인 뒤 규격표가 안 바뀐 경우) › 규격표 단가
+        chk = checks.get(code_u)
+        if po_hit:
+            price, price_src = po_hit[1], '발주 ' + po_hit[0]
+        elif chk and abs(board - chk[0]) < 0.01:
+            price, price_src = chk[1], '확인 ' + chk[2]
+        else:
+            price, price_src = board, '규격표'
+        if not m_str or price <= 0:
             continue
         raw_cat = str(r.get('그룹', '')).strip()
         cat = _cat_map.get(raw_cat, raw_cat)
@@ -11837,6 +11894,7 @@ def _build_material_regression():
             continue
         rows.append({
             'materials': tokens, 'price': price,
+            'price_src': price_src, 'board_price': board,
             'code': str(r.get('품번', '')).strip(),
             'name': str(r.get('품명', '')).strip(),
             'size': size_s, 'area': area,
@@ -12120,6 +12178,7 @@ def _pcalc_similar(items, sel_set, selected):
         out.append({
             'code': r['code'], 'name': r['name'], 'vendor': r['vendor'],
             'size': r['size'], 'price': r['price'],
+            'price_src': r.get('price_src', ''), 'board_price': r.get('board_price', 0),
             'overlap': len(inter), 'total': len(r['materials']),
             'materials': r['materials'],
         })
@@ -12678,10 +12737,19 @@ def api_spec_list():
         return jsonify({'items': [], 'total': 0})
     items = []
     _code_re = re.compile(r'^[A-Za-z0-9]+$')
+    po_latest = _spec_po_latest()   # 단가계산기 '실제' 단가 = 최신 발주단가 › 구매팀 확인 단가 › 규격표 (2026-11-04)
+    checks = _spec_price_checks()
     for _, r in spec.iterrows():
         code = str(r.get('품번', '')).strip()
         if not code or not _code_re.match(code):
             continue
+        po_hit = po_latest.get(code.upper())
+        chk = checks.get(code.upper())
+        try:
+            board_f = float(str(r.get('단가(원)', '')).strip().replace(',', '') or 0)
+        except Exception:
+            board_f = 0.0
+        chk_ok = bool(chk) and not po_hit and abs(board_f - chk[0]) < 0.01
         name = str(r.get('품명', '')).strip()
         size = str(r.get('사이즈', '')).strip()
         material = str(r.get('재질', '')).strip()
@@ -12701,6 +12769,8 @@ def api_spec_list():
         items.append({
             'code': code, 'name': name, 'size': size,
             'material': material, 'moq': moq, 'price': price,
+            'po_price': po_hit[1] if po_hit else 0, 'po_date': po_hit[0] if po_hit else '',
+            'chk_price': chk[1] if chk_ok else 0, 'chk_date': chk[2] if chk_ok else '',
             'vendor': vendor, 'category': cat, 'div': div,
             'tokens': _material_tokens(material, cat),  # 단가계산기 연동용 (서버 동일 토큰)
             # 시안 파일 수 — Monday 파일 칸 텍스트는 'URL, URL' (2026-10-28). 열어 볼 때 /api/spec_design/<item_id>
@@ -14273,6 +14343,13 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .pcalc-sim-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
   .pcalc-sim-code { font-size: 10.5px; font-weight: 700; color: #4f46e5; letter-spacing: -0.01em; }
   .pcalc-sim-price { font-size: 12px; font-weight: 800; color: var(--text); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  /* 단가 출처 꼬리표 (2026-11-04): 발주=아마란스 최신 발주단가(학습 기준), diff=규격표 단가와 2% 이상 다름 */
+  .pcalc-src { display: inline-block; font-size: 9.5px; font-weight: 700; padding: 1px 5px; border-radius: 5px; background: #f1f5f9; color: #64748b; margin-right: 5px; vertical-align: 1px; letter-spacing: -0.01em; }
+  .pcalc-src.po { background: #ecfdf5; color: #047857; }
+  .pcalc-src.chk { background: #eff6ff; color: #1d4ed8; }
+  .pcalc-src.diff { background: #fff7ed; color: #c2410c; }
+  .pcalc-sim-src { margin-top: 2px; line-height: 1.2; }
+  .pcalc-sim-src .pcalc-src { margin-right: 0; }
   .pcalc-sim-name { font-size: 11px; color: var(--text); margin-top: 2px; line-height: 1.3; }
   .pcalc-sim-meta { font-size: 10.5px; color: #0369a1; font-weight: 600; margin-top: 3px; letter-spacing: -0.01em; }
   .pcalc-sim-size.clickable { cursor: pointer; text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 2px; }
@@ -15418,7 +15495,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       <span style="margin-left:auto;font-size:10.5px;color:#b45309;background:#fef3c7;padding:2px 8px;border-radius:6px;font-weight:600;letter-spacing:-0.01em;white-space:nowrap">※ 동일 규격이라도 인쇄 도수·디자인에 따라 단가 편차 발생</span>
     </div>
     <div style="display:flex;gap:4px;margin-bottom:6px;align-items:center;flex-wrap:wrap">
-      <input id="pcalc-search" type="text" placeholder="재질 검색…" style="flex:1;min-width:120px;padding:6px 10px;font-size:11.5px;border:1px solid var(--border-2);border-radius:6px;outline:none" oninput="renderPriceCalcList()">
+      <input id="pcalc-search" type="text" placeholder="재질 검색…" style="flex:1;min-width:120px;padding:6px 10px;font-size:11.5px;border:1px solid var(--border-2);border-radius:6px;outline:none" oninput="pcalcSearchInput()">
       <span style="font-size:10.5px;color:var(--text-3)">가로</span>
       <input id="pcalc-w" type="number" placeholder="W" min="0" tabindex="1" style="width:48px;padding:6px 4px;font-size:11.5px;border:1px solid var(--border-2);border-radius:6px;outline:none;font-variant-numeric:tabular-nums;text-align:center" oninput="updatePriceCalc()" onkeydown="if(event.key==='Enter'||event.key==='Tab'){if(!event.shiftKey){event.preventDefault();document.getElementById('pcalc-h').focus();document.getElementById('pcalc-h').select()}}">
       <span style="font-size:10.5px;color:var(--text-3)">세로</span>
@@ -17088,6 +17165,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     try {
       const res = await fetch('/api/search?q=' + encodeURIComponent(q));
       const d = await res.json();
+      if (searchInput.value.trim() !== q) return;   // 그사이 지우거나 바꿈 → 늦게 온 결과로 화면을 덮지 않음
       let html = '';
       if (d.products.length) {
         html += '<div class="section-title">🏷️ 제품 <span class="count">' + d.products.length + '개</span></div>';
@@ -17116,6 +17194,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       }
       area.innerHTML = html;
     } catch (e) {
+      if (searchInput.value.trim() !== q) return;
       area.innerHTML = '<div class="search-empty" style="color:#ef4444">오류: ' + e.message + '</div>';
     }
   }
@@ -17364,10 +17443,19 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       (x.vendor||'').toLowerCase().includes(_poCalQ) ||
       (x.destination||'').toLowerCase().includes(_poCalQ));
   }
+  let _poCalPre = null;   // 검색 시작 전에 보던 달·선택 날짜 — 검색창을 비우면 그대로 복귀 (2026-11-04)
   function onPoCalSearch() {
-    _poCalQ = (document.getElementById('pocal-search').value || '').toLowerCase().trim();
-    const matches = _poCalScheduled();
+    const q = (document.getElementById('pocal-search').value || '').toLowerCase().trim();
+    if (q && !_poCalQ && !_poCalPre) _poCalPre = { ym: _poCalYm, sel: _poCalSel };
+    _poCalQ = q;
     const hit = document.getElementById('pocal-search-hit');
+    if (!q) {
+      if (_poCalPre) { _poCalYm = _poCalPre.ym; _poCalSel = _poCalPre.sel; _poCalPre = null; }
+      hit.textContent = '';
+      renderPoCal(); poCalRenderDetail();
+      return;
+    }
+    const matches = _poCalScheduled();
     hit.textContent = _poCalQ ? matches.length + '건' : '';
     // 현재 월에 매칭 결과가 없으면 가장 가까운 매칭 월로 이동
     if (_poCalQ && matches.length) {
@@ -17383,7 +17471,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   }
   function openPoCalModal() {
     document.getElementById('po-cal-modal').classList.add('show');
-    _poCalQ = '';
+    _poCalQ = ''; _poCalPre = null;
     const si = document.getElementById('pocal-search'); if (si) si.value = '';
     document.getElementById('pocal-search-hit').textContent = '';
     const sched = _poCalScheduled();
@@ -17542,8 +17630,17 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       (x.vendor||'').toLowerCase().includes(_osCalQ) ||
       (x.destination||'').toLowerCase().includes(_osCalQ));
   }
+  let _osCalPre = null;   // 검색 시작 전에 보던 달·선택 날짜 — 검색창을 비우면 그대로 복귀 (2026-11-04)
   function onOsCalSearch() {
-    _osCalQ = (document.getElementById('oscal-search').value || '').toLowerCase().trim();
+    const q = (document.getElementById('oscal-search').value || '').toLowerCase().trim();
+    if (q && !_osCalQ && !_osCalPre) _osCalPre = { ym: _osCalYm, sel: _osCalSel };
+    _osCalQ = q;
+    if (!q) {
+      if (_osCalPre) { _osCalYm = _osCalPre.ym; _osCalSel = _osCalPre.sel; _osCalPre = null; }
+      document.getElementById('oscal-search-hit').textContent = '';
+      renderOsCal(); osCalRenderDetail();
+      return;
+    }
     const matches = _osCalScheduled();
     document.getElementById('oscal-search-hit').textContent = _osCalQ ? matches.length + '건' : '';
     if (_osCalQ && matches.length) {
@@ -17559,7 +17656,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   }
   function openOsCalModal() {
     document.getElementById('os-cal-modal').classList.add('show');
-    _osCalQ = '';
+    _osCalQ = ''; _osCalPre = null;
     const si = document.getElementById('oscal-search'); if (si) si.value = '';
     document.getElementById('oscal-search-hit').textContent = '';
     const sched = _osCalScheduled();
@@ -19366,9 +19463,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     clearTimeout(_ckTimer);
     const q = e.target.value.trim();
     _ckTimer = setTimeout(async () => {
-      if (!q) { _ckRows = []; ckRender(); return; }
+      if (!q) { _ckRows = []; document.getElementById('ck-list').innerHTML = ''; return; }   // 처음 열었을 때처럼 빈 목록
       try {
         const d = await (await fetch('/api/search?q=' + encodeURIComponent(q))).json();
+        if (document.getElementById('ck-input').value.trim() !== q) return;   // 지운 뒤 늦게 온 결과는 버림
         const P = (d.products || []).map(p => ({ code: p.code, name: p.name, type: { G: '자사제품', H: '유상사급', I: '상품매입' }[p.group] || '완제품' }));
         const I = (d.items || []).map(p => ({ code: p.code, name: p.name, type: '자재' }));
         _ckRows = P.concat(I).slice(0, 30); _ckSel = 0; ckRender();
@@ -19598,6 +19696,18 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   let _pcalcSizeRaw = '';  // 체크박스 연동 시 원본 사이즈 문자열 (롤파우치 감지용)
   let _pcalcMatRaw  = '';  // 체크박스 연동 시 원본 재질 문자열 (박스 토크나이저용)
   let _pcalcActualPrice = 0;  // 체크박스로 연동한 품목의 실제 단가 (원래 사이즈일 때 표시)
+  let _pcalcActualSrc = '', _pcalcActualBoard = 0;   // 실제 단가 출처 — '발주 YYYY-MM-DD'(아마란스 최신 발주) | '규격표', 규격표 단가 (2026-11-04)
+  // 단가 출처 꼬리표: 발주 → '발주 26.10.12', 규격표 → '규격표'. 규격표 단가와 다르면 글자색으로 표시 + 툴팁
+  // 출처: '발주 YYYY-MM-DD'(아마란스 최신 발주) | '확인 YYYY-MM-DD'(구매팀 단가 확인, 발주 이력 없는 품목) | '규격표'
+  function _pcalcSrcTag(src, price, board) {
+    if (!src) return '';
+    const kind = src.indexOf('발주') === 0 ? 'po' : (src.indexOf('확인') === 0 ? 'chk' : '');
+    const label = kind ? src.slice(0, 2) + ' ' + src.slice(5).replace(/-/g, '.') : '규격표';
+    const diff = kind && board > 0 && Math.abs(price - board) / board >= 0.02;
+    const tip = (kind === 'po' ? '아마란스 최근 ' + src + ' 단가' : kind === 'chk' ? '구매팀이 ' + src.slice(3) + '에 확인한 단가 (발주 이력 없음)' : 'Monday 부자재 규격 보드 단가 (발주 이력 없음)')
+      + (kind ? (board > 0 ? ' · 규격표 ' + fmtInt(board) + '원' : ' · 규격표 단가 없음') : '');
+    return '<span class="pcalc-src' + (kind ? ' ' + kind : '') + (diff ? ' diff' : '') + '" title="' + escapeHtml(tip) + '">' + escapeHtml(label) + (diff ? ' · 규격표 ' + fmtInt(board) : '') + '</span>';
+  }
 
   async function loadPriceCalc() {
     try {
@@ -19630,7 +19740,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
 
   function resetPriceCalc() {
     _pcalcSelected.clear();
-    _pcalcActualPrice = 0;
+    _pcalcActualPrice = 0; _pcalcActualSrc = ''; _pcalcActualBoard = 0;
     _pcalcBase = null;
     const cb = document.getElementById('pcalc-compare-bar');
     if (cb) cb.style.display = 'none';
@@ -19652,6 +19762,24 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     el.textContent = _pcalcCat === '파우치' ? '밑지'
                    : (_pcalcCat === '단상자' || _pcalcCat === '박스') ? '높이'
                    : '밑지/높이';
+  }
+
+  // 연동 품목 비교 끝 (2026-11-04, 사용자 "검색내용이 지워지면 위 차이내역이 안 나타나야") —
+  // 기준값·'실제' 단가·기준→변경 차이 막대를 비우고 규격표 연동 체크도 해제
+  // unlinkSpec: 규격표 연동 체크까지 해제 (검색창을 비울 때만 — 패널 첫 로딩 중 초기 계산이 막 체크한 연동을 풀지 않게)
+  function _pcalcDropLink(unlinkSpec) {
+    _pcalcBase = null; _pcalcActualPrice = 0; _pcalcActualSrc = ''; _pcalcActualBoard = 0;
+    const bar = document.getElementById('pcalc-compare-bar');
+    if (bar) { bar.style.display = 'none'; bar.innerHTML = ''; }
+    if (unlinkSpec) document.querySelectorAll('.spec-calc-cb:checked').forEach(c => {
+      c.checked = false;
+      const row = c.closest('.spec-row'); if (row) row.classList.remove('sc-linked');
+    });
+  }
+  function pcalcSearchInput() {
+    const empty = !(document.getElementById('pcalc-search').value || '').trim();
+    if (empty && (_pcalcBase || _pcalcActualPrice)) { _pcalcDropLink(true); updatePriceCalc(); }
+    renderPriceCalcList();
   }
 
   function renderPriceCalcList() {
@@ -19704,10 +19832,13 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     }).join('');
   }
 
+  let _pcalcSeq = 0;   // 늦게 온 이전 계산 응답이 최신 화면을 덮어쓰지 않게 (재질을 빠르게 빼고 넣을 때)
   async function updatePriceCalc() {
+    const seq = ++_pcalcSeq;
     const estEl = document.getElementById('pcalc-est-inline');
     const simEl = document.getElementById('pcalc-similar');
     if (_pcalcSelected.size === 0) {
+      _pcalcDropLink(false);   // 재질을 다 빼면 비교할 기준도 없음 → 차이 막대 숨김
       estEl.innerHTML = '0<span style="font-size:10.5px;font-weight:600;margin-left:2px;color:#0369a1">원</span>';
       simEl.innerHTML = '<div class="pcalc-sim-empty">재질 선택 시 유사 제품 표시</div>';
       return;
@@ -19724,6 +19855,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         body: JSON.stringify({ materials: selected, category: _pcalcCat || '', width: wInput, height: hInput, depth: dInput, size_raw: _pcalcSizeRaw || '', material_raw: _pcalcMatRaw || '' })
       });
       const d = await res.json();
+      if (seq !== _pcalcSeq) return;   // 그사이 재질·사이즈가 또 바뀜 → 이 응답은 버림
       // 롤파우치 — 예측 불가 안내
       if (d.method === 'roll_film') {
         estEl.innerHTML = '<span style="font-size:11px;color:#dc2626;font-weight:600">⚠ 롤파우치 — 단위면적 단가 예측 불가</span>';
@@ -19743,6 +19875,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
           '<span style="font-size:10px;font-weight:800;background:#dcfce7;color:#15803d;padding:2px 6px;border-radius:6px;vertical-align:middle">실제</span>'
           + '<span style="color:#059669;font-size:16px;font-weight:800;margin-left:5px;vertical-align:middle">' + fmtInt(_pcalcActualPrice)
           + '<span style="font-size:10px;font-weight:700;margin-left:1px">원</span></span>'
+          + (_pcalcActualSrc ? '<span style="margin-left:6px;vertical-align:middle">' + _pcalcSrcTag(_pcalcActualSrc, _pcalcActualPrice, _pcalcActualBoard) + '</span>' : '')
           + '<span style="font-size:10px;font-weight:600;color:#9aa5b1;margin-left:7px;vertical-align:middle">예상 ' + fmtInt(Math.round(d.estimate || 0)) + '원</span>';
       }
 
@@ -19849,13 +19982,14 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
              + '<span class="pcalc-sim-code">' + escapeHtml(s.code || '-') + ' · ' + s.overlap + '/' + s.total + '재질</span>'
              + '<span class="pcalc-sim-price">' + fmtInt(s.price) + '원</span>'
              + '</div>'
+             + (s.price_src ? '<div class="pcalc-sim-src">' + _pcalcSrcTag(s.price_src, s.price, s.board_price) + '</div>' : '')
              + '<div class="pcalc-sim-name">' + escapeHtml(s.name) + '</div>'
              + metaHtml
              + '<div class="pcalc-sim-mats" id="pcalc-mats-' + i + '" style="display:' + (isOpen ? 'flex' : 'none') + '">' + mats + '</div>'
              + '</div>';
       }).join('');
     } catch (e) {
-      simEl.innerHTML = '<div class="pcalc-sim-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>';
+      if (seq === _pcalcSeq) simEl.innerHTML = '<div class="pcalc-sim-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>';
     }
   }
 
@@ -20452,10 +20586,11 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     clearTimeout(_rcTimer);
     const q = document.getElementById('rc-q').value.trim();
     const box = document.getElementById('rc-sug');
-    if (!q) { box.style.display = 'none'; return; }
+    if (!q) { box.style.display = 'none'; rcReset(); return; }   // 검색어를 지우면 아래 결과도 비움
     _rcTimer = setTimeout(async () => {
       try {
         const d = await (await fetch('/api/search?q=' + encodeURIComponent(q))).json();
+        if (document.getElementById('rc-q').value.trim() !== q) return;   // 지운 뒤 늦게 온 결과는 버림
         const all = d.products || [];   // 서버가 G/H/I 우선 정렬
         _rcRows = (_rcGroup === 'all' ? all : all.filter(p => _rcGroup === 'HI' ? (p.group === 'H' || p.group === 'I') : p.group === _rcGroup)).slice(0, 40); _rcSel = 0;
         if (!_rcRows.length) { box.style.display = 'none'; return; }
@@ -20497,11 +20632,20 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     else rcRun();
   }
   let _rcSeq = 0;
+  // 검색어 삭제 (2026-11-04): 요약 카드·표·머리 품번·안내를 모두 비우고, 진행 중이던 계산 응답은 버림
+  function rcReset() {
+    _rcSeq++; _rcData = null; _rcOff = new Set();
+    ['rc-summary', 'rc-table'].forEach(id => { const el = document.getElementById(id); el.style.display = 'none'; el.innerHTML = ''; });
+    document.getElementById('rc-count').textContent = '';
+    document.getElementById('rc-msg').textContent = '';
+    document.getElementById('rc-copy').disabled = true;
+  }
   async function rcRun() {
     const raw = document.getElementById('rc-q').value.trim();
     const code = _rcCode();
     const msg = document.getElementById('rc-msg');
-    if (!/^[A-Z][0-9]{3,}/.test(code)) { msg.textContent = raw ? '품번을 선택해 주세요' : ''; return; }
+    if (!raw) { rcReset(); return; }
+    if (!/^[A-Z][0-9]{3,}/.test(code)) { msg.textContent = '품번을 선택해 주세요'; return; }
     msg.textContent = '계산 중...';
     const seq = ++_rcSeq;
     try {
@@ -21399,10 +21543,41 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   }
 
   // ── 검색/자동 채움 ──
+  // 검색창을 비우면 그 칸으로 채웠던 값을 처음 화면 기본값으로 (2026-11-04 사용자 "모든 패널 검색창: 입력값 없으면 원래 보여지는대로").
+  // 기본값 = HTML에 적힌 값(input.defaultValue / option.defaultSelected). 검색으로 고른 적 없으면(직접 입력만) 건드리지 않음.
+  const _IPSU_FIELDS = {
+    a: ['ipsu-a-form', 'ipsu-aw', 'ipsu-ah', 'ipsu-abase', 'ipsu-at', 'ipsu-n1'],
+    b: ['ipsu-b-form', 'ipsu-bw', 'ipsu-bh', 'ipsu-bbase', 'ipsu-bt', 'ipsu-bbw', 'ipsu-bbd', 'ipsu-bbh', 'ipsu-n1'],
+    o: ['ipsu-cw', 'ipsu-cd', 'ipsu-ch'],
+    c: ['ipsu-mode', 'ipsu-n1', 'ipsu-n2'],
+  };
+  const _ipsuPicked = { p: false, a: false, b: false, o: false, c: false };
+  function _ipsuDefault(id) {
+    const el = document.getElementById(id); if (!el) return;
+    if (el.tagName === 'SELECT') { const o = [...el.options].find(x => x.defaultSelected) || el.options[0]; if (o) el.value = o.value; }
+    else el.value = el.defaultValue;
+  }
+  function ipsuResetPick(who) {
+    const blocks = who === 'p' ? ['a', 'b', 'o', 'c'] : [who];
+    blocks.forEach(b => {
+      (_IPSU_FIELDS[b] || []).forEach(_ipsuDefault);
+      if (who === 'p') { const q = document.getElementById('ipsu-' + b + '-q'); if (q) q.value = ''; }
+      const sel = document.getElementById('ipsu-' + b + '-sel'); if (sel) sel.innerHTML = b === 'o' ? '' : '-';
+      _ipsuPicked[b] = false;
+    });
+    if (who === 'p') { document.getElementById('ipsu-p-sel').innerHTML = '-'; _ipsuPicked.p = false; }
+    if (who === 'p' || who === 'c') _ipsuSelP = null;
+    if (blocks.includes('a')) _ipsuSelA = null;
+    if (blocks.includes('b')) _ipsuSelB = null;
+    if (blocks.includes('a')) ipsuOnForm('a');
+    if (blocks.includes('b')) ipsuOnForm('b');
+    if (blocks.includes('c')) ipsuOnMode();
+    if (blocks.includes('o')) ipsuSyncOuter();
+  }
   function ipsuSuggest(who) {
     const q = document.getElementById('ipsu-' + who + '-q').value.trim().toLowerCase();
     const box = document.getElementById('ipsu-' + who + '-sug');
-    if (!q) { box.style.display = 'none'; return; }
+    if (!q) { box.style.display = 'none'; if (_ipsuPicked[who]) ipsuResetPick(who); return; }
     let list, html;
     if (who === 'p') {
       list = _ipsuProducts.filter(p => (p.code + ' ' + p.name).toLowerCase().includes(q)).slice(0, 30);
@@ -21475,6 +21650,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     document.getElementById('ipsu-' + who + '-sel').innerHTML =
       `<b>${escapeHtml(s.code)}</b> ${escapeHtml(s.size)}${s.tier ? ' · ' + s.tier : ''}${s.ipsu ? ' · ' + s.ipsu + '입' : ''}`;
     document.getElementById('ipsu-' + who + '-q').value = s.code + ' ' + s.name.slice(0, 20);
+    _ipsuPicked[who] = true;
     ipsuOnForm(who);
   }
   // ③ 외박스 — 규격표의 3차원 외치수를 그대로 적용 (⑤ 팔레트까지 동기화)
@@ -21487,6 +21663,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     document.getElementById('ipsu-o-q').value = s.code + ' ' + s.name.slice(0, 16);
     document.getElementById('ipsu-o-sel').innerHTML =
       `<b>${escapeHtml(s.code)}</b> ${escapeHtml(s.size)}`;
+    _ipsuPicked.o = true;
     ipsuSyncOuter();
   }
   // ⓪ 완제품 — BOM 전개 결과로 ①②③ 일괄 적용
@@ -21538,6 +21715,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       document.getElementById('ipsu-n1').value =
         p.bomN1 || (p.a && p.a.ipsu) || '';
     document.getElementById('ipsu-p-q').value = p.code + ' ' + p.name.slice(0, 22);
+    _ipsuPicked.p = true;
     // ②는 위에서 '없음'으로 명시 처리했으므로 누락 경고에서 제외
     const miss = [!p.a && '①', !p.c && '③'].filter(Boolean);
     document.getElementById('ipsu-p-sel').innerHTML =
@@ -21551,6 +21729,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     document.getElementById('ipsu-n2').value = b.ipsu;
     if (ipsuIsGrid()) { document.getElementById('ipsu-mode').value = 'count'; ipsuOnMode(); }
     document.getElementById('ipsu-c-q').value = b.code + ' (박스입수 ' + b.ipsu + ')';
+    _ipsuPicked.c = true;
     ipsuCalc();
   }
 
@@ -22517,7 +22696,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
 
   // ───── 부자재 규격 → 단가 계산기 연동 ─────
   async function specLinkToCalc(cb) {
-    if (cb.checked) await panelOpen('.pcalc-panel');   // 계산기 패널을 아직 안 열었으면 열고 재질 목록부터 받음
+    const want = cb.checked;
+    if (want) await panelOpen('.pcalc-panel');   // 계산기 패널을 아직 안 열었으면 열고 재질 목록부터 받음
+    cb.checked = want;   // 패널 첫 로딩 중 초기화가 체크 상태를 건드려도 사용자가 누른 대로
     // 단일 선택: 다른 체크 해제 + 행 하이라이트
     document.querySelectorAll('.spec-calc-cb').forEach(c => {
       c.checked = (c === cb && cb.checked);
@@ -22534,7 +22715,11 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const cat  = cb.dataset.cat  || '';
     _pcalcSizeRaw = size;  // 롤파우치 감지용 원본 사이즈 저장
     _pcalcMatRaw  = mat;   // 박스 토크나이저용 원본 재질 저장
-    _pcalcActualPrice = +(cb.dataset.price || 0) || 0;  // 알고있는 품목의 실제 단가
+    // 알고있는 품목의 실제 단가 = 아마란스 최신 발주단가 › 규격표 단가 (계산기 학습 단가와 같은 기준, 2026-11-04)
+    _pcalcActualBoard = +(cb.dataset.price || 0) || 0;
+    const _poP = +(cb.dataset.poPrice || 0) || 0, _chkP = +(cb.dataset.chkPrice || 0) || 0;
+    _pcalcActualPrice = _poP || _chkP || _pcalcActualBoard;
+    _pcalcActualSrc = _poP ? '발주 ' + (cb.dataset.poDate || '') : (_chkP ? '확인 ' + (cb.dataset.chkDate || '') : (_pcalcActualBoard ? '규격표' : ''));
 
     // 사이즈 파싱: "150*200+밑지70", "W70*H175", "70*175" 등
     let w = 0, h = 0, d = 0;
@@ -22657,6 +22842,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         + ' data-mat="' + escapeHtml(it.material||'') + '"'
         + ' data-cat="' + escapeHtml(it.category||'') + '"'
         + ' data-price="' + (it.price || 0) + '"'
+        + ' data-po-price="' + (it.po_price || 0) + '" data-po-date="' + escapeHtml(it.po_date || '') + '"'
+        + ' data-chk-price="' + (it.chk_price || 0) + '" data-chk-date="' + escapeHtml(it.chk_date || '') + '"'
         + ' data-tokens="' + escapeHtml(JSON.stringify(it.tokens||[])) + '"';
       const divVal = it.div || '';
       const divCls = divVal === '쿠팡' ? 'sc-div-쿠팡'
@@ -23724,6 +23911,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     try {
       const res = await fetch('/api/suggest?q=' + encodeURIComponent(q));
       const items = await res.json();
+      const ui = document.getElementById('user-input');
+      if (ui && ui.value.trim() !== q) return;   // 지운 뒤 늦게 온 추천은 버림
       if (!items || items.length === 0) {
         suggestPanel.style.display = 'none';
         return;
