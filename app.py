@@ -6712,7 +6712,11 @@ def api_spec_design(item_id):
                               'ready': bool(pm),
                               'nopdf': bool((pm or {}).get('nopdf')),   # 'PDF 호환' 없이 저장된 .ai (안내문뿐)
                               'thumb': bool((pm or {}).get('thumb')),   # 그 1쪽 = 파일 속 작은 썸네일
-                              'conv': bool((pm or {}).get('conv'))})   # Scribus로 변환해 제대로 그림
+                              'conv': bool((pm or {}).get('conv')),   # Scribus로 변환해 제대로 그림
+                              # 변환 여부를 아직 모름(호스트가 GCP 변환 전에 받아 둔 썸네일) → 화면이 check로 GCP 변환본을 받아 오게 (2026-11-03)
+                              'conv_known': bool(pm) and 'conv' in pm,
+                              # 그림 주소 끝에 붙일 판 번호 = 정보 파일 수정 시각 — 다시 그린 시안(잘라내기 등)을 브라우저가 30일 보관한 옛 그림으로 안 보이게
+                              'v': int(os.path.getmtime(_design_preview_paths(aid)[1])) if pm else 0})
             elif f.get('linkToFile'):   # 구글 드라이브 등 링크로 붙인 파일
                 files.append({'name': f.get('name') or '링크', 'ext': '', 'kind': 'link', 'url': f.get('linkToFile')})
     if not files:
@@ -6807,6 +6811,17 @@ def _design_preview_make(item_id, asset_id, low=False, hd=False, force=False):
                     return None
             except Exception as e:
                 print(f'[시안 미리보기] GCP에서 받기 실패 → 직접 만듦: {e!r:.120}')
+        # GCP(메모리 1GB)가 그리다 실패한 시안(500MB짜리 .ai 등 pdftoppm 15분 초과)은 7일 동안 다시 안 함 — 예전엔 6시간마다 15분씩
+        # CPU를 쓰며 실패했고, 호스트 PC는 GCP 응답을 15분 기다린 뒤에야 직접 그렸음. 바로 503을 주면 호스트가 곧장 직접 그림 (2026-11-03)
+        fail_p = os.path.splitext(meta)[0] + '.fail'
+        if not _IS_HOST_PC and os.path.exists(fail_p) and time.time() - os.path.getmtime(fail_p) < 7 * 86400:
+            return '이 서버에서 그리지 못한 큰 시안입니다(7일 뒤 다시 시도)', 503
+
+        def _failed(msg, code):
+            if not _IS_HOST_PC:
+                with open(fail_p, 'w', encoding='utf-8') as fp:
+                    fp.write(str(msg)[:300])
+            return msg, code
         tmp_dir = tempfile.mkdtemp(prefix='dsgsrc_')
         try:
             src, a = _design_fetch_src(item_id, asset_id, tmp_dir)
@@ -6826,7 +6841,7 @@ def _design_preview_make(item_id, asset_id, low=False, hd=False, force=False):
                 res = json.loads(lines[-1]) if lines else {'ok': False, 'error': (pr.stderr or '')[-300:]}
                 n = int(res.get('rendered') or 0)
                 if not res.get('ok') or not n or not os.path.exists(prefix + '.jpg'):
-                    return str(res.get('error') or '미리보기 실패'), 500
+                    return _failed(str(res.get('error') or '미리보기 실패'), 500)
                 for p in range(n, 0, -1):   # 1쪽을 맨 마지막에
                     shutil.move(prefix + '.jpg' if p == 1 else f'{prefix}-p{p}.jpg', _design_preview_paths(asset_id, p, k)[0])
                 if k:
@@ -6840,9 +6855,11 @@ def _design_preview_make(item_id, asset_id, low=False, hd=False, force=False):
                 if 'conv' in res:   # 안내문뿐인 .ai를 Scribus로 변환해 그렸는지 (False면 썸네일)
                     m['conv'] = bool(res['conv'])
             json.dump(m, open(meta, 'w', encoding='utf-8'), ensure_ascii=False)
+            if os.path.exists(fail_p):
+                os.remove(fail_p)
             return None
         except _sp.TimeoutExpired:
-            return '미리보기 만들기 시간 초과', 504
+            return _failed('미리보기 만들기 시간 초과', 504)
         except Exception as e:
             return f'미리보기 실패: {e}'[:200], 500
         finally:
@@ -6980,6 +6997,9 @@ def _design_warm_loop():
             for item_id, asset_id in todo:
                 m = _design_preview_meta(asset_id) or {}
                 if not item_id.isdigit() or (m.get('hd') and not _design_need_chk(m)):
+                    continue
+                fp = os.path.splitext(_design_preview_paths(asset_id)[1])[0] + '.fail'   # 최근 7일 안에 못 그린 큰 시안은 조용히 건너뜀
+                if os.path.exists(fp) and time.time() - os.path.getmtime(fp) < 7 * 86400:
                     continue
                 # 다 만든 것은 안내문 여부·썸네일만 채움(2026-10-30 이전에 만든 것), 아니면 만들기(만들면서 함께 확인)
                 err = None
@@ -12305,6 +12325,42 @@ def _extract_po_stock(upd_text):
     return None
 
 
+def _erp_orders(code, kind='po', days=183):
+    """품번의 아마란스 발주 행(최근 days일, 최신순). kind=po: 구매발주(발주정보 — 부자재·원료 공급사) /
+    kind=os: 외주발주(외주발주정보 — 외주처) + 구매발주(상품 I코드는 외주처에서 완제품을 사 와서 구매발주로 잡힘)."""
+    from datetime import datetime as _dtm, timedelta as _tdl
+    code = (code or '').strip().upper()
+    srcs = ([(WP_ORDER_DF, '외주발주', '외주발주번호', 'unitDc')] if kind == 'os' else []) + [(ORDER_DF, '구매발주', '발주번호', '단위')]
+    cut = (_dtm.now() - _tdl(days=days)).strftime('%Y%m%d')
+    ymd = lambda s: (lambda d: f'{d[:4]}-{d[4:6]}-{d[6:8]}' if len(d) == 8 else '')(str(s or '').replace('-', '')[:8])
+    rows = []
+    for df, src, no_col, unit_col in srcs:
+        if not code or df is None or df.empty:
+            continue
+        for _, r in df[df['품번'].astype(str).str.strip().str.upper() == code].iterrows():
+            d = str(r.get('발주일자', '') or '').replace('-', '')[:8]
+            if len(d) != 8 or d < cut:
+                continue
+            q, rq = _num(r.get('발주수량', 0)), _num(r.get('입고수량', 0))
+            closed = str(r.get('expireYn', '')).strip() == '0'   # 마감 처리(발주 대비 입고량 조정 등) — 남은 수량은 더 안 들어옴
+            rows.append({'date': ymd(d), 'no': str(r.get(no_col, '') or ''), 'src': src, 'vendor': str(r.get('거래처명', '') or '').strip(),
+                         'qty': q, 'rcv': rq, 'left': 0 if closed else max(0.0, q - rq), 'due': ymd(r.get('납기일자', '')),
+                         'unit': str(r.get(unit_col, '') or ''), 'price': _num(r.get('단가', 0)),
+                         'closed': closed, 'closed_why': str(r.get('expireDc', '') or '').strip() if closed else '',
+                         'note': str(r.get('비고', '') or '').strip()[:60]})
+    rows.sort(key=lambda x: (x['date'], x['no']), reverse=True)
+    return rows
+
+
+@app.route('/api/po_erp', methods=['GET'])
+@cached_api()
+def api_po_erp():
+    """품번의 아마란스 발주 내역(최근 6개월, 최신순) — 입고 캘린더·예상입고일 상세 창에 '어느 업체로 언제 얼마나 발주했는지' (2026-11-04)."""
+    kind = request.args.get('kind', 'po')
+    rows = _erp_orders(request.args.get('code'), kind)
+    return jsonify({'items': rows[:15], 'total': len(rows), 'kind': kind})
+
+
 @app.route('/api/po_pending', methods=['GET'])
 @cached_api()
 def api_po_pending():
@@ -12334,8 +12390,11 @@ def api_po_pending():
         # 클릭 상세용 Monday 항목 내역 (2026-10-23: 예전엔 발주완료 전체 목록 창이 열려 해당 건을 찾기 불편)
         _sv = lambda c: '' if str(r.get(c, '') or '').strip().lower() in ('', 'nan') else str(r.get(c, '')).strip()
         _n = lambda c: (f'{int(float(_sv(c))):,}' if re.fullmatch(r'\d+(\.0+)?', _sv(c)) else _sv(c))   # 80000 → 80,000
+        # 먼데이 '발주업체'가 비어 있는 건이 많아 아마란스 최근 발주의 거래처를 함께 (2026-11-04, 캘린더에 발주 업체 표시)
+        _erp = _erp_orders(_sv('아이템명') or _sv('품번'), 'po')
+        maker = _erp[0]['vendor'] if _erp else ''
         po_detail = [{'label': k, 'value': v} for k, v in (
-            ('품번', _sv('아이템명') or _sv('품번')), ('품명', _sv('품명')), ('발주업체', _sv('발주업체')), ('입고처', _sv('입고처')),
+            ('품번', _sv('아이템명') or _sv('품번')), ('품명', _sv('품명')), ('발주업체', _sv('발주업체') or (maker + ' (아마란스 최근 발주)' if maker else '')), ('입고처', _sv('입고처')),
             ('발주 요청일', _sv('발주 요청일')), ('요청수량', _n('요청수량')), ('실발주 수량', _n('실발주 수량')),
             ('잔량', (f"{remain['qty']:,}{remain.get('unit', '')}" if remain and remain.get('qty') else '')),
             ('입고 예정', eta_display or '미정'), ('진행 그룹', _sv('그룹'))) if v]
@@ -12348,6 +12407,7 @@ def api_po_pending():
             'stock': _extract_po_stock(upd),  # 말풍선의 재고(보유) 언급 — 잔량과 별개
             'request_date': str(r.get('발주 요청일', '')).strip(),
             'vendor': str(r.get('발주업체', '')).strip(),
+            'maker': maker,   # 아마란스 최근 발주 거래처 — 먼데이 발주업체가 비었을 때 캘린더 줄에 씀
             'destination': str(r.get('입고처', '')).strip(),
             'schedule_entries': entries,
             'updates': _extract_po_updates(upd),  # 전체 말풍선 (작성자 무관)
@@ -12563,7 +12623,20 @@ def api_outsource_pending():
         # 고객사 (신양식) — 없으면 업체명 fallback
         customer = str(r.get('고객사', '') or '').strip()
         vendor = str(r.get('업체명', '') or '').strip()
+        _sv = lambda c: '' if str(r.get(c, '') or '').strip().lower() in ('', 'nan') else str(r.get(c, '')).strip()
+        # 클릭 상세용 Monday 항목 내역 (2026-11-04: 입고 캘린더 항목을 눌러도 아무 반응이 없어 외주처를 알 수 없었음)
+        # 먼데이 '업체명'은 외주처가 아니라 고객사(이마트·쿠팡 등) → 실제 외주처 = 아마란스 최근 외주발주(상품은 구매발주)의 거래처
+        _erp = _erp_orders(_sv('아이템명'), 'os')
+        maker = _erp[0]['vendor'] if _erp else ''
+        mon_detail = [{'label': k, 'value': v} for k, v in (
+            ('품번', _sv('아이템명')), ('품명', _sv('품명')), ('외주처', maker + (' (아마란스 최근 발주)' if maker else '')),
+            ('업체명', vendor), ('고객사', customer if customer != vendor else ''),
+            ('요청 입고지', _sv('요청 입고지')), ('외주 요청일', _sv('외주 요청일')), ('요청 입고일', _sv('요청 입고일')),
+            ('요청수량', _sv('요청수량')), ('입고 예정', eta_display or ('보류' if is_hold else '미정')),
+            ('발주 상태', order_status), ('진행 그룹', group)) if v]
         items.append({
+            'mon_detail': mon_detail,
+            'maker': maker,
             'code': str(r.get('아이템명', '')).strip(),
             'item_id': str(r.get('아이템ID', '')).strip(),
             'name': str(r.get('품명', '')).strip(),
@@ -13609,11 +13682,13 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   /* ───── Chart Panels ───── */
   /* 화면 폭 (2026-09-28): 섹션 최대폭 1440px 고정을 없애고 모니터 가로에 맞춰 늘고 줄게. 좌우 여백 --pg는
      오른쪽 섹션 내비(1101px↑에서 보임)를 가리지 않는 폭. KPI 띠·모든 섹션·하단 wrap이 같은 여백을 써서 가장자리가 한 줄로 맞음 */
-  :root { --pg: 24px; }
-  @media (min-width: 1101px) { :root { --pg: 32px; } }
-  @media (min-width: 1600px) { :root { --pg: 64px; } }
+  /* --pg-r = 오른쪽 여백. 섹션 내비가 보이는 폭(1101px↑)에선 내비 자리(약 50px)를 따로 비워 둠 —
+     예전엔 1101~1599px에서 오른쪽 여백(32px)이 내비보다 좁아 패널 오른쪽 끝(날짜 칸 등)을 덮었음 (2026-11-04 사용자 "위치 애매, 휠 내릴 때 방해") */
+  :root { --pg: 24px; --pg-r: 24px; }
+  @media (min-width: 1101px) { :root { --pg: 32px; --pg-r: 68px; } }
+  @media (min-width: 1600px) { :root { --pg: 64px; --pg-r: 68px; } }
   .chart-grid {
-    max-width: none; margin: 14px auto 0; padding: 0 var(--pg);
+    max-width: none; margin: 14px auto 0; padding: 0 var(--pg-r) 0 var(--pg);
     display: grid; grid-template-columns: repeat(30, 1fr); gap: 12px;
   }
   .chart-panel.po-inline     { grid-column: span 15; border-top: 3px solid #059669; }
@@ -13643,7 +13718,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .vk-tag.both { background:linear-gradient(90deg,#ede9fe,#ffedd5); color:#7c3aed; }
 
   /* ── KPI 요약 띠 ── */
-  .kpi-strip { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:12px; margin:16px var(--pg) 4px; }
+  .kpi-strip { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:12px; margin:16px var(--pg-r) 4px var(--pg); }
   .kpi-tile { position:relative; display:flex; align-items:center; gap:10px; min-width:0; cursor:pointer;
     background:#fff; border:1px solid #e6e9f0; border-radius:14px; padding:13px 14px 12px 14px; overflow:hidden;
     box-shadow:0 1px 2px rgba(15,23,42,.04); transition:transform .14s, box-shadow .14s; }
@@ -13664,15 +13739,16 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     .kpi-tile { padding:10px 11px; gap:9px; } .kpi-tile .kpi-ic { flex-basis:32px; width:32px; height:32px; font-size:15px; border-radius:9px; } .kpi-tile .kpi-v { font-size:20px; } }
 
   /* ── 섹션 점프 내비 ── */
-  .sec-nav { position:fixed; right:10px; top:50%; transform:translateY(-50%); z-index:60; display:flex; flex-direction:column; gap:3px;
+  /* 오른쪽 여백(--pg-r) 안에만 들어가게: 폭 46px 이하·오른쪽 끝에서 10px — 패널(오른쪽 끝 68px 안쪽)과 겹치지 않음 */
+  .sec-nav { position:fixed; right:10px; top:50%; transform:translateY(-50%); z-index:60; display:flex; flex-direction:column; gap:3px; width:46px; box-sizing:border-box;
     background:rgba(255,255,255,.92); border:1px solid #e2e8f0; border-radius:12px; padding:6px 4px; box-shadow:0 6px 18px rgba(15,23,42,.10); backdrop-filter:blur(4px); }
-  .sec-nav a { display:block; font-size:10.5px; font-weight:700; color:#64748b; text-decoration:none; padding:4px 7px; border-radius:7px; text-align:center; line-height:1.2; }
+  .sec-nav a { display:block; font-size:10.5px; font-weight:700; color:#64748b; text-decoration:none; padding:4px 2px; border-radius:7px; text-align:center; line-height:1.2; white-space:nowrap; }
   .sec-nav a:hover { background:#f1f5f9; color:#0f172a; }
   .sec-nav a.on { background:#4f46e5; color:#fff; }
   @media (max-width:1100px) { .sec-nav { display:none; } }
 
   /* ── 회송 원가 역산 ── */
-  .return-strip { max-width: none; margin: 12px auto 0; padding: 0 var(--pg); }
+  .return-strip { max-width: none; margin: 12px auto 0; padding: 0 var(--pg-r) 0 var(--pg); }
   .chart-panel.return-panel { border-top: 3px solid #db2777; }
   .rc-form { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:10px; }
   .rc-field { display:flex; align-items:center; gap:6px; }
@@ -13732,9 +13808,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .ck-row:hover, .ck-row.sel { background:var(--surface-2,#f8fafc) }
   .ck-row .cd { font-weight:800; color:#4f46e5; min-width:64px } .ck-row .tp { font-size:10.5px; color:var(--text-3); margin-left:auto; white-space:nowrap }
   .ck-hint { padding:8px 18px; font-size:11px; color:var(--text-3) }
-  .spec-strip { max-width: none; margin: 12px auto 0; padding: 0 var(--pg); }
+  .spec-strip { max-width: none; margin: 12px auto 0; padding: 0 var(--pg-r) 0 var(--pg); }
   /* ───── 입수 테스트 (3D) ───── */
-  .ipsu-strip { max-width: none; margin: 12px auto 0; padding: 0 var(--pg); }
+  .ipsu-strip { max-width: none; margin: 12px auto 0; padding: 0 var(--pg-r) 0 var(--pg); }
   .chart-panel.ipsu-panel { border-top: 3px solid #7c3aed; }
   .ipsu-block { border: 1px solid var(--border); border-radius: 9px; padding: 8px 10px; margin-bottom: 8px; }
   .ipsu-block .ib-t { font-size: 11px; font-weight: 700; color: #7c3aed; margin-bottom: 6px; }
@@ -13789,7 +13865,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   @media (max-width: 900px) { .ipsu-stages { grid-template-columns: 1fr; } }
   /* ───── 매출 현황 + NPD ───── */
   .sales-npd-strip {
-    max-width: none; margin: 12px auto 0; padding: 0 var(--pg);
+    max-width: none; margin: 12px auto 0; padding: 0 var(--pg-r) 0 var(--pg);
     display: grid; grid-template-columns: 1.55fr 1fr; gap: 12px;
   }
   .chart-panel.sales-panel { border-top: 3px solid #0ea5e9; }
@@ -13798,10 +13874,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
                             border-radius: 12px; padding: 12px 16px 10px; }
   .prod-chart-wrap { height: 240px; position: relative; }
   /* ───── 월 판매기반 자료 패널 ───── */
-  .salesbase-strip { max-width: none; margin: 12px auto 0; padding: 0 var(--pg); }
+  .salesbase-strip { max-width: none; margin: 12px auto 0; padding: 0 var(--pg-r) 0 var(--pg); }
   .retired { display: none !important; }   /* 제거한 영역 (JS가 style.display를 바꿔도 숨김 유지) */
   /* ───── 판매 분석 (2026-09-23) ───── */
-  .lens-strip { max-width: none; margin: 12px auto 0; padding: 0 var(--pg); display: grid; grid-template-columns: 1.15fr 1.15fr 0.8fr; gap: 12px; }
+  .lens-strip { max-width: none; margin: 12px auto 0; padding: 0 var(--pg-r) 0 var(--pg); display: grid; grid-template-columns: 1.15fr 1.15fr 0.8fr; gap: 12px; }
   .chart-panel.lens-gap { border-top: 3px solid #0d9488; }
   .chart-panel.lens-price { border-top: 3px solid #9333ea; }
   .chart-panel.lens-wd { border-top: 3px solid #64748b; }
@@ -14054,8 +14130,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .dsg-nav:hover { background: rgba(15,23,42,0.75); }
   .dsg-note {
     position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%);
-    background: rgba(15,23,42,0.7); color: #fff; font-size: 11.5px; font-weight: 600;
-    padding: 5px 12px; border-radius: 999px; white-space: nowrap;
+    background: rgba(15,23,42,0.78); color: #fff; font-size: 12px; font-weight: 600; line-height: 1.55; text-align: center;
+    padding: 7px 16px; border-radius: 12px; max-width: calc(100% - 32px); width: max-content;   /* 두 줄 안내도 들어가게 (2026-11-03) */
   }
   .dsg-nav.prev { left: 12px; } .dsg-nav.next { right: 12px; }
   .dsg-thumbs { display: flex; gap: 8px; padding: 10px 18px 14px; overflow-x: auto; flex: none; }
@@ -14451,7 +14527,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 
   /* ───── Layout ───── */
-  .wrap { max-width: none; margin: 0 auto; padding: 32px var(--pg) 140px; display: grid; grid-template-columns: 1fr; gap: 24px; }
+  .wrap { max-width: none; margin: 0 auto; padding: 32px var(--pg-r) 140px var(--pg); display: grid; grid-template-columns: 1fr; gap: 24px; }
   .main-col { min-width: 0; }
   /* 캘린더 가로 스트립 (검색창 위) */
   .cal-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 20px; }
@@ -14587,6 +14663,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .pocal-drow { display: flex; align-items: center; gap: 10px; padding: 10px 11px; border-radius: 11px; margin-bottom: 2px;
     border: 1px solid transparent; transition: all 0.12s; }
   .pocal-drow:hover { background: #f8fafc; border-color: var(--border); }
+  /* 클릭 = 이 건 상세(발주 업체·아마란스 발주 내역·말풍선) (2026-11-04) */
+  .pocal-drow.clk { cursor: pointer; }
+  .pocal-drow.clk:hover { background: #eef2ff; border-color: #c7d2fe; }
+  .pocal-detail h3 .pocal-hint { font-size: 11px; font-weight: 600; color: var(--text-3); margin-left: 6px; }
   .pocal-drow .tag { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
   .pocal-drow .tag.po, .pocal-drow .tag.os-done { background: #2563eb; } .pocal-drow .tag.raw { background: #059669; }
   .pocal-drow .tag.import_raw, .pocal-drow .tag.os-req { background: #d97706; }
@@ -17387,16 +17467,21 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     _renderMini('pocal-mini', ym);
   }
   const _poTypeLabel = { po:'부자재', raw:'원료', import_raw:'수입' };
+  // 캘린더 한 줄용 짧은 상호 — '농업회사법인유한회사더고은' → '더고은' (상세 창에는 공식 상호 그대로)
+  const _coShort = s => (s || '').replace(/농업회사법인|유한회사|주식회사|영농조합법인|\\(주\\)|\\(유\\)|㈜/g, '').trim() || (s || '');
   function _poCalRowHtml(it) {
     const code = escapeHtml(it.code || '-');
     const name = escapeHtml(it.name || (it.contract || '-'));
     const sub = it.type === 'import_raw' && it.contract ? '<div class="dsub">' + escapeHtml(it.contract) + '</div>' : '';
     const qtyText = (it.type === 'raw' || it.type === 'import_raw') ? (it.qty || '') : (it.qty ? fmtNum(it.qty) : '');
-    const dest = it.destination ? ' · ' + escapeHtml(it.destination) : '';
-    return '<div class="pocal-drow">'
+    // 발주 업체 → 입고처를 한 줄에 (2026-11-04 사용자 "어떤 업체로 발주가 나갔는지 캘린더만 봐서는 모름") · 클릭 = 이 건 상세
+    const vend = it.vendor || it.maker;   // 먼데이 발주업체, 비었으면 아마란스 최근 발주 거래처
+    const dest = (vend ? ' · ' + escapeHtml(_coShort(vend)) + (it.destination ? ' → ' + escapeHtml(it.destination) : '') : (it.destination ? ' · ' + escapeHtml(it.destination) : ''));
+    return '<div class="pocal-drow clk" onclick="showImportDetail(' + _poInlineItems.indexOf(it) + ')" title="클릭 = 발주 업체·아마란스 발주 내역·말풍선">'
          + '<span class="tag ' + it.type + '"></span>'
          + '<span class="dcode">' + code + '</span>'
-         + '<div class="dname">' + name + '<span class="dsub" title="클릭하여 펼치기/접기" onclick="event.stopPropagation();this.classList.toggle(\\'expanded\\')">' + (_poTypeLabel[it.type]||'') + dest + '</span>' + sub + '</div>'
+         // 부제(업체 → 입고처)도 누르면 상세 창 — 예전엔 부제만 펼치기/접기라 '눌러도 안 열림'으로 보였음 (2026-11-04)
+         + '<div class="dname">' + name + '<span class="dsub">' + (_poTypeLabel[it.type]||'') + dest + '</span>' + sub + '</div>'
          + '<span class="dqty">' + escapeHtml(qtyText) + '</span></div>';
   }
   const _DOW = ['일','월','화','수','목','금','토'];
@@ -17412,7 +17497,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     if (_poCalSel) {
       const list = all.filter(it => it.eta_sort.slice(0,10) === _poCalSel);
       const md = (+_poCalSel.slice(5,7)) + '월 ' + (+_poCalSel.slice(8,10)) + '일 (' + _ymdDow(_poCalSel) + ')';
-      detail.innerHTML = '<h3>' + md + ' · 입고 예정 ' + list.length + '건'
+      detail.innerHTML = '<h3>' + md + ' · 입고 예정 ' + list.length + '건 <span class="pocal-hint">항목을 누르면 발주 업체·내역</span>'
         + ' <span class="pocal-clear" onclick="poCalShowAll()">✕ 전체보기</span></h3>'
         + list.map(_poCalRowHtml).join('');
       return;
@@ -17421,7 +17506,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const byDate = {};
     all.forEach(it => { const k = it.eta_sort.slice(0,10); (byDate[k]=byDate[k]||[]).push(it); });
     const keys = Object.keys(byDate).sort();
-    let html = '<h3>전체 입고 일정 · ' + all.length + '건</h3>';
+    let html = '<h3>전체 입고 일정 · ' + all.length + '건 <span class="pocal-hint">항목을 누르면 발주 업체·내역</span></h3>';
     keys.forEach(k => {
       const md = (+k.slice(5,7)) + '월 ' + (+k.slice(8,10)) + '일';
       html += '<div class="pocal-dgroup" onclick="poCalPick(\\'' + k + '\\')">'
@@ -17537,12 +17622,13 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const code = escapeHtml(it.code || '-');
     const name = escapeHtml(it.name || '-');
     const t = _osCalType(it);
-    const dest = it.destination ? ' · ' + escapeHtml(it.destination) : '';
+    // 외주처(아마란스 최근 외주발주 거래처) → 입고지. 먼데이 '업체명'은 고객사라 외주처로 쓰지 않음
+    const dest = (it.maker ? ' · 외주 ' + escapeHtml(_coShort(it.maker)) : (it.vendor ? ' · ' + escapeHtml(it.vendor) : '')) + (it.destination ? ' → ' + escapeHtml(it.destination) : '');
     const grp = escapeHtml(it.group || '');
-    return '<div class="pocal-drow">'
+    return '<div class="pocal-drow clk" onclick="showOsInlineDetail(' + _osInlineItems.indexOf(it) + ')" title="클릭 = 외주처·아마란스 외주발주 내역·말풍선">'
          + '<span class="tag ' + t + '"></span>'
          + '<span class="dcode">' + code + '</span>'
-         + '<div class="dname">' + name + '<span class="dsub" title="클릭하여 펼치기/접기" onclick="event.stopPropagation();this.classList.toggle(\\'expanded\\')">' + grp + dest + '</span></div>'
+         + '<div class="dname">' + name + '<span class="dsub">' + grp + dest + '</span></div>'
          + '<span class="dqty">' + escapeHtml(it.qty || '') + '</span></div>';
   }
   function osCalRenderDetail() {
@@ -17555,7 +17641,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     if (_osCalSel) {
       const list = all.filter(it => it.eta_sort.slice(0,10) === _osCalSel);
       const md = (+_osCalSel.slice(5,7)) + '월 ' + (+_osCalSel.slice(8,10)) + '일 (' + _ymdDow(_osCalSel) + ')';
-      detail.innerHTML = '<h3>' + md + ' · 입고 예정 ' + list.length + '건'
+      detail.innerHTML = '<h3>' + md + ' · 입고 예정 ' + list.length + '건 <span class="pocal-hint">항목을 누르면 발주 업체·내역</span>'
         + ' <span class="pocal-clear" onclick="osCalShowAll()">✕ 전체보기</span></h3>'
         + list.map(_osCalRowHtml).join('');
       return;
@@ -17563,7 +17649,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const byDate = {};
     all.forEach(it => { const k = it.eta_sort.slice(0,10); (byDate[k]=byDate[k]||[]).push(it); });
     const keys = Object.keys(byDate).sort();
-    let html = '<h3>전체 입고 일정 · ' + all.length + '건</h3>';
+    let html = '<h3>전체 입고 일정 · ' + all.length + '건 <span class="pocal-hint">항목을 누르면 발주 업체·내역</span></h3>';
     keys.forEach(k => {
       const md = (+k.slice(5,7)) + '월 ' + (+k.slice(8,10)) + '일';
       html += '<div class="pocal-dgroup" onclick="osCalPick(\\'' + k + '\\')">'
@@ -19829,8 +19915,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     document.getElementById('po-upd-title').textContent =
       (it.code || '') + ' ' + (it.name || '');
     const BOARD = { po: '원/부자재 발주 요청', raw: '원료 입고 일정', import_raw: '원재료 수입 현황' };
-    document.getElementById('po-upd-sub').innerHTML = 'Monday <b>' + (BOARD[it.type] || '원/부자재 발주 요청') + '</b> 보드 · 이 건의 내역과 말풍선 대화'
-      + (ups.length ? ' (' + ups.length + '개)' : '');
+    const erp = it.type === 'po' || !it.type;   // 부자재(구매발주)·외주 완제품(외주발주)은 아마란스 발주 내역도 붙임
+    document.getElementById('po-upd-sub').innerHTML = 'Monday <b>' + (BOARD[it.type] || (it.type ? '원/부자재 발주 요청' : '외주 생산 요청')) + '</b> 보드 · 이 건의 내역'
+      + (erp ? ' · 아마란스 ' + (it.type ? '발주' : '외주발주') + ' 내역' : '') + ' · 말풍선 대화' + (ups.length ? ' (' + ups.length + '개)' : '');
     const bodyEl = document.getElementById('po-upd-body');
     let html = '';
     if (det.length) {
@@ -19855,9 +19942,42 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       html = '<div class="search-empty">말풍선(업데이트)이 없습니다</div>';
     }
     bodyEl.innerHTML = html;
+    if (erp && it.code) {   // Monday 내역 표 바로 밑(없으면 맨 위)에 아마란스 발주 내역
+      const box = document.createElement('div');
+      if (det.length) box.style.marginTop = '12px';
+      box.innerHTML = '<div class="loading" style="padding:4px 0 12px;font-size:12px">아마란스 발주 내역 불러오는 중...</div>';
+      if (det.length && bodyEl.firstElementChild) bodyEl.firstElementChild.after(box); else bodyEl.prepend(box);
+      _poErpSection(it, box);
+    }
     pop.classList.add('show');
   }
   function showImportDetail(idx) { _showUpdatesPopup(_poInlineItems[idx]); }
+  function showOsInlineDetail(idx) { _showUpdatesPopup(_osInlineItems[idx]); }
+  // 아마란스 발주 내역 — 상세 창 Monday 내역 밑에 '어느 업체로 언제 얼마나' (부자재=구매발주, 외주 완제품=외주발주) (2026-11-04)
+  async function _poErpSection(it, box) {
+    const kind = it.type === 'po' ? 'po' : (!it.type ? 'os' : '');
+    if (!kind || !it.code || !/^[A-Za-z]\\d/.test(it.code)) { box.remove(); return; }
+    try {
+      const d = await (await fetch('/api/po_erp?kind=' + kind + '&code=' + encodeURIComponent(it.code))).json();
+      const rows = d.items || [];
+      const ttl = '<div style="font-size:12px;font-weight:800;color:var(--text);margin:2px 0 6px">아마란스 ' + (kind === 'os' ? '외주발주' : '발주') + ' 내역 <span style="font-weight:500;color:var(--text-3)">최근 6개월 · ' + (d.total || 0) + '건' + (d.total > rows.length ? ' 중 최신 ' + rows.length + '건' : '') + '</span></div>';
+      if (!rows.length) { box.innerHTML = ttl + '<div style="font-size:12px;color:var(--text-3);padding:6px 0 10px">최근 6개월 아마란스 ' + (kind === 'os' ? '외주발주' : '발주') + ' 기록이 없습니다</div>'; return; }
+      const cell = 'padding:6px 8px;border-top:1px solid var(--border);white-space:nowrap';
+      box.innerHTML = ttl + '<div style="border:1px solid var(--border);border-radius:10px;overflow:auto;margin-bottom:12px"><table style="width:100%;border-collapse:collapse;font-size:12px">'
+        + '<thead><tr style="background:var(--surface-2);color:var(--text-2);font-size:11px"><th style="padding:6px 8px;text-align:left;position:static">발주일</th><th style="padding:6px 8px;text-align:left;position:static">' + (kind === 'os' ? '외주처' : '발주 업체') + '</th><th style="padding:6px 8px;text-align:right;position:static">발주</th><th style="padding:6px 8px;text-align:right;position:static">입고</th><th style="padding:6px 8px;text-align:left;position:static">상태</th><th style="padding:6px 8px;text-align:left;position:static">납기</th></tr></thead><tbody>'
+        + rows.map(o => {
+            const st = o.closed ? '<span style="color:var(--text-3)" title="' + escapeHtml(o.closed_why) + '">마감</span>'
+              : (o.left > 0 ? '<b style="color:#b45309">미입고 ' + fmtInt(Math.round(o.left)) + '</b>' : '<span style="color:#047857">입고 완료</span>');
+            return '<tr title="' + escapeHtml(o.no + (o.note ? ' · ' + o.note : '')) + '"><td style="' + cell + '">' + escapeHtml(o.date.slice(2).replace(/-/g, '.')) + '</td>'
+              + '<td style="' + cell + ';white-space:normal;font-weight:700">' + escapeHtml(o.vendor)
+              + (kind === 'os' && o.src === '구매발주' ? ' <span style="font-size:10px;font-weight:500;color:var(--text-3)" title="완제품을 사 오는 구매발주">구매</span>' : '') + '</td>'
+              + '<td style="' + cell + ';text-align:right">' + fmtInt(Math.round(o.qty)) + (o.unit ? ' <span style="color:var(--text-3);font-size:10.5px">' + escapeHtml(o.unit) + '</span>' : '') + '</td>'
+              + '<td style="' + cell + ';text-align:right">' + fmtInt(Math.round(o.rcv)) + '</td>'
+              + '<td style="' + cell + '">' + st + '</td>'
+              + '<td style="' + cell + '">' + escapeHtml(o.due ? o.due.slice(5).replace('-', '/') : '-') + '</td></tr>';
+          }).join('') + '</tbody></table></div>';
+    } catch (e) { box.innerHTML = '<div style="font-size:12px;color:#ef4444;margin-bottom:10px">아마란스 발주 내역을 못 불러왔습니다: ' + escapeHtml(e.message) + '</div>'; }
+  }
   function closePoUpdates() { document.getElementById('po-upd-modal').classList.remove('show'); }
 
   async function openPoPending() {
@@ -22611,7 +22731,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   }
   // 미리보기 쪽 주소 — .ai는 대지마다 한 쪽(최대 8쪽), 쪽마다 목록 한 칸으로 펼쳐 화살표·썸네일로 넘김
   // &t=1·2 = 안내문뿐인 .ai의 1쪽을 썸네일·변환 그림으로 바꾼 뒤 주소 (브라우저가 30일 보관한 옛 안내문 그림을 안 쓰게)
-  const dsgSrc = (f, hd) => f.preview + '?page=' + (f.page || 1) + (hd ? '&hd=1' : '') + (f.nopdf ? (f.conv ? '&t=2' : f.thumb ? '&t=1' : '') : '');
+  const dsgSrc = (f, hd) => f.preview + '?page=' + (f.page || 1) + (hd ? '&hd=1' : '') + (f.nopdf ? (f.conv ? '&t=2' : f.thumb ? '&t=1' : '') : '') + (f.v ? '&v=' + f.v : '');
   function dsgThumbs() {
     document.getElementById('dsg-thumbs').innerHTML = _dsgFiles.length > 1 ? _dsgFiles.map((f, i) =>
       '<button onclick="showDesign(' + i + ')" title="' + escapeHtml(f.name) + (f.page ? ' · ' + f.page + '쪽' : '') + '">'
@@ -22633,10 +22753,11 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const imgTag = src => '<div class="dsg-box"><img src="' + escapeHtml(src) + '" alt="' + escapeHtml(f.name) + '" draggable="false" onload="dsgOnLoad(this)" title="마우스 휠: 확대·축소 · 끌기: 이동 · 클릭: 크게 보기/맞춤"></div>';
     if (f.kind === 'image') {
       stage.innerHTML = nav + imgTag(f.url);
-    } else if (dsgStub(f) && f.thumb) {   // 파일 속 작은 썸네일(256px) — 조금 키워서 보여 줌
+    } else if (dsgStub(f) && f.conv_known !== false && f.thumb) {   // 파일 속 작은 썸네일(256px) — 조금 키워서 보여 줌 (변환 여부 모르면 아래 check로 먼저 확인)
       stage.innerHTML = nav + imgTag(dsgSrc(f))
-        + '<div class="dsg-note">\\'PDF 호환\\' 없이 저장된 AI라 파일 속 작은 미리보기만 있습니다 — 크게 보려면 [원본 받기]</div>';
-    } else if (dsgStub(f)) {
+        + '<div class="dsg-note">\\'PDF 호환\\'을 끄고 저장된 AI라 화면에 크게 그릴 수 없어 파일 속 작은 미리보기만 보입니다<br>'
+        + '크게 보려면 디자인 업체에 \\'PDF 호환 파일 만들기\\'를 켜고 다시 저장해 달라고 하거나, [원본 받기]로 일러스트레이터에서 여세요</div>';
+    } else if (dsgStub(f) && f.conv_known !== false) {
       stage.innerHTML = nav + '<div class="search-empty" style="margin:auto;text-align:center;line-height:1.7">이 AI 파일은 일러스트레이터에서 \\'PDF 호환 파일 만들기\\'를 끄고 저장해서<br>화면 미리보기가 없습니다. 오른쪽 위 [원본 받기]로 받아 일러스트레이터에서 열어 주세요.</div>';
     } else if (f.preview && f.expanded) {
       stage.innerHTML = nav + imgTag(dsgSrc(f))
@@ -22649,7 +22770,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         if (seq !== _dsgSeq) return;   // 그사이 다른 파일로 넘겼거나 창을 닫음
         if (!d.ok) throw new Error(d.error || '미리보기 실패');
         if (d.nopdf) {   // 안내문뿐인 .ai — 짝 그림으로 합치거나, 변환 못 했으면 맨 뒤로(썸네일·안내)
-          Object.assign(f, {nopdf: true, conv: !!d.conv, thumb: !!d.thumb});
+          Object.assign(f, {nopdf: true, conv: !!d.conv, thumb: !!d.thumb, conv_known: true});
           dsgFoldNopdf(f);
           if (dsgStub(f) || _dsgFiles.indexOf(f) < 0) { dsgThumbs(); showDesign(_dsgIdx); return; }
         }   // Scribus로 변환한 것은 아래에서 보통 시안처럼 쪽을 펼침

@@ -35,6 +35,41 @@ def _windows(src, prefix, width, max_pages):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+# 내용만 잘라 크게 (2026-11-03, 사용자 "시안 이슈 전체 점검") — 큰 대지 가운데 디자인이 조그맣게 있으면(B0048·B0044 등 잉크 2~4%)
+# 2400px로 그려도 디자인은 손톱만 해서 안 보임 → 흰 여백을 뺀 내용 상자가 쪽 넓이의 절반보다 작으면 그 부분만 같은 해상도로 그림
+_TRIM_AREA = 0.5
+_TRIM_PAD = 0.03
+_LO = 800                                                   # 내용 상자 찾을 때 쓰는 저해상도 긴 변(px)
+_INK = bytes(1 if v < 245 else 0 for v in range(256))       # 회색조 화소 → 흰색이 아니면 1
+
+
+def _ink_box(w, h, data):
+    """회색조 화소(1바이트씩) → (흰색 아닌 화소를 감싼 상자 (x0, y0, x1, y1) 또는 None, 잉크 비율)."""
+    m = bytes(data).translate(_INK)
+    x0, y0, x1, y1 = w, -1, -1, -1
+    for i in range(h):
+        row = m[i * w:(i + 1) * w]
+        a = row.find(1)
+        if a < 0:
+            continue
+        if y0 < 0:
+            y0 = i
+        y1 = i
+        x0, x1 = min(x0, a), max(x1, row.rfind(1))
+    return ((x0, y0, x1 + 1, y1 + 1) if y1 >= 0 else None), m.count(1) / max(1, len(m))
+
+
+def _trim_frac(w, h, box):
+    """내용 상자가 쪽 넓이의 _TRIM_AREA보다 작으면 둘레 여백을 붙인 자르기 범위(쪽 대비 비율 0~1), 아니면 None."""
+    if not box:
+        return None
+    x0, y0, x1, y1 = box
+    if (x1 - x0) * (y1 - y0) >= _TRIM_AREA * w * h:
+        return None
+    px, py = (x1 - x0) * _TRIM_PAD + 2, (y1 - y0) * _TRIM_PAD + 2
+    return (max(0, x0 - px) / w, max(0, y0 - py) / h, min(w, x1 + px) / w, min(h, y1 + py) / h)
+
+
 def _mupdf(src, prefix, width, max_pages):
     # PyMuPDF(2026-11-02): 무거운 시안도 몇 초 — WinRT는 Scribus PDF에서 15~30분+ 걸려 시간 초과
     import pymupdf
@@ -42,8 +77,13 @@ def _mupdf(src, prefix, width, max_pages):
         n = min(doc.page_count, max_pages)
         for i in range(n):
             pg = doc[i]
-            z = width / max(pg.rect.width, pg.rect.height)
-            pg.get_pixmap(matrix=pymupdf.Matrix(z, z), alpha=False).save(
+            r = pg.rect
+            zl = _LO / max(r.width, r.height)
+            lo = pg.get_pixmap(matrix=pymupdf.Matrix(zl, zl), colorspace=pymupdf.csGRAY, alpha=False)
+            t = _trim_frac(lo.width, lo.height, _ink_box(lo.width, lo.height, lo.samples)[0])
+            clip = pymupdf.Rect(r.x0 + t[0] * r.width, r.y0 + t[1] * r.height, r.x0 + t[2] * r.width, r.y0 + t[3] * r.height) if t else r
+            z = width / max(clip.width, clip.height)
+            pg.get_pixmap(matrix=pymupdf.Matrix(z, z), clip=clip, alpha=False).save(
                 prefix + '.jpg' if i == 0 else f'{prefix}-p{i + 1}.jpg', jpg_quality=85)
         return doc.page_count, n
 
@@ -73,7 +113,67 @@ def _poppler(src, prefix, width, max_pages):
         raise RuntimeError('미리보기 실패: ' + (r.stderr or '')[-250:])
     for i, p in enumerate(outs, 1):   # pdftoppm은 쪽 번호를 0으로 채움(-01, -001) → 우리 이름으로
         os.replace(p, prefix + '.jpg' if i == 1 else f'{prefix}-p{i}.jpg')
+    _poppler_trim(src, prefix, width, len(outs))
     return pages or len(outs), len(outs)
+
+
+def _pgm(path):
+    """pdftoppm -gray 결과(P5 PGM) → (가로, 세로, 화소 bytes). 화소에 공백 값이 섞여도 되게 머리만 낱말 단위로 읽음."""
+    with open(path, 'rb') as f:
+        b = f.read()
+    toks, i = [], 0
+    while len(toks) < 4:
+        while b[i:i + 1].isspace():
+            i += 1
+        j = i
+        while not b[j:j + 1].isspace():
+            j += 1
+        toks.append(b[i:j])
+        i = j
+    w, h = int(toks[1]), int(toks[2])
+    return w, h, b[i + 1:i + 1 + w * h]
+
+
+def _poppler_lo(src, first, last, out):
+    """1쪽~last쪽 저해상도 회색조 [(가로, 세로, 화소)] — 내용 상자·빈 쪽 판정용."""
+    subprocess.run(['pdftoppm', '-gray', '-scale-to', str(_LO), '-f', str(first), '-l', str(last), src, out],
+                   capture_output=True, timeout=300)
+    pgms = sorted(glob.glob(glob.escape(out) + '-*.pgm'), key=lambda p: int(re.search(r'-(\d+)\.pgm$', p).group(1)))
+    res = []
+    for p in pgms:
+        res.append(_pgm(p))
+        os.remove(p)
+    return res
+
+
+def _poppler_trim(src, prefix, width, n):
+    """그린 쪽 중 내용이 대지 일부뿐인 쪽은 그 부분만 같은 해상도로 다시 그림(pdftoppm 자르기는 그 영역만 그려 메모리 적게 씀).
+    보기 좋게 하는 단계라 실패해도 전체 쪽 그림을 그대로 둠."""
+    try:
+        for k, (w, h, data) in enumerate(_poppler_lo(src, 1, n, prefix + '_lo'), 1):
+            t = _trim_frac(w, h, _ink_box(w, h, data)[0])
+            if not t:
+                continue
+            n2 = int(width * _LO / max((t[2] - t[0]) * w, (t[3] - t[1]) * h))   # 자른 부분의 긴 변이 width가 되는 쪽 전체 긴 변
+            x, y = int(t[0] * w * n2 / _LO), int(t[1] * h * n2 / _LO)
+            cw, ch = int((t[2] - t[0]) * w * n2 / _LO), int((t[3] - t[1]) * h * n2 / _LO)
+            crop = prefix + '_crop'
+            subprocess.run(['pdftoppm', '-jpeg', '-jpegopt', 'quality=88', '-scale-to', str(n2), '-x', str(x), '-y', str(y),
+                            '-W', str(cw), '-H', str(ch), '-f', str(k), '-l', str(k), '-singlefile', src, crop],
+                           capture_output=True, timeout=900)
+            if os.path.exists(crop + '.jpg') and os.path.getsize(crop + '.jpg') > 100:
+                os.replace(crop + '.jpg', prefix + '.jpg' if k == 1 else f'{prefix}-p{k}.jpg')
+    except Exception:
+        pass
+
+
+def _first_page_ink(pdf, out):
+    """1쪽 잉크 비율 — Scribus 변환 결과가 빈 쪽인지(B0013·B0358·B0389·B0404가 빈 흰 쪽으로 '변환'됐음, 2026-11-03)."""
+    try:
+        lo = _poppler_lo(pdf, 1, 1, out)
+        return _ink_box(*lo[0])[1] if lo else 0.0
+    except Exception:
+        return 1.0   # 판정 못 하면 막지 않음
 
 
 _PH_WORDS = {'adobe', 'illustrator', 'pdf'}
@@ -205,6 +305,8 @@ def main(src, prefix, width=2400, max_pages=8):
         out.update(check(src, out['rendered'], prefix + '-thumb.jpg'))
         if out.get('nopdf') and os.name != 'nt':   # 안내문뿐인 .ai → Scribus로 변환한 PDF를 다시 그림으로
             out['conv'] = scribus_pdf(src, src + '.conv.pdf')
+            if out['conv'] and _first_page_ink(src + '.conv.pdf', prefix + '_blank') < 0.002:
+                out['conv'] = False   # 빈 쪽으로 변환됨 → 변환 실패로 보고 아래에서 파일 속 썸네일로
             if out['conv']:
                 for p in glob.glob(glob.escape(prefix) + '*.jpg'):
                     os.remove(p)
