@@ -2530,6 +2530,81 @@ def _month_inv_df(ym):
     return df, name
 
 
+_MONTH_INB = {}   # ym → (지문, [입고 행], 출처 이름)
+_INB_COLS = ['vendor', 'date', 'code', 'name', 'spec', 'qty', 'unit', 'supplier', 'dest', 'exp']
+
+
+def _parse_inbound_sheet(xlsx_path, tmp_name='_inb_snapshot.xlsx'):
+    """재고파악 엑셀의 'daily_원부자재 입고일지' 시트 → [{vendor(입고처), date, code, name, spec, qty, unit, supplier, dest, exp}].
+    원본은 열지 않고 임시 복사본으로 읽음(_parse_inventory_excel과 같은 이유 — 엑셀 읽기전용·OneDrive 동기화 막힘 방지)."""
+    import shutil as _sh
+    import tempfile as _tf
+    tmp = os.path.join(_tf.gettempdir(), tmp_name)
+    _sh.copy2(xlsx_path, tmp)
+    xls = pd.ExcelFile(tmp, engine='openpyxl')
+    try:
+        isn = next((s for s in xls.sheet_names if '입고일지' in s), None)
+        if not isn:
+            return []
+        raw = xls.parse(sheet_name=isn, header=None, dtype=object, nrows=10)
+        hr = next((i for i in range(len(raw)) if '입고일자' in [str(v).strip() for v in raw.iloc[i].tolist()]), None)
+        if hr is None:
+            return []
+        ib = xls.parse(sheet_name=isn, header=hr, dtype=object)
+    finally:
+        xls.close()
+    ib.columns = [str(c).strip() for c in ib.columns]
+    if '품번' not in ib.columns:
+        return []
+    ib = ib[ib['품번'].notna()]   # 시트가 6만여 행까지 서식만 잡혀 있음 → 빈 행 먼저 버림
+    g = lambda r, c: r.get(c) if c in ib.columns else None
+    s = lambda r, c: '' if g(r, c) is None or str(g(r, c)) == 'nan' else str(g(r, c)).strip()
+    out = []
+    for _, r in ib.iterrows():
+        code = s(r, '품번')
+        dt, qty = _xdate(g(r, '입고일자')), _xnum(g(r, '입고수량'))
+        if not code or not dt or qty <= 0:
+            continue
+        exp = g(r, '유통기한')
+        out.append({'vendor': s(r, '입고처'), 'date': dt, 'code': code.upper(), 'name': s(r, '제품명'), 'spec': s(r, '규격'),
+                    'qty': qty, 'unit': s(r, '입고단위')[:10], 'supplier': s(r, '원/부자재 업체명')[:40],
+                    'dest': s(r, '출고처')[:40], 'exp': (_xdate(exp) or s(r, '유통기한'))[:10]})
+    return out
+
+
+def _month_inbound(ym):
+    """그 달 재고파악 엑셀의 입고일지(구매팀이 적은 입고) — 거래처 화면 입고일지에 자동으로 깜 (2026-11-04, 사용자 "입고일지가 업데이트 안 됨, 자동으로 불러오게").
+    로컬: 그 달 엑셀(마감 > 최종본 > 월 파일)을 읽어 data/inv_month/{ym}_in.csv로 보관 → update_cloud ③-3이 GCP로 올림 / GCP: 그 CSV.
+    입고일지 시트엔 여러 달이 쌓일 수 있어 그 달 날짜만. 엑셀이 안 바뀌면 메모리 캐시."""
+    snap = f'{DATA_DIR}/inv_month/{ym}_in.csv'
+    src = _month_inv_file(ym)
+    fp = (src, os.path.getmtime(src) if src else None, os.path.getmtime(snap) if os.path.exists(snap) else None)
+    hit = _MONTH_INB.get(ym)
+    if hit and hit[0] == fp:
+        return hit[1], hit[2]
+    rows, name = None, ''
+    if src:
+        try:
+            rows = [x for x in _parse_inbound_sheet(src, tmp_name=f'_inb_{ym}.xlsx') if x['date'][:7] == f'{ym[:4]}-{ym[4:6]}']
+            os.makedirs(os.path.dirname(snap), exist_ok=True)
+            pd.DataFrame(rows, columns=_INB_COLS).to_csv(snap, index=False, encoding='utf-8-sig')
+            name = os.path.basename(src)
+        except Exception as e:
+            print(f'[입고일지] {ym} 엑셀 읽기 실패: {e}')
+            rows = None
+    if rows is None and os.path.exists(snap):
+        try:
+            d = pd.read_csv(snap, encoding='utf-8-sig', dtype=str).fillna('')
+            rows = [{**r, 'qty': _xnum(r.get('qty'))} for r in d.to_dict('records')]
+            name = name or os.path.basename(snap)
+        except Exception as e:
+            print(f'[입고일지] {ym} CSV 읽기 실패: {e}')
+    rows = rows or []
+    fp = (src, os.path.getmtime(src) if src else None, os.path.getmtime(snap) if os.path.exists(snap) else None)
+    _MONTH_INB[ym] = (fp, rows, name)
+    return rows, name
+
+
 def _months_back_ym(n, base=None):
     """base(기본 이번 달)에서 n달 전 'YYYYMM'."""
     d = base or datetime.now()
@@ -2586,11 +2661,27 @@ def api_vendor_portal_sheet(token):
                         'base': _xnum(r.get(cols[7], 0)), 'inb_file': _xnum(r.get(cols[8], 0)),
                         'cur_file': _xnum(r.get('현재고량_일지', r.get(COL_재고량, 0))),
                         'daily_file': daily_file, 'daily_entry': daily_entry, 'entry_by': entry_by, 'entry_src': entry_src})
+    # 재고 파일 입고일지(구매팀이 적은 입고)를 자동으로 깜 (2026-11-04). 입고처 = 이 거래처인 행만.
+    # 화면·엑셀로 등록한 입고 중 파일에 이미 같은 날짜·품번·수량이 있으면(마감에 옮겨 적힘) 파일 행으로만 보여 중복 방지.
+    from collections import Counter as _Ctr
+    finb, _ = _month_inbound(ym)
+    fmine = [x for x in finb if x.get('vendor') and (x['vendor'] == vendor or x['vendor'].startswith(vendor))]
+    fkeys = _Ctr((x['date'], x['code'], round(float(x['qty']), 3)) for x in fmine)
+
+    def _in_file(e):
+        k = (e['date'], str(e['code']).upper(), round(float(e.get('qty') or 0), 3))
+        if fkeys.get(k, 0) > 0:
+            fkeys[k] -= 1
+            return True
+        return False
+    _nm = lambda c, k: next((x[k] for x in out if x['code'].upper() == c), '')
     inbound = sorted([{'id': e['id'], 'date': e['date'], 'code': e['code'], 'qty': e['qty'], 'unit': e.get('unit', ''), 'exp': e.get('exp', ''),
                        'supplier': e.get('supplier', ''), 'dest': e.get('dest', ''), 'src': e.get('src', ''),
-                       'by': e.get('name', ''), 'name': next((x['name'] for x in out if x['code'].upper() == e['code']), ''),
-                       'spec': next((x['spec'] for x in out if x['code'].upper() == e['code']), '')} for e in ins], key=lambda x: (x['date'], x['id']))
-    return jsonify({'vendor': vendor, 'ym': ym, 'ndays': ndays, 'rows': out, 'inbound': inbound,
+                       'by': e.get('name', ''), 'name': _nm(e['code'], 'name'), 'spec': _nm(e['code'], 'spec')}
+                      for e in ins if not _in_file(e)], key=lambda x: (x['date'], x['id']))
+    inbound_file = sorted([{**x, 'name': x.get('name') or _nm(x['code'], 'name'), 'spec': x.get('spec') or _nm(x['code'], 'spec')}
+                           for x in fmine], key=lambda x: x['date'])
+    return jsonify({'vendor': vendor, 'ym': ym, 'ndays': ndays, 'rows': out, 'inbound': inbound, 'inbound_file': inbound_file,
                     'file_month_matches': file_is_month, 'source': source,
                     'readonly': ym < _months_back_ym(2), 'first_ym': VENDOR_PORTAL_FIRST_YM})
 
@@ -3581,6 +3672,8 @@ table.inbg{min-width:1180px}
 .inbg td input:focus,.inbg td select:focus{background:#eef2ff;box-shadow:inset 0 0 0 2px #4f46e5}
 .inbg td.ro{padding:0 6px;color:#334155;background:#f8fafc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:420px}
 .inbg tr.saved td{background:#f1f5f9}.inbg tr.saved td.y{background:#f1f5f9;color:#1d4ed8;font-weight:700}
+.inbg tr.filerow td{background:#f8fafc;color:#64748b}.inbg tr.filerow td.num{font-weight:700;color:#475569}
+.inleg{font-size:12px;color:#64748b;margin:0 0 6px}.inleg b{color:#334155}
 .inbg td.num{text-align:right}
 .card{background:#fff;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;margin-bottom:12px}
 .row{display:grid;grid-template-columns:1fr 120px;gap:8px;align-items:center;padding:9px 12px;border-bottom:1px solid #f1f5f9}
@@ -3603,6 +3696,7 @@ table.inbg{min-width:1180px}
 
   <div id="pane-in" style="display:none">
     <p class="note" style="font-weight:700;color:#b45309">▶ 노랑색 부분만 작성 부탁드립니다.</p>
+    <p class="inleg" id="in-legend"></p>
     <div class="gridwrap" style="max-height:calc(100vh - 240px)"><table class="grid inbg" id="ingrid"></table></div>
     <div class="bar" style="margin-top:8px"><button class="btn g" onclick="addInRows(5)">+ 빈 행 5개 추가</button><span class="note" style="margin:0">제품명·규격은 품번을 넣으면 자동으로 채워집니다. 품번은 목록에서 고르거나 직접 입력하세요. 아래 [저장]을 누르면 입력한 행이 기록됩니다.</span></div>
     <datalist id="codelist"></datalist>
@@ -3700,8 +3794,12 @@ const VENDOR_NAME = {{ vendor|tojson }};
 function codeInfo(c) { c = (c || '').trim().toUpperCase(); const r = (SHEET ? SHEET.rows : []).find(x => x.code.toUpperCase() === c); return r || null; }
 function renderIn() {
   const L = SHEET ? SHEET.inbound : [];
+  const F = SHEET ? (SHEET.inbound_file || []) : [];   // 재고 파일 입고일지(매홍 구매팀이 적은 입고) — 자동으로 깔림 (2026-11-04)
+  document.getElementById('in-legend').innerHTML = (F.length ? '<b>회색 ' + F.length + '건</b> = 재고 파일 입고일지에 적힌 입고(자동, 수정은 매홍에 요청)' : '재고 파일 입고일지에 이 달 입고가 아직 없습니다')
+    + (L.length ? ' · <b style="color:#1d4ed8">파랑 ' + L.length + '건</b> = 이 화면·엑셀로 등록한 입고' : '');
   document.getElementById('codelist').innerHTML = (SHEET ? SHEET.rows : []).filter(r => /^[A-D]/i.test(r.code)).map(r => '<option value="' + esc(r.code) + '">' + esc(r.name) + '</option>').join('');
   let h = '<thead><tr><th style="min-width:118px">입고일자</th><th style="min-width:110px">품번</th><th style="min-width:380px">제품명</th><th style="min-width:110px">규격</th><th style="min-width:160px">원/부자재 업체명</th><th style="min-width:100px">입고수량</th><th style="min-width:80px">입고단위</th><th style="min-width:100px">입고처</th><th style="min-width:110px">출고처</th><th style="min-width:118px">유통기한</th><th style="min-width:60px"></th></tr></thead><tbody>';
+  F.forEach(e => { h += '<tr class="filerow" title="재고 파일 입고일지 — 매홍 구매팀이 적은 입고"><td class="ro">' + e.date + '</td><td class="ro">' + esc(e.code) + '</td><td class="ro" title="' + esc(e.name) + '">' + esc(e.name) + '</td><td class="ro">' + esc(e.spec || '') + '</td><td class="ro">' + esc(e.supplier || '') + '</td><td class="ro num">' + fmt(e.qty) + '</td><td class="ro">' + esc(e.unit || '') + '</td><td class="ro">' + esc(VENDOR_NAME) + '</td><td class="ro">' + esc(e.dest || '') + '</td><td class="ro">' + esc(e.exp || '') + '</td><td class="ro" style="text-align:center;font-size:11px">파일</td></tr>'; });
   L.forEach(e => { h += '<tr class="saved"' + (e.src === 'xlsx' ? ' title="매홍이 엑셀로 올린 입고"' : '') + '><td class="y ro"' + (e.src === 'xlsx' ? ' style="color:#047857"' : '') + '>' + e.date + '</td><td class="y ro">' + esc(e.code) + '</td><td class="ro" title="' + esc(e.name) + '">' + esc(e.name) + '</td><td class="ro">' + esc(e.spec) + '</td><td class="y ro">' + esc(e.supplier || '') + '</td><td class="y ro num">' + fmt(e.qty) + '</td><td class="ro">' + esc(e.unit) + '</td><td class="ro">' + esc(VENDOR_NAME) + '</td><td class="ro">' + esc(e.dest || '') + '</td><td class="ro">' + esc(e.exp || '') + '</td><td style="text-align:center"><button class="btn d" onclick="delIn(' + JSON.stringify(e.id) + ',' + JSON.stringify(e.code) + ')">삭제</button></td></tr>'; });
   for (let i = 0; i < INROWS; i++) h += inBlankRow(i);
   document.getElementById('ingrid').innerHTML = h + '</tbody>'; upd();
@@ -25330,6 +25428,17 @@ def export_source_csv():
         if fym and DF is not None and not DF.empty:
             os.makedirs(f'{DATA_DIR}/inv_month', exist_ok=True)
             _inv_full_df().to_csv(f'{DATA_DIR}/inv_month/{fym}.csv', index=False, encoding='utf-8-sig')
+            # 거래처 화면 입고일지 자동 표시용 — 이번 달은 엑셀이 바뀔 때마다, 지난 달은 CSV가 없을 때 한 번 (2026-11-04)
+            try:
+                _month_inbound(fym)
+                ym_i = VENDOR_PORTAL_FIRST_YM
+                while ym_i < fym:
+                    if not os.path.exists(f'{DATA_DIR}/inv_month/{ym_i}_in.csv'):
+                        _month_inbound(ym_i)
+                    y_i, m_i = int(ym_i[:4]), int(ym_i[4:]) + 1
+                    ym_i = f'{y_i + (m_i > 12)}{(m_i - 1) % 12 + 1:02d}'
+            except Exception as e:
+                print(f'[export] 입고일지 CSV 실패: {e}')
         print(f"[export] OneDrive 소스 CSV 저장: {out} (+마감보관 {ym})")
         return jsonify({'ok': True, 'exported': out, 'date': today})
     except Exception as e:
