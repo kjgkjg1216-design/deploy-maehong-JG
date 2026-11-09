@@ -8,6 +8,13 @@ $LOCK = "$DIR\.monday_sync.lock"
 $tok  = (Get-Content "$DIR\.reload_token" -Raw).Trim()
 function Log($m){ Add-Content -Path $LOG -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $m" -Encoding UTF8 }
 
+# 로컬 대시보드가 꺼져 있으면 다시 띄움 — 오류 기록 없이 꺼진 사례(2026-11-09 사용자 "localhost 연결 거부").
+#   로그인 직후 2분은 로그인 작업(OneDrive 대기 1분 지연)에 맡김. 기동 중 중복 실행은 런처가 막음.
+if (-not (Get-NetTCPConnection -State Listen -LocalPort 5000 -ErrorAction SilentlyContinue)) {
+  $ex = Get-Process explorer -ErrorAction SilentlyContinue | Sort-Object StartTime | Select-Object -First 1
+  if ($ex -and ((Get-Date) - $ex.StartTime).TotalMinutes -gt 2) { Start-ScheduledTask -TaskName MaehongDashboard -ErrorAction SilentlyContinue }
+}
+
 # dirty 확인 (변경 없으면 즉시 종료 — 가벼움)
 try {
   $st = (Invoke-WebRequest "$URL/api/monday_dirty?token=$tok" -UseBasicParsing -TimeoutSec 20).Content | ConvertFrom-Json

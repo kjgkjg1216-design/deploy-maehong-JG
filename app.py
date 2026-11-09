@@ -13001,6 +13001,257 @@ def api_ipsu_specs():
                     'total': len(specs), 'parsed': parsed, 'box_total': len(boxes)})
 
 
+# ── 팔레트 적재량 보조 출처 (2026-11-05, 사용자 "PT적재량이 나온 자료를 찾아 적용 — 제품리스트.xlsx 활용") ──
+#   우선순위: Monday '박스입수 적재량' PT적재량(품번 정확) › 제품리스트.xlsx(채널별 제품명·규격, 품번 없음 → 매칭) › 재고파악 '품번 등 데이터' 시트
+#   제품리스트 검증(2026-11-05): Monday와 둘 다 있는 81건 중 72건 같음, 다른 7건은 자료 차이(솥뚜껑 3kg 30/36 등) → Monday 우선, 다르면 함께 표시
+PRODUCT_LIST_XLSX = os.path.join(os.path.expanduser('~'), 'OneDrive', '바탕 화면', '제품리스트.xlsx')
+_PLT_CACHE = {}
+_PLT_W_RE = re.compile(r'(\d+(?:\.\d+)?)\s*(kg|g)(?![a-z])', re.I)
+# 무게 바로 뒤에 붙은 개수만: '80g*10ea' · '90g_3번들' · '200g 5번들' · '60G*8개' ('330g (11g x 3장)'의 3은 11g 몫)
+_PLT_M_RE = re.compile(r'\s*(?:[*xX×]\s*(\d+)|[_(,]\s*(\d+)\s*(?:입(?!수)|개입|번들|개|봉|ea|포|장)|(\d+)\s*(?:개입|번들|ea|포))', re.I)
+_PLT_BRANDS = [('자연다움', '자연다움'), ('착한상점', '착한상점'), ('이더스', '이더스'), ('eatus', '이더스'), ('웰리유', '웰리유'),
+               ('라이트잇', '라이트잇'), ('아침한끼', '아침한끼'), ('매홍', '매홍')]
+_PLT_STRIP_RE = re.compile(r'(자연다움|착한상점|이더스|eatus|웰리유|라이트잇|아침한끼|매홍|valuepack|해들녘|데이웰즈|정성|더푸른|청통)', re.I)
+_PLT_CH_TAG = [('홈플', '홈플러스'), ('롯데', '롯데마트'), ('이마트', '이마트'), ('노브랜드', '이마트'), ('세븐', '세븐일레븐'), ('GS', 'GS리테일'),
+               ('스낵24', '스낵24'), ('컬리', '마켓컬리'), ('쿠팡', '쿠팡'), ('온라인', '온라인')]
+_PLT_OTHER = ['H마트', '올리브영', '코스트코', '총각네', '미동농산', '매머드', '프레시지', '우고래빗', '마카다프릇', '페이보넥스', '지앤이',
+              '청아굿푸드', '와이즐리', '강원수출', '더리터', '해촌', '롯데상사', '웰리유', 'HBAF', '타다']
+
+
+def _plt_forms(s):
+    """품명 → ({(단위 g, 개수)} 표현들, 이름에 그대로 적힌(곱해서 만든 게 아닌) 무게들).
+    '600g(100g*6ea)' → {(600,1),(100,6)} · '90g_3번들' → {(90,3),(270,1)} — 묶음은 낱개 무게(90g) 단품 행과 맞추지 않음"""
+    s = (s or '').replace('×', 'x')
+    out, stated = set(), set()
+    for m in _PLT_W_RE.finditer(s):
+        w = float(m.group(1)) * (1000 if m.group(2).lower() == 'kg' else 1)
+        mm = _PLT_M_RE.match(s, m.end())
+        n = int(next(g for g in mm.groups() if g)) if mm else 1
+        if n > 1:
+            out.update({(w, n), (w * n, 1)})
+        else:
+            out.add((w, 1))
+            stated.add(w)
+    return out, stated
+
+
+def _plt_var_forms(spec):
+    """제품리스트 규격 '90g 90g x 3 90g x 5' → 변형마다 표현 집합"""
+    s = (spec or '').replace('×', 'x').replace('\n', ' ')
+    res = []
+    for p in re.findall(r'\d+(?:\.\d+)?\s*(?:kg|g)(?:\s*x\s*\d+)?', s, re.I):
+        m = re.match(r'(\d+(?:\.\d+)?)\s*(kg|g)(?:\s*x\s*(\d+))?', p, re.I)
+        w = float(m.group(1)) * (1000 if m.group(2).lower() == 'kg' else 1)
+        n = int(m.group(3) or 1)
+        res.append({(w, n), (w * n, 1)} if n > 1 else {(w, 1)})
+    return res
+
+
+def _plt_chan(name):
+    if '롯데상사' in name:   # '롯데'가 들었지만 롯데마트 아님 → 제품리스트 '기타' 시트
+        return '기타'
+    for t, c in _PLT_CH_TAG:
+        if t in name:
+            return c
+    return '기타' if any(t in name for t in _PLT_OTHER) else ''
+
+
+def _plt_norm(s):
+    s = re.sub(r'(홈플러스|홈플|롯데마트|롯데|이마트|세븐일레븐|세븐|스낵24|마켓컬리|컬리|쿠팡|온라인전용|온라인|미사용|단종|중복|제품|자사|외주|상품)', '', s or '')
+    s = re.sub(r'\d+(\.\d+)?\s*(kg|g|ea|개입|입|번들|개|봉|포|장)', '', s, flags=re.I)
+    return re.sub(r'[^가-힣a-zA-Z]', '', s).lower()
+
+
+def _plt_sim(a, b):
+    A = {a[i:i + 2] for i in range(len(a) - 1)}
+    B = {b[i:i + 2] for i in range(len(b) - 1)}
+    return len(A & B) / len(A | B) if A and B else 0.0
+
+
+def _plt_brands(s):
+    s = (s or '').lower()
+    return {v for k, v in _PLT_BRANDS if k in s}
+
+
+def _plt_bnorm(s):
+    """브랜드·생산처를 뺀 제품 이름 — '(자연다움)'처럼 브랜드만 같은 걸로 맞추지 않게"""
+    return _plt_norm(_PLT_STRIP_RE.sub('', s or ''))
+
+
+def _plt_bigrams(x):
+    return {x[i:i + 2] for i in range(len(x) - 1)}
+
+
+def _plt_sib_key(name):
+    """같은 제품의 다른 품번(자사·외주·생산처 표기만 다름)을 묶는 키"""
+    s = re.sub(r'\[F\]|\(MK/외주\)|외주생산|외주|자사|해들녘|해들녁|데이웰즈|정성|더푸른|청통|참좋은\s*반제품|참좋은\s*사용|참좋은|'
+               r'x?미사용단종중복x?|미사용|제품', '', name or '')
+    return re.sub(r'[^가-힣a-zA-Z0-9]', '', s).lower()
+
+
+def _product_list_rows():
+    """제품리스트.xlsx(채널별 시트: 제품명·규격·박스입수량·파렛트적재량) → 행 목록. 원본은 임시 복사본으로 읽음. 파일 수정시각 캐시."""
+    path = PRODUCT_LIST_XLSX
+    if not os.path.exists(path):
+        return []
+    mt = os.path.getmtime(path)
+    hit = _PLT_CACHE.get('rows')
+    if hit and hit[0] == mt:
+        return hit[1]
+    import shutil as _sh
+    import tempfile as _tf
+    import openpyxl as _ox
+    tmp = os.path.join(_tf.gettempdir(), '_product_list.xlsx')
+    _sh.copy2(path, tmp)
+    out = []
+    wb = _ox.load_workbook(tmp, read_only=True, data_only=True)
+    try:
+        for ws in wb.worksheets:
+            rows = list(ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=110, values_only=True))
+            hr = next((i for i, r in enumerate(rows[:10]) if any(str(v or '').strip() == '파렛트적재량' for v in r)), None)
+            if hr is None:
+                continue
+            col = {str(v).strip(): i for i, v in enumerate(rows[hr]) if v not in (None, '')}
+            g = lambda r, k: str(r[col[k]]).strip() if k in col and r[col[k]] not in (None, '') else ''
+            for r in rows[hr + 1:]:
+                if not g(r, '제품명'):
+                    continue
+                out.append({'ch': ws.title, 'name': g(r, '제품명').replace('\n', ' '), 'spec': g(r, '규격'),
+                            'box': g(r, '박스입수량'), 'pt': g(r, '파렛트적재량')})
+    finally:
+        wb.close()
+    _PLT_CACHE['rows'] = (mt, out)
+    return out
+
+
+def _pallet_from_product_list(products):
+    """제품리스트 행 → 대시보드 완제품 품번 {code: (PT, '채널 · 제품명 규격')}.
+    한 제품이 자사·외주·온라인 등 여러 품번이라 같은 행을 여러 품번에 줌. 조건: 규격(중량×개수) 일치 + 채널 호환 + 브랜드 안 다름
+    + (이름 유사 ≥0.45, 또는 박스입수 = BOM 박스당 완제품 수 이면서 (유사 ≥0.35 · 제품명 조각 포함률 ≥0.75 · 같은 채널이면 ≥0.4)).
+    한 행에 박스·PT가 여럿이면 박스입수가 맞는 짝. 검증(2026-11-05): Monday와 둘 다 있는 품번 중 다른 건 자료 차이(솥뚜껑 3kg 등)뿐"""
+    import math as _m
+    rows = _product_list_rows()
+    if not rows:
+        return {}
+    info = [(p['code'], p.get('name') or '', p.get('bomPer') or p.get('ipsu')) for p in products]
+    pre = {}
+    for c, n, _ in info:
+        base = re.sub(r'\([^)]*\)|\[[^\]]*\]', '', n)
+        forms, stated = _plt_forms(n)
+        pre[c] = (forms, stated, _plt_norm(base), _plt_bnorm(base), _plt_chan(n), _plt_brands(n))
+    df = {}
+    for v in pre.values():
+        for g in _plt_bigrams(v[3]):
+            df[g] = df.get(g, 0) + 1
+    tot = len(pre)
+
+    def cover(x, y):   # 제품리스트 이름 x의 2글자 조각 중 품명 y에 든 몫 — 흔한 조각(고구마·누룽지)은 가볍게, 드문 조각(콜라겐·카사바)은 무겁게
+        A = _plt_bigrams(x)
+        if not A:
+            return 0.0
+        wt = {g: _m.log((tot + 1) / (df.get(g, 0) + 1)) + 1 for g in A}
+        return sum(wt[g] for g in A & _plt_bigrams(y)) / sum(wt.values())
+    best = {}
+    for r in rows:
+        pts = [x.strip() for x in re.split(r'[\n/]', r['pt']) if re.fullmatch(r'\d+', x.strip())]
+        if not pts:
+            continue
+        boxes = [x.strip() for x in r['box'].split('\n') if x.strip()]
+        vfs = _plt_var_forms(r['spec']) or [set()]
+        # '(자연다움)'처럼 괄호에 브랜드만 든 조각은 이름 비교에서 뺌 (자연다움 건포도가 '고구마스틱 (자연다움)'에 붙던 문제)
+        frags = [r['name'], re.sub(r'\([^)]*\)', '', r['name'])] + [x for x in re.findall(r'\(([^)]*)\)', r['name']) if len(_plt_bnorm(x)) >= 2]
+        names = [x for x in (_plt_norm(y) for y in frags) if x]
+        bnames = [x for x in {_plt_bnorm(y) for y in frags} if len(x) >= 2]
+        rb = _plt_brands(r['name'])
+        for vi, fset in enumerate(vfs):
+            v_single = all(k == 1 for _, k in fset)
+            units = {w for w, k in fset if k > 1}
+            for code, nm, per in info:
+                forms, stated, nn, bn, ch, ib = pre[code]
+                if ch and not (ch == r['ch'] or (ch == '온라인' and r['ch'] in ('쿠팡', '오픈마켓', '마켓컬리'))):
+                    continue
+                if rb and ib and not (rb & ib):   # 브랜드가 다름 (웰리유 퀵오트밀 ≠ 이더스 퀵오트밀)
+                    continue
+                # 박스·PT 짝: 변형 수만큼 있으면 같은 순서, 아니면 박스입수가 맞는 것
+                if len(boxes) == len(vfs) and len(vfs) > 1:
+                    bi = vi
+                else:
+                    bi = next((i for i, b in enumerate(boxes) if per and b == str(int(per))), 0 if len(boxes) <= 1 else None)
+                if bi is None:
+                    continue
+                box_ok = bool(per) and bi < len(boxes) and boxes[bi] == str(int(per))
+                # 규격: 총중량만 우연히 같은 묶음끼리(80g×5 ↔ 20g×20)는 제외 — 어느 한쪽엔 그 무게가 그대로 적혀 있어야 함
+                common = {f for f in forms & fset if f[1] > 1 or f[0] in stated or v_single}
+                s = max((_plt_sim(x, nn) for x in names), default=0.0)
+                cv = max((cover(x, bn) for x in bnames), default=0.0)
+                if not common and not (box_ok and cv >= 0.75 and forms and all(k == 1 for _, k in forms) and any(w in units for w in stated)):
+                    continue   # 규격 다름 — 단, 낱개 품명('쫀득고구마꿀꺽20g')이 묶음 규격 행과 이름·박스입수까지 같으면 인정
+                ch_exact = bool(ch) and ch == r['ch'] and ch != '기타'
+                if not (s >= 0.45 or (box_ok and (s >= 0.35 or cv >= 0.75 or (ch_exact and cv >= 0.4)))):
+                    continue
+                pt = int(pts[bi] if bi < len(pts) else pts[0])
+                score = max(s, cv) + (0.5 if box_ok else 0) + (0.3 if ch_exact else 0) + (0.2 if rb & ib else 0)
+                if code not in best or score > best[code][0]:
+                    best[code] = (score, pt, (r['ch'] + ' · ' + r['name'] + ' ' + r['spec']).replace('\n', ' ')[:60])
+    return {c: (v[1], v[2]) for c, v in best.items()}
+
+
+_PLT_BOX_RULE = {'C0018': 36, 'C0023': 30}
+
+
+def _pallet_answers():
+    """data/pallet_answers_*.csv (구매팀이 대시보드 대화에서 확인한 PT적재량) → {code: (PT, 'MM-DD')}. 나중 파일 우선"""
+    out = {}
+    for f in sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'pallet_answers_*.csv'))):
+        df = pd.read_csv(f, encoding='utf-8-sig', dtype=str).fillna('')
+        for _, r in df.iterrows():
+            try:
+                v = int(float(r['PT적재량']))
+            except ValueError:
+                continue
+            if v > 0:
+                out[r['품번'].strip().upper()] = (v, r['확인일'][5:])
+    return out
+
+
+def _inv_pallet_table():
+    """지금 재고파악 엑셀의 '품번 등 데이터' 시트 품번별 Pallet 적재량 {code: PT} (1 이하는 자리 채움 값이라 버림). 수정시각 캐시."""
+    path = CSV_PATH if str(CSV_PATH or '').lower().endswith('.xlsx') else _find_inventory_xlsx()
+    if not path or not os.path.exists(path):
+        return {}
+    mt = os.path.getmtime(path)
+    hit = _PLT_CACHE.get('inv')
+    if hit and hit[0] == (path, mt):
+        return hit[1]
+    import shutil as _sh
+    import tempfile as _tf
+    import openpyxl as _ox
+    tmp = os.path.join(_tf.gettempdir(), '_inv_pallet.xlsx')
+    _sh.copy2(path, tmp)
+    out = {}
+    wb = _ox.load_workbook(tmp, read_only=True, data_only=True)
+    try:
+        ws = next((w for w in wb.worksheets if '품번' in w.title and '데이터' in w.title), None)
+        if ws is not None:
+            rows = list(ws.iter_rows(min_row=1, max_row=1500, max_col=40, values_only=True))
+            hr = next((i for i, r in enumerate(rows[:10]) if any(re.search(r'pallet\s*적재량', str(v or ''), re.I) for v in r)), None)
+            if hr is not None:
+                pc = next(i for i, v in enumerate(rows[hr]) if re.search(r'pallet\s*적재량', str(v or ''), re.I))
+                cc = max(i for i, v in enumerate(rows[hr][:pc]) if str(v or '').strip() == '품번')
+                for r in rows[hr + 1:]:
+                    code = str(r[cc] or '').strip().upper()
+                    try:
+                        pt = int(float(r[pc])) if r[pc] not in (None, '') else 0
+                    except (TypeError, ValueError):
+                        pt = 0
+                    if re.fullmatch(r'[GHI]\d{4}', code) and pt > 1:
+                        out[code] = pt
+    finally:
+        wb.close()
+    _PLT_CACHE['inv'] = ((path, mt), out)
+    return out
+
+
 @app.route('/api/ipsu_bom', methods=['GET'])
 @cached_api()
 def api_ipsu_bom():
@@ -13119,6 +13370,61 @@ def api_ipsu_bom():
             'a': a, 'b': b, 'c': c,
         })
     products.sort(key=lambda x: x['code'])
+    # PT적재량 보조 출처로 빈 곳 채우기 (2026-11-05) — Monday › 제품리스트 › 재고파악 '품번 등 데이터'
+    try:
+        plist = _pallet_from_product_list(products)
+    except Exception as e:
+        print(f'[입수] 제품리스트 PT 읽기 실패: {e}')
+        plist = {}
+    try:
+        ptab = _inv_pallet_table()
+    except Exception as e:
+        print(f'[입수] 재고파악 PT 읽기 실패: {e}')
+        ptab = {}
+    try:
+        pans = _pallet_answers()
+    except Exception as e:
+        print(f'[입수] PT 확인 답변 읽기 실패: {e}')
+        pans = {}
+    for p in products:
+        code = p['code']
+        cands = []   # (출처, PT) — 앞이 우선, 값이 다른 출처는 함께 표시
+        box = (p.get('c') or {}).get('code', '')
+        if box in _PLT_BOX_RULE:   # 사용자 규칙(2026-11-05): 외박스 C0018은 무조건 36, C0023은 모두 30
+            cands.append((f'외박스 {box} 규칙', _PLT_BOX_RULE[box]))
+        if p.get('pallet'):
+            cands.append(('Monday 박스입수 보드', p['pallet']))
+        if pans.get(code):
+            cands.append(('구매팀 확인 ' + pans[code][1], pans[code][0]))
+        if plist.get(code):
+            cands.append(('제품리스트 · ' + plist[code][1], plist[code][0]))
+        if ptab.get(code):
+            cands.append(('재고파악 품번 등 데이터', ptab[code]))
+        if not cands:
+            continue
+        p['pallet'], p['pallet_src'] = cands[0][1], cands[0][0]
+        diff = [(s, v) for s, v in cands[1:] if v != cands[0][1]]
+        if diff:
+            p['pallet_alt'] = ' · '.join(('제품리스트는 ' + str(v) + ' (' + s.split(' · ', 1)[1] + ')') if s.startswith('제품리스트')
+                                         else s.split(' ')[0] + '은 ' + str(v) if s.startswith('재고파악')
+                                         else s + ' ' + str(v) for s, v in diff)
+    # 그래도 없으면: 같은 제품의 다른 품번(자사·외주·생산처 표기만 다름)이고 박스당 완제품 수까지 같으면 그 값
+    rank = lambda q: 0 if q['pallet_src'].startswith('Monday') else 1 if q['pallet_src'].startswith('제품리스트') else 2
+    sib = {}
+    for p in products:
+        if p.get('pallet') and p.get('pallet_src') and p.get('bomPer'):
+            sib.setdefault((_plt_sib_key(p['name']), p['bomPer']), []).append(p)
+    for p in products:
+        if p.get('pallet') or not p.get('bomPer'):
+            continue
+        hit = sorted((q for q in sib.get((_plt_sib_key(p['name']), p['bomPer']), []) if q['code'] != p['code']), key=rank)
+        if hit:
+            q = hit[0]
+            p['pallet'] = q['pallet']
+            p['pallet_src'] = '같은 제품 ' + q['code'] + ' 값 · ' + q['pallet_src'].split(' · ')[0]
+            others = sorted({x['pallet'] for x in hit[1:]} - {q['pallet']})
+            if others:
+                p['pallet_alt'] = '같은 제품 다른 품번은 ' + '/'.join(map(str, others))
     full = sum(1 for p in products if p['a'] and p['b'] and p['c'])
     return jsonify({'products': products, 'total': len(products), 'full': full,
                     'withIpsu': sum(1 for p in products if p['ipsu']),
@@ -13855,6 +14161,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   :root { --pg: 24px; --pg-r: 24px; }
   @media (min-width: 1101px) { :root { --pg: 32px; --pg-r: 68px; } }
   @media (min-width: 1600px) { :root { --pg: 64px; --pg-r: 68px; } }
+  /* 좁은 폭에서도 한 줄로 (2026-11-06 GCP 배포 점검): 769~980px에서 섹션마다 여백이 16·24·12px로 달라 패널 왼쪽 끝이 들쭉날쭉했음 */
+  @media (max-width: 980px) { :root { --pg: 16px; --pg-r: 16px; } }
+  @media (max-width: 900px) { :root { --pg: 12px; --pg-r: 12px; } }
   .chart-grid {
     max-width: none; margin: 14px auto 0; padding: 0 var(--pg-r) 0 var(--pg);
     display: grid; grid-template-columns: repeat(30, 1fr); gap: 12px;
@@ -13914,6 +14223,55 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .sec-nav a:hover { background:#f1f5f9; color:#0f172a; }
   .sec-nav a.on { background:#4f46e5; color:#fff; }
   @media (max-width:1100px) { .sec-nav { display:none; } }
+
+  /* ── 업무별 탭 + 즐겨찾기 (2026-11-05) — 고른 탭의 패널만 보이게. 탭 줄은 고정 머리 바로 아래에 붙음(--hdr-h는 JS가 잼) ── */
+  .tab-hide { display:none !important; }
+  /* 탭을 바꾸면 칸 폭이 달라짐 → 넓을 때 그려진 차트(canvas)가 칸을 밀어내 옆 패널이 찌그러지던 것(2026-11-06 사용자 지적: 매출·분석에서
+     월 매출 패널이 세로 글자로 눌림) 방지. 그리드 칸은 내용 폭과 상관없이 정해진 비율대로 */
+  .chart-grid > .chart-panel, .sales-npd-strip > .chart-panel, .lens-strip > .chart-panel { min-width:0; }
+
+  /* ── 전체 패널 보기 편하게 (2026-11-06, 사용자 "모든 패널 다 검토 — 기본은 보기 편해야") ── */
+  /* ① 탭 보기에선 목록 칸을 화면 높이에 맞춰 키움 — 패널마다 5~6건만 보이고 작은 칸 안에서 스크롤하던 것 (전체 보기는 그대로) */
+  @media (min-width: 981px) {
+    body[data-dtab="stock"] .chart-grid > .chart-panel > .alert-list { min-height: max(310px, calc(100vh - 340px)); }
+    body[data-dtab="order"] .chart-grid > .chart-panel > .po-inline-list,
+    body[data-dtab="fav"] .chart-grid > .chart-panel > .po-inline-list { min-height: max(260px, calc(50vh - 110px)); }
+    body[data-dtab="order"] .chart-grid > .chart-panel > .alert-list,
+    body[data-dtab="fav"] .chart-grid > .chart-panel > .alert-list { min-height: max(310px, calc(56vh - 110px)); }
+    body[data-dtab="price"] .spec-list, body[data-dtab="fav"] .spec-list { max-height: max(310px, calc(62vh - 150px)); }
+  }
+  /* ② 패널 머리: 칸이 좁으면 오른쪽 버튼·건수가 다음 줄로 (제목·부제목과 겹치거나 버튼 글자가 두 줄로 눌리던 것 — 매출 집중도 등) */
+  .chart-head { flex-wrap: wrap; column-gap: 8px; row-gap: 6px; }
+  .vk-chip { white-space: nowrap; }
+  /* ③ 발주·입고 추이: 옆 패널(월 매출)이 더 길면 아래가 비던 것 → 차트가 패널 높이를 채움 */
+  .chart-panel.prod-panel { display: flex; flex-direction: column; }
+  .chart-panel.prod-panel > .prod-chart-wrap { flex: 1 1 auto; min-height: 240px; }
+  /* ④ 폰: 단가 계산기 재질 목록·유사 제품을 위아래로 (좁은 두 칸에서 단가가 칸 밖으로 밀리던 것) */
+  @media (max-width: 900px) { .pcalc-cols { grid-template-columns: 1fr !important; } }
+  .dash-tabs { position:sticky; top:var(--hdr-h, 0px); z-index:45; display:flex; align-items:center; gap:4px;
+    margin:12px var(--pg-r) 0 var(--pg); padding:5px; background:rgba(255,255,255,.94); backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px);
+    border:1px solid #e6e9f0; border-radius:12px; box-shadow:0 4px 14px -6px rgba(15,23,42,.12); overflow-x:auto; scrollbar-width:none; }
+  .dash-tabs::-webkit-scrollbar { display:none; }
+  .dash-tabs button { flex:0 0 auto; display:inline-flex; align-items:center; gap:6px; padding:7px 14px; border:0; border-radius:8px;
+    background:transparent; color:#475569; font:inherit; font-size:13px; font-weight:700; cursor:pointer; white-space:nowrap; transition:background .12s, color .12s; }
+  .dash-tabs button:hover { background:#f1f5f9; color:#0f172a; }
+  .dash-tabs button.on { background:#4f46e5; color:#fff; box-shadow:0 2px 8px rgba(79,70,229,.30); }
+  .dash-tabs .dt-n { min-width:18px; padding:1px 6px; border-radius:9px; background:#fef3c7; color:#b45309; font-size:10.5px; font-weight:800; text-align:center; }
+  .dash-tabs .dt-n:empty { display:none; }
+  .dash-tabs button.on .dt-n { background:rgba(255,255,255,.22); color:#fff; }
+  .dash-tabs .dt-sep { flex:0 0 auto; width:1px; height:20px; margin:0 4px; background:#e2e8f0; }
+  .dash-tabs .dt-all { margin-left:auto; color:#64748b; }
+  .fav-empty { margin:12px var(--pg-r) 0 var(--pg); padding:28px 16px; text-align:center; color:#64748b; font-size:13px;
+    background:#fff; border:1px dashed #cbd5e1; border-radius:12px; }
+  .fav-empty b { color:#f59e0b; }
+  .pnl-fav { border:0; background:none; padding:0 5px 0 0; margin:0; cursor:pointer; font-size:14px; line-height:1; color:#cbd5e1; vertical-align:-1px; }
+  .pnl-fav:hover { color:#f59e0b; }
+  .pnl-fav.on { color:#f59e0b; }
+  @media (max-width:900px) {
+    .dash-tabs { margin:10px 12px 0; }
+    .dash-tabs button { padding:6px 11px; font-size:12px; }
+    .fav-empty { margin:10px 12px 0; }
+  }
 
   /* ── 회송 원가 역산 ── */
   .return-strip { max-width: none; margin: 12px auto 0; padding: 0 var(--pg-r) 0 var(--pg); }
@@ -13984,6 +14342,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .ipsu-block .ib-t { font-size: 11px; font-weight: 700; color: #7c3aed; margin-bottom: 6px; }
   .ipsu-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end; }
   .ipsu-fld { display: flex; flex-direction: column; gap: 3px; }
+  /* 중량 기준 입수 예상 줄 (2026-11-05) */
+  .ipsu-est { margin-top: 8px; padding: 7px 10px; background: #f0f9ff; border-left: 3px solid #0ea5e9; border-radius: 6px; font-size: 11.5px; line-height: 1.55; color: #0f172a; }
+  .ipsu-est .ie-sub { color: #64748b; }
+  .ipsu-est button { margin-left: 6px; padding: 2px 8px; font-size: 11px; border: 1px solid #0369a1; border-radius: 6px; background: #fff; color: #0369a1; cursor: pointer; font-weight: 600; }
   .ipsu-fld label { font-size: 10px; color: var(--text-3); font-weight: 600; }
   .ipsu-num { width: 54px; padding: 5px 4px; font-size: 11.5px; border: 1px solid var(--border-2);
               border-radius: 6px; text-align: center; font-variant-numeric: tabular-nums; outline: none; }
@@ -14001,6 +14363,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .ipsu-sug .sg-c { font-weight: 700; color: #6d28d9; margin-right: 5px; }
   .ipsu-sug .sg-s { color: var(--text-3); font-size: 10px; }
   .ipsu-stages { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+  /* 3D 캔버스(예전 폭 그대로)가 칸 최소폭이 되어 폰에서 화면 밖으로 233px 밀던 것 → 칸은 캔버스와 무관하게 줄고, 캔버스가 칸을 따라감 (2026-11-06) */
+  .ipsu-stages > * { min-width: 0; }
   .ipsu-cv { width: 100%; height: 260px; background: #0f172a; border-radius: 9px;
              overflow: hidden; position: relative; cursor: grab; }
   .ipsu-cv:active { cursor: grabbing; }
@@ -14074,7 +14438,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .chart-panel.lens-shift { border-top: 3px solid #db2777; }
   .chart-panel.lens-dormant { border-top: 3px solid #a16207; grid-column: span 2; }
   .dorm-mats { font-size: 10.5px; color: var(--text-2); margin-top: 3px; line-height: 1.55; }
-  .dorm-mats .m { display: inline-block; margin-right: 8px; white-space: nowrap; }
+  .dorm-mats .m { display: inline-block; margin-right: 8px; white-space: nowrap; max-width: 100%; vertical-align: top; }
+  @media (max-width: 900px) { .dorm-mats .m { white-space: normal; word-break: keep-all; overflow-wrap: anywhere; } }   /* 폰에서 자재 한 줄이 칸 밖으로 밀리던 것 (2026-11-06) */
   .dorm-mats .m b { color: #92400e; }
   .dorm-mats .warn { color: #b45309; font-weight: 600; }
   .chart-panel.lens-gaps { border-top: 3px solid #b91c1c; }
@@ -14114,6 +14479,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .sb-forecast { font-size: 11.5px; color: #1f5f55; background: #eef8f6; border: 1px solid #cfe9e3; border-radius: 8px; padding: 6px 10px; margin: -2px 0 8px; line-height: 1.5; }
   .sb-forecast b { color: #0f766e; }
   @media (max-width: 900px) { .lens-strip { grid-template-columns: 1fr; padding: 0 12px; } .chart-panel.lens-dormant { grid-column: auto; } }
+  /* 901~1199px(작은 노트북)에선 3칸이면 매출 집중도가 240px로 찌그러져 숫자가 칸 밖으로 → 2칸 (2026-11-06 전수 점검) */
+  @media (min-width: 901px) and (max-width: 1199px) { .lens-strip { grid-template-columns: 1fr 1fr; } }
   .chart-panel.salesbase-panel { border-top: 3px solid #3f9e8f; }
   .salesbase-body { display: grid; grid-template-columns: 1fr 1.7fr; gap: 16px; align-items: start; }
   .salesbase-chart-wrap { height: 460px; position: relative; min-width: 0; }
@@ -14125,6 +14492,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .sales-npd-strip .salesbase-chart-wrap { height: 400px; }
   .sales-npd-strip .sb-top-list { max-height: 330px; }
   .sales-npd-strip .prod-chart-wrap { height: 360px; }
+  /* 매출·분석 탭처럼 패널이 한 줄을 다 쓰면 도표도 넓게 (2026-11-09) — 화면 폭이 아니라 패널 폭 기준 */
+  .chart-panel.salesbase-panel { container-type: inline-size; }
+  @container (min-width: 1100px) { .sales-npd-strip .salesbase-body { grid-template-columns: 1.2fr 1fr; } }
   .salesbase-side { display: flex; flex-direction: column; min-width: 0; }
   .sb-side-title { font-size: 11px; font-weight: 700; color: var(--text-2); margin-bottom: 6px; }
   .sb-top-list { flex: 1; overflow-y: auto; max-height: 460px; margin: 0 -2px; }
@@ -14158,7 +14528,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .sb-cls.jasa  { background:#ebeef9; color:#45589f; }
   .sb-cls.sagup { background:#f7efda; color:#927029; }
   .sb-cls.saip  { background:#e4f1ed; color:#2f8576; }
-  @media (max-width: 900px) { .salesbase-body { grid-template-columns: 1fr; } }
+  /* 모바일은 도표 위·TOP10 아래 한 줄씩 — '.sales-npd-strip .salesbase-body'(두 칸)가 우선순위가 높아 폰에서 TOP10 품번이 세로 글자로 눌리던 것 (2026-11-06) */
+  @media (max-width: 900px) { .salesbase-body, .sales-npd-strip .salesbase-body { grid-template-columns: 1fr; } }
   .chart-nav { display: inline-flex; gap: 3px; }
   .chart-nav button {
     width: 24px; height: 24px; border: 1px solid var(--border-2);
@@ -14195,7 +14566,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .spec-list::-webkit-scrollbar { width: 6px; }
   .spec-list::-webkit-scrollbar-thumb { background: rgba(15,23,42,0.12); border-radius: 6px; }
   .spec-row {
-    display: grid; grid-template-columns: 70px 1.4fr 60px 132px 1.1fr 34px 28px 76px 76px 92px;
+    display: grid; grid-template-columns: 70px minmax(150px,1.4fr) 60px minmax(132px,0.75fr) minmax(150px,1.1fr) 34px 28px 76px 76px minmax(92px,0.55fr);
     align-items: center; gap: 8px;
     padding: 6px 8px; border-radius: 6px;
     font-size: 11px; line-height: 1.3;
@@ -14232,7 +14603,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .spec-row .sc-check { display: flex; align-items: center; justify-content: center; }
   .spec-row .sc-check input[type=checkbox] { width: 14px; height: 14px; cursor: pointer; accent-color: #6366f1; }
   .spec-head {
-    display: grid; grid-template-columns: 70px 1.4fr 60px 132px 1.1fr 34px 28px 76px 76px 92px;
+    display: grid; grid-template-columns: 70px minmax(150px,1.4fr) 60px minmax(132px,0.75fr) minmax(150px,1.1fr) 34px 28px 76px 76px minmax(92px,0.55fr);
     gap: 8px; padding: 4px 8px;
     font-size: 10px; font-weight: 700; color: var(--text-3);
     border-bottom: 1px solid var(--border); margin-bottom: 4px;
@@ -14243,6 +14614,38 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .spec-head .h-moq, .spec-head .h-price { text-align: right; }
   .spec-head .h-check { text-align: center; color: #6366f1; font-size: 12px; cursor: default; }
   .spec-head .h-design { text-align: center; }
+  /* 규격 표는 화면 폭이 아니라 표 칸 실제 폭 기준(탭마다 패널 폭이 다름) — 좁으면 칸 최소폭·간격을 줄이고, 더 좁으면 카드형
+     (2026-11-06 전수 점검: 1024px에서 19px, 800~900px에서 140~240px 옆으로 밀리던 것. 카드형은 원래 폰 전용이었음) */
+  .spec-list { container-type: inline-size; }
+  @container (max-width: 979px) {
+    .spec-row, .spec-head { grid-template-columns: 62px minmax(110px,1.4fr) 54px minmax(96px,0.75fr) minmax(104px,1.1fr) 30px 26px 66px 64px minmax(72px,0.55fr); gap: 6px; }
+  }
+  @container (max-width: 779px) {
+    .spec-head { display: none; }
+    .spec-row {
+      grid-template-columns: 1fr auto auto;
+      grid-template-areas:
+        "code code price"
+        "name name name"
+        "div design check"
+        "size size size"
+        "mat mat mat"
+        "vendor vendor moq";
+      gap: 4px 8px; padding: 10px 12px;
+      font-size: 11.5px;
+    }
+    .spec-row .sc-check  { grid-area: check; display: flex; align-items: center; justify-content: flex-end; }
+    .spec-row .sc-design { grid-area: design; }
+    .spec-row .sc-code   { grid-area: code; }
+    .spec-row .sc-name   { grid-area: name; white-space: normal; }
+    .spec-row .sc-div    { grid-area: div; justify-self: start; }
+    .spec-row .sc-size   { grid-area: size; }
+    .spec-row .sc-mat    { grid-area: mat; white-space: normal; font-size: 11px; }
+    .spec-row .sc-moq    { grid-area: moq; text-align: right; }
+    .spec-row .sc-price  { grid-area: price; text-align: right; }
+    .spec-row .sc-vendor { grid-area: vendor; justify-self: start; }
+    .spec-row + .spec-row { border-top: 1px solid rgba(15,23,42,0.08); }
+  }
   /* 시안 아이콘 (2026-10-28) — Monday '시안' 파일 칸, 클릭하면 시안 보기 창 */
   .spec-row .sc-design { display: flex; align-items: center; justify-content: center; color: #cbd5e1; }
   .sc-design-btn {
@@ -14252,8 +14655,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   }
   .sc-design-btn:hover { background: #ede9fe; transform: scale(1.08); }  .sc-design-btn svg { width: 13px; height: 13px; }
   .sc-design-btn .n {
-    position: absolute; top: -5px; right: -6px; min-width: 13px; height: 13px; padding: 0 3px;
-    border-radius: 7px; background: #7c3aed; color: #fff; font-size: 9px; font-weight: 700; line-height: 13px;
+    position: absolute; top: -6px; right: -7px; min-width: 14px; height: 14px; padding: 0 3px;
+    border-radius: 7px; background: #7c3aed; color: #fff; font-size: 10px; font-weight: 700; line-height: 14px;
   }
   /* 시안 보기 창 */
   /* 화면을 꽉 채워서 봄 (2026-10-29 사용자 "꽉 차게 보는 게 훨씬 좋아") */
@@ -14476,7 +14879,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .po-inline-list::-webkit-scrollbar { width: 6px; }
   .po-inline-list::-webkit-scrollbar-thumb { background: rgba(15,23,42,0.12); border-radius: 6px; }
   .po-inline-row {
-    display: grid; grid-template-columns: 70px 1fr auto auto auto auto;
+    display: grid; grid-template-columns: 84px 1fr auto auto auto auto;   /* 첫 칸 70→84: 수입 원료는 공급사명('어스플레이랜드')이 들어가 두 줄로 쪼개지던 것 (2026-11-06) */
     align-items: center; gap: 8px;
     padding: 7px 8px; border-radius: 7px;
     cursor: pointer; font-size: 11.5px;
@@ -14501,6 +14904,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     font-variant-numeric: tabular-nums; white-space: nowrap;
     max-width: 110px; overflow: hidden; text-overflow: ellipsis;
   }
+  /* 넓은 화면은 수량 칩을 더 보여줌 ('648박스(10,368번들)' 등이 잘리던 것) · 품명 칸은 줄어들 수 있게(긴 품명이 행을 밀어 가로 스크롤 생기던 것) */
+  @media (min-width: 1101px) { .po-inline-qty { max-width: 160px; } }
+  @media (min-width: 1600px) { .po-inline-qty { max-width: 200px; } }
+  .po-inline-row > * { min-width: 0; }
   .po-inline-dest {
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
     font-size: 10.5px; font-weight: 600;
@@ -14513,10 +14920,22 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .po-inline-dest.expanded { -webkit-line-clamp: unset; }
   /* 칩 묶음: PC에선 display:contents라 기존 그리드 칸 그대로, 모바일에선 2번째 줄 가로 묶음 */
   .po-inline-extra { display: contents; }
+  /* 원/부자재·외주 입고 목록: 목록 칸이 좁으면(작은 노트북·탭 배치) 폰처럼 2줄 — 1줄 품번·품명·날짜, 2줄 수량·거래처 칩
+     (2026-11-06 전수 점검: 1100~1440px에서 칩들이 자리를 차지해 품명이 앞 몇 글자만 보이던 것) */
+  .po-inline-list { container-type: inline-size; }
+  @container (max-width: 640px) {
+    .po-inline-row { grid-template-columns: 84px minmax(0, 1fr) auto; row-gap: 3px; }
+    .po-inline-row > :first-child { grid-column: 1; grid-row: 1; }
+    .po-inline-row > :nth-child(2) { grid-column: 2; grid-row: 1; }
+    .po-inline-row > :last-child { grid-column: 3; grid-row: 1; justify-self: end; }
+    .po-inline-row > .po-inline-extra { grid-column: 2 / -1; grid-row: 2; display: flex; flex-wrap: wrap; gap: 4px; align-items: center; min-width: 0; }
+    .po-inline-extra > span:empty { display: none; }
+    .po-inline-extra .po-inline-dest { max-width: 100%; }
+  }
   .nav-links .nav-menu-btn { display: none; }   /* .nav-refresh-btn의 display보다 우선 (모바일에서만 !important로 보임) */
   .po-inline-row + .po-inline-row { border-top: 1px dashed rgba(15,23,42,0.06); }
   .po-inline-row:hover { background: var(--surface-2); }
-  .po-inline-code { font-weight: 700; color: #059669; font-size: 11px; letter-spacing: -0.01em; }
+  .po-inline-code { font-weight: 700; color: #059669; font-size: 11px; letter-spacing: -0.01em; word-break: keep-all; overflow-wrap: anywhere; }
   .po-inline-row.raw .po-inline-code { color: #7c3aed; }
   .po-inline-row.raw .po-inline-chip { background: #7c3aed; }
   .po-inline-row.import-raw .po-inline-code { color: #0369a1; }
@@ -14630,7 +15049,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     .chart-panel.vendor-panel { grid-column: span 30; }
   }
   @media (max-width: 980px) {
-    .chart-grid { grid-template-columns: 1fr; padding: 0 16px; }
+    .chart-grid { grid-template-columns: 1fr; }
     .chart-panel.po-inline, .chart-panel.os-inline, .chart-panel.pcalc-panel, .chart-panel.alert-span, .chart-panel.price-span, .chart-panel.plan-panel, .chart-panel.chstock-panel, .chart-panel.vendor-panel { grid-column: auto; }
   }
 
@@ -15312,32 +15731,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     .alert-row { grid-template-columns: 56px 1fr auto auto; gap: 6px; padding: 7px 8px; font-size: 11px; }
     .alert-list { max-height: 240px; }
 
-    /* ───── 부자재 규격 → 카드 형태 ───── */
-    .spec-head { display: none; }
-    .spec-row {
-      grid-template-columns: 1fr auto auto;
-      grid-template-areas:
-        "code code price"
-        "name name name"
-        "div design check"
-        "size size size"
-        "mat mat mat"
-        "vendor vendor moq";
-      gap: 4px 8px; padding: 10px 12px;
-      font-size: 11.5px;
-    }
-    .spec-row .sc-check  { grid-area: check; display: flex; align-items: center; justify-content: flex-end; }
-    .spec-row .sc-design { grid-area: design; }
+    /* ───── 부자재 규격 → 카드 형태: 표 칸 폭 기준 @container 규칙으로 옮김 (2026-11-06) ───── */
     #design-modal .dsg-modal { height: calc(100vh - 16px); }
-    .spec-row .sc-code   { grid-area: code; }
-    .spec-row .sc-name   { grid-area: name; white-space: normal; }
-    .spec-row .sc-div    { grid-area: div; justify-self: start; }
-    .spec-row .sc-size   { grid-area: size; }
-    .spec-row .sc-mat    { grid-area: mat; white-space: normal; font-size: 11px; }
-    .spec-row .sc-moq    { grid-area: moq; text-align: right; }
-    .spec-row .sc-price  { grid-area: price; text-align: right; }
-    .spec-row .sc-vendor { grid-area: vendor; justify-self: start; }
-    .spec-row + .spec-row { border-top: 1px solid rgba(15,23,42,0.08); }
     .spec-list { max-height: 360px; }
     .spec-strip { padding: 0 12px; }
     .ipsu-strip { padding: 0 12px; }
@@ -15353,8 +15748,22 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     .po-inline-search { padding: 8px 12px; font-size: 12px; }
 
     /* ───── 모달 ───── */
-    .modal { max-width: 100vw !important; margin: 8px; max-height: calc(100vh - 16px); }
+    /* 창 바깥 여백 24px+8px → 8px: 폰에서 상세 창이 296px로 좁아 표가 옆으로 밀리던 것 (2026-11-06 전수 점검) */
+    .modal-overlay { padding: 8px; }
+    .modal { max-width: 100vw !important; margin: 0; max-height: calc(100vh - 16px); }
     .modal-body { --mbp: 12px; padding: var(--mbp) 14px; }
+    /* 발주 완료·외주 입고 일정 창 표 → 카드: 윗줄 품번·품명·수량, 아랫줄 날짜·업체·입고처, 맨 아래 입고 일정
+       (폰에서 품명이 한두 글자씩 세로로 쪼개지고 오른쪽 칸이 잘리던 것) */
+    .po-row, .po-row.os-modal-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; padding: 10px 12px; }
+    .po-row.head, .po-row.head.os-modal-row { display: none; }   /* 위 flex 규칙보다 뒤·더 구체적으로 (외주 창 머리줄은 클래스가 둘) */
+    .po-row::before { content: ''; order: 1; flex-basis: 100%; height: 0; }
+    .po-row > .po-name { flex: 1 1 0; min-width: 0; }
+    .po-row > :nth-child(n+4) { order: 2; font-size: 11px; color: var(--text-2); }
+    .po-row > .po-date::before { content: '발주요청 '; color: var(--text-3); }
+    .po-row.os-modal-row > .po-date::before { content: '입고요청 '; }
+    .po-row > :nth-child(6)::before { content: '→ '; color: var(--text-3); }
+    .po-row > .po-date:empty, .po-row > :nth-child(6):empty { display: none; }
+    .po-row > .po-schedule { order: 3; flex: 1 1 100%; }
 
     /* ───── 입고 캘린더 (모바일) ───── */
     .chart-head > div:first-child { flex-wrap: wrap; gap: 6px 8px !important; }
@@ -15462,6 +15871,18 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   <div class="kpi-tile" data-go=".price-span" id="kpi-price"><div class="kpi-ic">📈</div><div class="kpi-body"><div class="kpi-v">–</div><div class="kpi-l">단가 변동</div><div class="kpi-s"></div></div></div>
   <div class="kpi-tile" data-go="health" id="kpi-health"><div class="kpi-ic">🩺</div><div class="kpi-body"><div class="kpi-v">–</div><div class="kpi-l">데이터 상태</div><div class="kpi-s"></div></div></div>
 </section>
+
+<!-- 업무별 탭 (2026-11-05, 사용자 "패널이 많아서 보기가 어려움" → 탭 + ☆ 즐겨찾기). 패널 자리는 그대로, 고른 탭에 든 것만 보임 -->
+<nav class="dash-tabs" id="dash-tabs" aria-label="업무별 보기">
+  <button type="button" data-tab="fav" title="패널 제목 앞 ☆를 누른 패널만 모아 보기">⭐ 즐겨찾기<span class="dt-n" id="dt-fav-n"></span></button>
+  <span class="dt-sep"></span>
+  <button type="button" data-tab="order" title="예상입고일·외주 입고·발주 타이밍·수급 플래너·거래처 스코어·발주입고 추이·달력">🚚 발주·입고</button>
+  <button type="button" data-tab="stock" title="자사·외주 재고 경고·채널 품절 경보">📦 재고</button>
+  <button type="button" data-tab="price" title="단가 변동·예상 단가 계산기·부자재 규격·회송 원가 역산·입수 테스트(3D)">💰 단가·규격·입수</button>
+  <button type="button" data-tab="sales" title="월 매출·판매 추이·발주입고 추이·판매 분석 7개">📈 매출·분석</button>
+  <button type="button" data-tab="all" class="dt-all" title="모든 패널을 한 화면에 (예전 보기)">☰ 전체</button>
+</nav>
+<div class="fav-empty tab-hide" id="fav-empty">아직 즐겨찾기한 패널이 없어요. 다른 탭에서 패널 제목 앞 <b>☆</b>를 누르면 여기에 모여요.</div>
 
 <!-- 섹션 점프 내비 (우측 고정) -->
 <nav class="sec-nav" id="sec-nav" aria-label="섹션 이동">
@@ -15604,7 +16025,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       <button onclick="resetPriceCalc()" style="padding:6px 10px;font-size:11px;border:1px solid var(--border-2);border-radius:6px;background:white;cursor:pointer;color:var(--text-2)">초기화</button>
     </div>
     <div id="pcalc-selected-bar" class="pcalc-selected-bar"></div>
-    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:8px">
+    <div class="pcalc-cols" style="display:grid;grid-template-columns:1.4fr 1fr;gap:8px">
       <div id="pcalc-list" style="height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:4px"></div>
       <div id="pcalc-similar" style="height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:4px"></div>
     </div>
@@ -15758,6 +16179,13 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
           <input id="ipsu-comp" class="ipsu-num" type="number" value="0" min="0" max="80" step="5" oninput="ipsuCalc()"></div>
         <div class="ipsu-fld"><label title="실제 박스당 최대입수를 넣으면 파우치 두께를 자동 역산해 맞춥니다">실측 최대입수(두께보정)</label>
           <input id="ipsu-realmax" class="ipsu-num" type="number" placeholder="선택" min="1" oninput="ipsuCalibThickness()"></div>
+        <div class="ipsu-fld"><label title="1차 파우치 1개에 든 내용물 중량(g) — 완제품·1차 파우치를 고르면 품명에서 자동. 넣으면 실제 제품들의 박스 1L당 담기는 중량으로 입수를 예상">1차 중량(g)</label>
+          <input id="ipsu-wt" class="ipsu-num" type="number" placeholder="예: 80" min="0" oninput="ipsuCalc()"></div>
+        <div class="ipsu-fld"><label title="제품군마다 박스에 담기는 밀도가 다름 (오트밀·누룽지는 촘촘, 스틱·스낵은 성김)">제품군</label>
+          <select id="ipsu-fam" onchange="ipsuCalc()">
+            <option value="auto">자동</option><option>말랭이</option><option>스틱·바</option><option>누룽지</option>
+            <option>오트밀</option><option>칩·스낵</option><option>기타</option>
+          </select></div>
         <div style="width:1px;background:#ddd6fe;align-self:stretch;margin:0 3px"></div>
         <div class="ipsu-fld"><label>입력 방식</label>
           <select id="ipsu-mode" onchange="ipsuOnMode()">
@@ -15825,6 +16253,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
             border-radius:6px;background:#fff;color:#0369a1;cursor:pointer;font-weight:600;white-space:nowrap"
             title="실측 입수와 계산치를 비교해 실제 눌림(압축)률 역산">🎯 실측 캘리브레이션</button></div>
       </div>
+      <div id="ipsu-est" class="ipsu-est" style="display:none"></div>
       <div id="ipsu-reco" style="display:none;margin-top:8px;padding:8px 10px;background:#fff;
         border:1px solid var(--border-2);border-radius:8px;font-size:11px"></div>
     </div>
@@ -15839,6 +16268,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
             <input id="ipsu-pld" class="ipsu-num" type="number" value="1100" oninput="ipsuCalc()">
           </div></div>
         <div class="ipsu-fld"><label>최대 적재높이</label><input id="ipsu-plh" class="ipsu-num" type="number" value="1700" oninput="ipsuCalc()"></div>
+        <div class="ipsu-fld"><label title="영업 거래처 요청 등으로 팔레트당 박스 수가 정해진 제품 — 완제품을 고르면 Monday PT적재량을 자동으로 넣음. 비우면 원칙(최대 적재높이) 기준 최대치">지정 적재량(박스)</label>
+          <input id="ipsu-pltq" class="ipsu-num" type="number" min="1" placeholder="비우면 원칙" oninput="ipsuCalc()"></div>
         <div class="ipsu-fld"><label title="③ 외박스 외치수와 자동 연동됩니다">외박스 외치수 W×D×H <span style="color:#0369a1">(③ 자동연동)</span></label>
           <div style="display:flex;gap:3px">
             <input id="ipsu-bow" class="ipsu-num" type="number" value="530" style="background:#f0f9ff" oninput="ipsuCalc()">
@@ -20657,9 +21088,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   })();
   // 고정 헤더에 가리지 않도록 헤더 높이 + 여백만큼 위로 띄워 스크롤 (KPI 클릭·섹션 내비 공용)
   function scrollToPanel(el, highlight) {
-    const hdr = document.querySelector('header');
-    const pos = hdr ? getComputedStyle(hdr).position : '';
-    const off = ((pos === 'sticky' || pos === 'fixed') ? hdr.offsetHeight : 0) + 16;
+    tabReveal(el);   // 다른 탭에 있는 패널이면 그 탭으로 먼저 바꿈 (2026-11-05)
+    const tabs = document.getElementById('dash-tabs');
+    const off = _hdrH() + (tabs && !tabs.classList.contains('tab-hide') ? tabs.offsetHeight + 8 : 0) + 16;   // 고정 머리 + 탭 줄에 가리지 않게
     window.scrollTo({ top: el.getBoundingClientRect().top + window.scrollY - off, behavior: 'smooth' });
     if (highlight) { el.style.boxShadow = '0 0 0 3px #4f46e5'; setTimeout(() => el.style.boxShadow = '', 1600); }
   }
@@ -20819,6 +21250,150 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   }
   initCollapsibles();
   initSecNav();   // 섹션 id 부여(initCollapsibles) 이후에 실행
+
+  // ───── 업무별 탭 + ☆ 즐겨찾기 (2026-11-05, 사용자 "패널이 많아서 보기가 어려움" → 추천안 '탭 + 즐겨찾기') ─────
+  // 패널 자리(DOM)는 그대로 두고 고른 탭에 든 것만 보이게(.tab-hide). 한 패널이 여러 탭에 들어갈 수 있음:
+  // 부자재 규격은 단가·원가에도(규격 ↑ → 계산기 연동이라 계산기 바로 아래 있어야 함), 발주·입고 추이는 발주·입고와 매출·분석 둘 다.
+  // 고른 탭·즐겨찾기는 이 브라우저에만 기억(localStorage mhDashTab·mhFavPanels). 새 패널을 만들면 아래 탭 목록에도 넣을 것.
+  const DASH_TAB_UNITS = {
+    order: ['.po-inline', '.os-inline', '.reorder-panel', '.plan-panel', '.vendor-panel', '.prod-panel', 'section.cal-strip'],
+    stock: ['.scope-jasa', '.scope-outsource', '.chstock-panel'],
+    // 단가·원가 + 규격·입수 한 탭으로 (2026-11-06 사용자 "이 둘을 하나로 합치자") — 규격 표 ↑가 바로 위 계산기를 채움
+    price: ['.price-span', '.pcalc-panel', '.spec-panel', '.return-panel', '.ipsu-panel'],
+    // 발주·입고 추이는 '발주·입고' 탭에만 — 중복이라 뺌, 월 매출·판매 추이가 한 줄을 다 씀 (2026-11-09 사용자 요청)
+    sales: ['.salesbase-panel', '.lens-gap', '.lens-price', '.lens-wd', '.lens-shift', '.lens-dormant', '.lens-gaps', '.lens-new', '.lens-abc'],
+  };
+  const DASH_SECS = ['.chart-grid', '.spec-strip', '.return-strip', '.ipsu-strip', '.sales-npd-strip', '.lens-strip'];
+  const DASH_UNITS = [...new Set(Object.values(DASH_TAB_UNITS).flat())];
+  let _dashTab = 'all';
+  function _unit(sel) { return sel.startsWith('section') ? document.querySelector(sel) : _pnl(sel); }
+  function _favGet() { try { const a = JSON.parse(localStorage.getItem('mhFavPanels') || '[]'); return Array.isArray(a) ? a : []; } catch (e) { return []; } }
+  function _favSet(a) { try { localStorage.setItem('mhFavPanels', JSON.stringify(a)); } catch (e) {} }
+  function _hdrH() {
+    const h = document.querySelector('header'); const pos = h ? getComputedStyle(h).position : '';
+    return (pos === 'sticky' || pos === 'fixed') ? h.offsetHeight : 0;
+  }
+  function initDashTabs() {
+    const bar = document.getElementById('dash-tabs'); if (!bar) return;
+    bar.querySelectorAll('button[data-tab]').forEach(b => b.addEventListener('click', () => dashTab(b.dataset.tab)));
+    // 패널 제목 앞 ☆ — 누르면 즐겨찾기. 닫힌 패널을 여는 클릭과 겹치지 않게 전파를 막음
+    DASH_UNITS.filter(s => !s.startsWith('section')).forEach(sel => {
+      const p = _pnl(sel), t = p && p.querySelector('.chart-title'); if (!t) return;
+      const b = document.createElement('button'); b.type = 'button'; b.className = 'pnl-fav'; b.dataset.sel = sel;
+      b.title = '즐겨찾기 — ⭐ 탭에 모아 보기';
+      b.addEventListener('click', e => { e.stopPropagation(); favToggle(sel); });
+      t.parentNode.insertBefore(b, t);
+    });
+    favPaint();
+    // 탭 줄은 고정 머리 바로 아래에 붙음 — 머리 높이(모바일 메뉴 펼침 등으로 바뀜)를 CSS 변수로
+    const setH = () => document.documentElement.style.setProperty('--hdr-h', _hdrH() + 'px');
+    setH();
+    const hdr = document.querySelector('header');
+    if (hdr && window.ResizeObserver) new ResizeObserver(setH).observe(hdr); else window.addEventListener('resize', setH);
+    let saved = ''; try { saved = localStorage.getItem('mhDashTab') || ''; } catch (e) {}
+    dashTab(saved || (_favGet().length ? 'fav' : 'order'), { noScroll: true });
+    let rt = null;
+    window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(dashPackAll, 120); });
+  }
+  function dashTab(t, opt) {
+    opt = opt || {};
+    if (t === 'spec') t = 'price';   // 옛 '규격·입수' 탭을 기억한 브라우저 → 합친 탭으로
+    if (t !== 'fav' && t !== 'all' && !DASH_TAB_UNITS[t]) t = 'order';
+    _dashTab = t;
+    document.body.dataset.dtab = t;   // 탭별 CSS(목록 칸 높이 등)
+    try { localStorage.setItem('mhDashTab', t); } catch (e) {}
+    document.querySelectorAll('#dash-tabs button[data-tab]').forEach(b => {
+      const on = b.dataset.tab === t; b.classList.toggle('on', on); b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+    const fav = _favGet();
+    DASH_UNITS.forEach(sel => {
+      const el = _unit(sel); if (!el) return;
+      const show = t === 'all' || (t === 'fav' ? fav.includes(sel) : DASH_TAB_UNITS[t].includes(sel));
+      el.classList.toggle('tab-hide', !show);
+    });
+    // 보이는 패널이 하나도 없는 묶음(섹션)은 통째로 숨김 — 빈 여백이 남지 않게
+    DASH_SECS.forEach(s => {
+      const sec = document.querySelector('section' + s); if (!sec) return;
+      const any = [...sec.children].some(c => c.classList.contains('chart-panel') && !c.classList.contains('tab-hide'));
+      sec.classList.toggle('tab-hide', !any);
+    });
+    document.getElementById('fav-empty').classList.toggle('tab-hide', !(t === 'fav' && !fav.some(s => _unit(s))));
+    const nav = document.getElementById('sec-nav'); if (nav) nav.classList.toggle('tab-hide', t !== 'all');   // 섹션 점프 내비는 전체 보기에서만
+    dashPackAll();
+    // 탭에서는 그 탭 패널을 바로 엶 — 탭마다 패널이 몇 개뿐이라 한꺼번에 받아도 가벼움 (2026-11-06 사용자 "모든 패널의 기본은 보기 편해야").
+    // 전체 보기는 예전처럼 클릭해서 열기(패널 20여 개를 한 번에 받으면 느려서)
+    if (t !== 'all') DASH_UNITS.forEach(sel => {
+      if (sel.startsWith('section')) return;
+      const p = _pnl(sel); if (p && p.classList.contains('p-closed') && !p.classList.contains('tab-hide')) panelOpen(p);
+    });
+    pnlHintPos();
+    window.dispatchEvent(new Event('resize'));   // 숨어 있던 차트·3D 뷰어가 제 크기를 다시 잼
+    // 칸 폭이 바뀐 차트를 새 폭으로 다시 그림 — 바로 한 번(레이아웃은 위에서 이미 계산됨) + 다음 프레임에 한 번 더.
+    // ⚠️ 2026-11-06 사고(발주·입고 추이 막대가 왼쪽 위 구석에 작게 굳음): 예전엔 숨은 차트까지 resize해 0 크기로 줄였고,
+    //    다시 보일 때 0→원래 크기로 커지는 애니메이션을 다음 프레임의 stop()이 중간에 끊어 그 모양 그대로 남았음.
+    //    → 숨은(칸 크기 0) 차트는 건드리지 않고, 멈춘 뒤엔 반드시 update('none')로 최종 모양을 바로 그림.
+    const fitCharts = () => {
+      if (!(window.Chart && Chart.instances)) return;
+      Object.values(Chart.instances).forEach(c => {
+        try {
+          const box = c.canvas && c.canvas.parentNode;
+          if (!box || !box.clientWidth || !box.clientHeight) return;
+          c.resize(); c.stop(); c.update('none');
+        } catch (e) {}
+      });
+    };
+    fitCharts(); requestAnimationFrame(fitCharts);
+    if (!opt.noScroll) {   // 아래로 내려가 있었으면 탭 내용 처음으로 (탭 줄이 머리 바로 아래)
+      const kpi = document.getElementById('kpi-strip');
+      const top = kpi ? kpi.offsetTop + kpi.offsetHeight - _hdrH() : 0;
+      if (window.scrollY > top) window.scrollTo({ top: Math.max(0, top) });
+    }
+  }
+  // 탭에서 일부 패널만 보이면 줄마다 빈 칸이 생김 → 보이는 패널끼리 원래 폭 비율대로 한 줄을 꽉 채움 (전체 보기는 원래 배치)
+  function dashPackAll() {
+    DASH_SECS.forEach(s => { const sec = document.querySelector('section' + s); if (sec && !sec.classList.contains('tab-hide')) dashPack(sec); });
+  }
+  function dashPack(sec) {
+    const kids = [...sec.children].filter(c => c.classList.contains('chart-panel'));
+    kids.forEach(c => { c.style.gridColumn = ''; });   // 원래 CSS 칸으로 되돌린 뒤 잼
+    if (_dashTab === 'all') return;
+    const cols = getComputedStyle(sec).gridTemplateColumns.split(' ').filter(Boolean).length;
+    if (cols < 2) return;   // 모바일(한 칸)은 그대로
+    const span = c => { const v = getComputedStyle(c).gridColumnStart; const n = v.indexOf('span') === 0 ? parseInt(v.slice(4), 10) : 1; return Math.min(n || 1, cols); };
+    let row = [], used = 0;
+    const flush = () => {
+      const tot = row.reduce((a, x) => a + x.s, 0);
+      if (row.length && tot < cols) {
+        let left = cols;
+        row.forEach((x, i) => { const s = i === row.length - 1 ? left : Math.max(1, Math.round(x.s * cols / tot)); x.c.style.gridColumn = 'span ' + s; left -= s; });
+      }
+      row = []; used = 0;
+    };
+    kids.filter(c => !c.classList.contains('tab-hide')).forEach(c => { const s = span(c); if (used + s > cols) flush(); row.push({ c: c, s: s }); used += s; });
+    flush();
+  }
+  function favToggle(sel) {
+    const a = _favGet(), i = a.indexOf(sel);
+    if (i >= 0) a.splice(i, 1); else a.push(sel);
+    _favSet(a); favPaint();
+    if (_dashTab === 'fav') dashTab('fav', { noScroll: true });   // 즐겨찾기 탭에서 ★를 끄면 바로 빠짐
+  }
+  function favPaint() {
+    const a = _favGet();
+    document.querySelectorAll('.pnl-fav').forEach(b => {
+      const on = a.includes(b.dataset.sel); b.classList.toggle('on', on); b.textContent = on ? '★' : '☆'; b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+    const n = document.getElementById('dt-fav-n'); if (n) n.textContent = a.length ? String(a.length) : '';
+  }
+  // 숨은 탭의 패널로 가야 하면(KPI 타일·규격 → 계산기 등) 그 패널이 든 탭으로 먼저 바꿈
+  function tabReveal(el) {
+    if (!el || _dashTab === 'all' || !el.closest('.tab-hide')) return;
+    const unit = el.closest('.chart-panel, section.cal-strip');
+    const sel = unit && DASH_UNITS.find(s => _unit(s) === unit);
+    const t = sel && Object.keys(DASH_TAB_UNITS).find(k => DASH_TAB_UNITS[k].includes(sel));
+    dashTab(t || 'all', { noScroll: true });
+  }
+  initDashTabs();
 
   // ───── 섹션 점프 내비 (스크롤 스파이) ─────
   function initSecNav() {
@@ -21407,13 +21982,26 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     document.querySelectorAll('#sb-mode .vk-chip').forEach(b => b.classList.toggle('on', b === el));
     drawSbChart();
   }
-  const SB_CHART_MONTHS = 5;   // 패널 도표는 최근 5개월만 (2026-10-23 사용자: 도표 폭 줄이고 TOP10 품명이 잘리지 않게) — 전체 기간은 [크게 보기]
+  // 패널 도표 개월 수 = 도표 폭에 맞춰 (한 달 76px, 최소 5 · 최대 12개월). 좁은 '전체' 탭은 5개월, 넓은 '매출·분석' 탭은 12개월 (2026-11-09 사용자 "패널이 길어진 만큼 개월 수 늘려") — 전체 기간은 [크게 보기]
+  let _sbShown = 0;
+  const _sbMonths = wrap => Math.max(5, Math.min(12, Math.floor(wrap.clientWidth / 76)));
   function drawSbChart() {
     if (!_sbMonthly || !_sbMonthly.length) return;
     if (_sbChart) _sbChart.destroy();
-    _sbChart = _sbMakeChart(document.getElementById('salesBaseChart'), _sbMonthly.slice(-SB_CHART_MONTHS), _sbMode === 'ch' && _sbHasAmt, false);
+    const cv = document.getElementById('salesBaseChart');
+    _sbShown = _sbMonths(cv.parentNode);
+    _sbChart = _sbMakeChart(cv, _sbMonthly.slice(-_sbShown), _sbMode === 'ch' && _sbHasAmt, false);
   }
-  // 월 매출 누적막대 차트 생성 (패널 5개월 / 크게 보기 전체 기간 공용). big = 글자 조금 크게
+  // 탭 전환·창 크기로 도표 폭이 바뀌어 개월 수가 달라질 때만 다시 그림 (숨은 동안 폭 0은 무시)
+  (function () {
+    const wrap = document.querySelector('.salesbase-chart-wrap');
+    if (!wrap || !window.ResizeObserver) return;
+    new ResizeObserver(() => {
+      if (!_sbChart || !wrap.clientWidth || _sbMonths(wrap) === _sbShown) return;
+      drawSbChart(); _sbChart.stop(); _sbChart.update('none');
+    }).observe(wrap);
+  })();
+  // 월 매출 누적막대 차트 생성 (패널 5~12개월 / 크게 보기 전체 기간 공용). big = 글자 조금 크게
   function _sbMakeChart(canvas, monthly, chMode, big) {
       // 차트: 분류별 (매출액 억 / 없으면 판매수량) 누적막대 · 채널별 모드는 상위 6채널 + 기타
       const CLS = [['자사', '#6276c5'], ['유상사급', '#dcb058'], ['상품매입', '#49aa9c']];
@@ -21603,6 +22191,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       try {
         const bd = await (await fetch('/api/ipsu_bom')).json();
         _ipsuProducts = bd.products || [];
+        _ipsuDens = null;   // 중량 기준 입수 예상 통계는 새 BOM 데이터로 다시 계산
         pn = _ipsuProducts.length;
       } catch (e) { _ipsuProducts = []; }
       document.getElementById('ipsu-stat').textContent =
@@ -21644,10 +22233,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   // 검색창을 비우면 그 칸으로 채웠던 값을 처음 화면 기본값으로 (2026-11-04 사용자 "모든 패널 검색창: 입력값 없으면 원래 보여지는대로").
   // 기본값 = HTML에 적힌 값(input.defaultValue / option.defaultSelected). 검색으로 고른 적 없으면(직접 입력만) 건드리지 않음.
   const _IPSU_FIELDS = {
-    a: ['ipsu-a-form', 'ipsu-aw', 'ipsu-ah', 'ipsu-abase', 'ipsu-at', 'ipsu-n1'],
+    a: ['ipsu-a-form', 'ipsu-aw', 'ipsu-ah', 'ipsu-abase', 'ipsu-at', 'ipsu-n1', 'ipsu-wt', 'ipsu-fam'],
     b: ['ipsu-b-form', 'ipsu-bw', 'ipsu-bh', 'ipsu-bbase', 'ipsu-bt', 'ipsu-bbw', 'ipsu-bbd', 'ipsu-bbh', 'ipsu-n1'],
     o: ['ipsu-cw', 'ipsu-cd', 'ipsu-ch'],
-    c: ['ipsu-mode', 'ipsu-n1', 'ipsu-n2'],
+    c: ['ipsu-mode', 'ipsu-n1', 'ipsu-n2', 'ipsu-pltq', 'ipsu-plh'],
   };
   const _ipsuPicked = { p: false, a: false, b: false, o: false, c: false };
   function _ipsuDefault(id) {
@@ -21665,7 +22254,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     });
     if (who === 'p') { document.getElementById('ipsu-p-sel').innerHTML = '-'; _ipsuPicked.p = false; }
     if (who === 'p' || who === 'c') _ipsuSelP = null;
-    if (blocks.includes('a')) _ipsuSelA = null;
+    if (blocks.includes('a')) { _ipsuSelA = null; ipsuSetFamAuto(''); }
     if (blocks.includes('b')) _ipsuSelB = null;
     if (blocks.includes('a')) ipsuOnForm('a');
     if (blocks.includes('b')) ipsuOnForm('b');
@@ -21678,7 +22267,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     if (!q) { box.style.display = 'none'; if (_ipsuPicked[who]) ipsuResetPick(who); return; }
     let list, html;
     if (who === 'p') {
-      list = _ipsuProducts.filter(p => (p.code + ' ' + p.name).toLowerCase().includes(q)).slice(0, 30);
+      list = _ipsuProducts.filter(p => (p.code + ' ' + p.name).toLowerCase().includes(q)).slice(0, 500);
       html = list.map(p => {
         const tag = [p.a ? '①' : '', p.b ? '②' : '', p.c ? '③' : ''].join('') || '-';
         const per = p.bomPer || p.bomN2;   // 박스당 완제품 수 (Monday 박스입수와 같은 단위)
@@ -21689,17 +22278,17 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
           `<span class="sg-s"> · ${tag}${n}</span></div>`;
       }).join('');
     } else if (who === 'o') {
-      list = _ipsuOuters.filter(s => (s.code + ' ' + s.name).toLowerCase().includes(q)).slice(0, 30);
+      list = _ipsuOuters.filter(s => (s.code + ' ' + s.name).toLowerCase().includes(q)).slice(0, 500);
       html = list.map(s => `<div onmousedown="ipsuPickOuter('${s.code}')">` +
         `<span class="sg-c">${escapeHtml(s.code)}</span>${escapeHtml(s.name.slice(0, 30))}` +
         `<span class="sg-s"> · ${escapeHtml(s.size)}</span></div>`).join('');
     } else if (who === 'c') {
-      list = _ipsuBoxes.filter(b => (b.code + ' ' + b.name).toLowerCase().includes(q)).slice(0, 30);
+      list = _ipsuBoxes.filter(b => (b.code + ' ' + b.name).toLowerCase().includes(q)).slice(0, 500);
       html = list.map(b => `<div onmousedown="ipsuPickBox('${b.code}')">` +
         `<span class="sg-c">${escapeHtml(b.code)}</span>${escapeHtml(b.name.slice(0, 34))}` +
         `<span class="sg-s"> · 박스입수 ${b.ipsu}</span></div>`).join('');
     } else {
-      list = _ipsuSpecs.filter(s => (s.code + ' ' + s.name).toLowerCase().includes(q)).slice(0, 30);
+      list = _ipsuSpecs.filter(s => (s.code + ' ' + s.name).toLowerCase().includes(q)).slice(0, 500);
       html = list.map(s => `<div onmousedown="ipsuPick('${who}','${s.code}')">` +
         `<span class="sg-c">${escapeHtml(s.code)}</span>${escapeHtml(s.name.slice(0, 34))}` +
         `<span class="sg-s"> · ${escapeHtml(s.size)}${s.ipsu ? ' · ' + s.ipsu + '입' : ''}</span></div>`).join('');
@@ -21749,6 +22338,11 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       `<b>${escapeHtml(s.code)}</b> ${escapeHtml(s.size)}${s.tier ? ' · ' + s.tier : ''}${s.ipsu ? ' · ' + s.ipsu + '입' : ''}`;
     document.getElementById('ipsu-' + who + '-q').value = s.code + ' ' + s.name.slice(0, 20);
     _ipsuPicked[who] = true;
+    if (who === 'a') {   // 1차 파우치 규격명의 내용물 중량·제품군 → 중량 기준 입수 예상 (2026-11-05)
+      const w = ipsuWeightOf(s.name, true);
+      if (w > 0) document.getElementById('ipsu-wt').value = w;
+      ipsuSetFamAuto(s.name);
+    }
     ipsuOnForm(who);
   }
   // ③ 외박스 — 규격표의 3차원 외치수를 그대로 적용 (⑤ 팔레트까지 동기화)
@@ -21814,6 +22408,11 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         p.bomN1 || (p.a && p.a.ipsu) || '';
     document.getElementById('ipsu-p-q').value = p.code + ' ' + p.name.slice(0, 22);
     _ipsuPicked.p = true;
+    // 1차 파우치 1개 중량 = 완제품 중량 ÷ 완제품당 1차 수 (예: 60g*4번들 → 240g ÷ 4) · 제품군은 완제품명 기준
+    const pw = ipsuProductWeight(p);
+    document.getElementById('ipsu-wt').value = pw > 0 ? Math.round(pw / (p.qa || 1) * 10) / 10 : '';
+    ipsuSetFamAuto(p.name);
+    document.getElementById('ipsu-pltq').value = p.pallet > 0 ? p.pallet : '';   // 지정 적재량 = Monday PT적재량(거래처 지정 포함)
     // ②는 위에서 '없음'으로 명시 처리했으므로 누락 경고에서 제외
     const miss = [!p.a && '①', !p.c && '③'].filter(Boolean);
     document.getElementById('ipsu-p-sel').innerHTML =
@@ -21827,6 +22426,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     document.getElementById('ipsu-n2').value = b.ipsu;
     if (ipsuIsGrid()) { document.getElementById('ipsu-mode').value = 'count'; ipsuOnMode(); }
     document.getElementById('ipsu-c-q').value = b.code + ' (박스입수 ' + b.ipsu + ')';
+    document.getElementById('ipsu-pltq').value = b.pallet > 0 ? b.pallet : '';   // 지정 적재량 = Monday PT적재량
     _ipsuPicked.c = true;
     ipsuCalc();
   }
@@ -22343,6 +22943,17 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     _ipsuV1 = ipsuMakeViewer(document.getElementById('ipsu-cv1'));
     _ipsuV2 = ipsuMakeViewer(document.getElementById('ipsu-cv2'));
     _ipsuV3 = ipsuMakeViewer(document.getElementById('ipsu-cv3'));
+    // 칸 크기가 바뀌면(창 크기·탭 배치·숨었다 보임) 3D 캔버스도 맞춤 — 예전엔 처음 만든 크기 그대로라
+    // 칸이 좁아지면 오른쪽이 잘리고 넓어지면 빈 띠가 생겼음 (2026-11-06 전수 점검, 1100px에서 43px 잘림)
+    if (window.ResizeObserver) [[1, _ipsuV1], [2, _ipsuV2], [3, _ipsuV3]].forEach(([n, v]) => {
+      const el = document.getElementById('ipsu-cv' + n); if (!el || !v) return;
+      let pw = el.clientWidth, ph = el.clientHeight;
+      new ResizeObserver(() => {
+        const w = el.clientWidth, h = el.clientHeight;
+        if (!w || !h || (w === pw && h === ph)) return;   // 숨은 동안(0)은 그대로
+        pw = w; ph = h; v.resize();
+      }).observe(el);
+    });
     // 클릭(드래그 아님) → 확대 보기. 6px 이상 움직이면 회전 드래그로 간주.
     [1, 2, 3].forEach(n => {
       const el = document.getElementById('ipsu-cv' + n);
@@ -22559,6 +23170,17 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   }
 
   // ── 팔레트 적재 (외박스 → 팔레트) ──
+  // 팔레트 적재 (2026-11-05, 사용자 "원칙은 1,700mm 높이에 맞게 적재, 영업 거래처 요청으로 적재량이 정해진 제품도 있음" — 예 G0251 코스트코 144)
+  //   지정 적재량(Monday PT적재량 또는 직접 입력)이 있으면 그 수량으로 배치(나눠떨어지는 단 구성 우선: 144 = 24박스/단(4×6 한 방향) × 6단),
+  //   없으면 원칙 = 최대 적재높이 안에서 최대(혼합방향 허용). 원칙 기준은 Monday PT적재량 123건 중 106건 일치.
+  // 한 방향 배열만 (혼합방향 없이) — 정방향·90° 회전 중 많은 쪽
+  function ipsuSimplePlan(W, D, w, d) {
+    const a = { cols: Math.floor(W / w), rows: Math.floor(D / d), rot: false, pitchX: w, pitchZ: d };
+    const b = { cols: Math.floor(W / d), rows: Math.floor(D / w), rot: true, pitchX: d, pitchZ: w };
+    const best = a.cols * a.rows >= b.cols * b.rows ? a : b;
+    const count = Math.max(0, best.cols) * Math.max(0, best.rows);
+    return { count, blocks: count ? [{ x: 0, z: 0, ...best }] : [] };
+  }
   function ipsuPallet(perBoxTotal) {
     if (!_ipsuV3) return;
     const over = _ig('ipsu-over');
@@ -22568,9 +23190,22 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
           bh = _ig('ipsu-boh') || _ig('ipsu-ch');
     const P = { W: _ig('ipsu-plw'), D: _ig('ipsu-pld'), H: _ig('ipsu-plh') };
     const area = { W: P.W + over * 2, D: P.D + over * 2, H: P.H };   // 오버행 허용분
-    const plan = ipsuFitPlan(area.W, area.D, bw, bd, 1.0);
-    const layers = bh > 0 ? Math.floor(area.H / bh) : 0;
-    const total = plan.count * layers;
+    // 원칙: 최대 적재높이 안에서 최대 (혼합방향 허용)
+    const mixPlan = ipsuFitPlan(area.W, area.D, bw, bd, 1.0);
+    const maxLayers = bh > 0 ? Math.floor(area.H / bh) : 0;
+    const maxTotal = mixPlan.count * maxLayers;
+    // 지정 적재량: 단당 박스 수(혼합/한 방향) 중 딱 나눠떨어지고 높이 안에 드는 것 우선 → 없으면 단 수가 가장 적은 것(맨 위 단은 일부)
+    const fixedN = Math.round(_ig('ipsu-pltq'));
+    let plan = mixPlan, layers = maxLayers, total = maxTotal, topN = 0;
+    if (fixedN > 0 && bh > 0) {
+      const cands = [mixPlan, ipsuSimplePlan(area.W, area.D, bw, bd)].filter(p => p.count > 0);
+      const opt = cands.map(p => ({ p, L: Math.ceil(fixedN / p.count), exact: fixedN % p.count === 0 }))
+        .sort((a, b) => (b.exact - a.exact) || ((a.L * bh <= area.H) ? 0 : 1) - ((b.L * bh <= area.H) ? 0 : 1) || a.L - b.L || b.p.count - a.p.count)[0];
+      if (opt) {
+        plan = opt.p; layers = opt.L; total = fixedN;
+        topN = opt.exact ? 0 : fixedN - opt.p.count * (opt.L - 1);
+      }
+    }
 
     const gap = 2;
     const box = (w, d) => { const g = new THREE.BoxGeometry(w - gap, bh - gap, d - gap);
@@ -22579,36 +23214,50 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const blocks = plan.blocks.length ? plan.blocks
       : [{ x: 0, z: 0, cols: 0, rows: 0, rot: false, pitchX: bw, pitchZ: bd }];
     const items = [];
-    for (let L = 0; L < layers; L++)
+    for (let L = 0; L < layers; L++) {
+      let k = 0;   // 맨 위 단이 일부만이면(topN) 그만큼만
       for (const b of blocks)
         for (let r = 0; r < b.rows; r++)
-          for (let c = 0; c < b.cols; c++)
+          for (let c = 0; c < b.cols; c++) {
+            if (topN && L === layers - 1 && k >= topN) continue;
+            k++;
             items.push({ x: b.x + c * b.pitchX, z: b.z + r * b.pitchZ, y: L * bh, sc: 1,
                          gk: b.rot ? 's' : 'n' });
-    _ipsuV3.render({ W: area.W, H: area.H, D: area.D },
+          }
+    }
+    _ipsuV3.render({ W: area.W, H: Math.max(area.H, layers * bh), D: area.D },
       { items, geoms, geom: geoms.n, isBox: true }, null, 150);   // 팔레트 위는 외박스
 
     document.getElementById('ipsu-s3cnt').textContent = total;
     const mix = blocks.length > 1
-      ? ` · 혼합방향(${blocks.map(b => b.cols + '×' + b.rows + (b.rot ? '↻' : '')).join('+')})` : '';
+      ? ` · 혼합방향(${blocks.map(b => b.cols + '×' + b.rows + (b.rot ? '↻' : '')).join('+')})` : ' · 한 방향';
     const useH = layers * bh;
+    const fixed = fixedN > 0 && total === fixedN;
     document.getElementById('ipsu-s3badge').textContent =
-      total > 0 ? `${plan.count}박스/단 × ${layers}단 = ${total}박스${mix}`
-                + ` · 높이 ${useH}/${P.H}mm · 박스외치수 ${bw}×${bd}×${bh}`
+      total > 0 ? (fixed ? '지정 적재량 · ' : '') + `${plan.count}박스/단 × ${layers}단` + (topN ? `(맨 위 ${topN})` : '') + ` = ${total}박스${mix}`
+                + ` · 높이 ${useH}/${P.H}mm` + (useH > P.H ? ' ⚠ 최대 적재높이 초과 — 외박스 규격(BOM) 또는 PT적재량 확인' : '')
+                + (fixed ? ` · 원칙(${P.H}mm) 최대 ${maxTotal}박스` : '') + ` · 박스외치수 ${bw}×${bd}×${bh}`
                 + (perBoxTotal ? ` · 파우치 총 ${(total * perBoxTotal).toLocaleString()}개` : '')
                 : '팔레트에 올라가지 않음 (박스 외치수 확인)';
-    // PT적재량 실측 대조
+    // Monday PT적재량(거래처 지정 포함)과 원칙 계산 대조
     const el = document.getElementById('ipsu-pt');
     // ⓪ 완제품 선택이 우선, 없으면 '박스입수 조회'로 고른 것
     const picked = (_ipsuSelP && _ipsuSelP.pallet > 0) ? _ipsuSelP
       : _ipsuBoxes.find(b => document.getElementById('ipsu-c-q').value.startsWith(b.code));
     if (picked && picked.pallet > 0) {
-      const diff = total - picked.pallet;
-      el.innerHTML = `<b>${escapeHtml(picked.code)}</b> Monday PT적재량 <b>${picked.pallet}</b> vs 계산 <b>${total}</b>`
-        + (diff === 0 ? ' · <span style="color:#059669">일치</span>'
-                      : ` · <span style="color:#b45309">차이 ${diff > 0 ? '+' : ''}${diff}</span>`);
+      const same = picked.pallet === maxTotal;
+      const src = picked.pallet_src || 'Monday 박스입수 보드';   // 출처: Monday › 제품리스트 › 재고파악 '품번 등 데이터' › 같은 제품 다른 품번 (2026-11-05)
+      el.innerHTML = `<b>${escapeHtml(picked.code)}</b> PT적재량 <b>${picked.pallet}</b>` + (fixedN === picked.pallet ? ' 적용' : '')
+        + ` <span style="color:#64748b">(${escapeHtml(src)})</span>`
+        + ` · 원칙(${P.H}mm) 계산 <b>${maxTotal}</b>`
+        + (same ? ' · <span style="color:#059669">일치</span>'
+                : ' · <span style="color:#b45309">다름 — 거래처 지정 등</span>')
+        + (picked.pallet_alt ? ` · <span style="color:#b45309">⚠ ${escapeHtml(picked.pallet_alt)}</span>` : '');
+    } else if (_ipsuSelP) {
+      el.innerHTML = `<b>${escapeHtml(_ipsuSelP.code)}</b> PT적재량 자료 없음(Monday·제품리스트·재고파악) · 원칙(${P.H}mm) 계산 <b>${maxTotal}</b>`
+        + (fixed ? ` · 지정 적재량 <b>${fixedN}</b> 적용` : ' · 거래처가 정한 수량이 있으면 지정 적재량에 넣으세요');
     } else {
-      el.textContent = '완제품을 검색하면 실측 PT적재량과 비교됩니다';
+      el.textContent = '완제품을 검색하면 PT적재량 자료(Monday·제품리스트·재고파악)와 비교됩니다';
     }
   }
 
@@ -22683,6 +23332,146 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     ipsuCalc();
   }
 
+  // ───── 중량 기준 입수 예상 (2026-11-05, 사용자 "파우치에 공기가 들어 딱딱하지 않아 입수가 안 맞음, 꽉 눌러 담으면 더 담김") ─────
+  // 파우치를 단단한 덩어리로 보는 기하 계산은 실제 박스입수의 절반 수준(중앙 오차 50%).
+  // → 실제 제품(아마란스 BOM 박스입수 × 품명 중량 ÷ 외박스 내부 부피)에서 '박스 1L당 담기는 내용물 g'을
+  //   제품군 × 포장 방식(직행/2차/단상자)별로 배워 씀. 눌림·공기·빈틈이 실측에 다 들어 있음.
+  //   검증(직행 112건, 자기 제외): 중앙 오차 50% → 19%, ±20% 안 15% → 51%.
+  const IPSU_FAMS = ['말랭이', '스틱·바', '누룽지', '오트밀', '칩·스낵', '기타'];
+  var _ipsuDens = null, _ipsuFamAuto = '';   // var: 패널 로딩(loadIpsuSpecs)이 먼저 불려도 TDZ 오류 없게
+  function ipsuFamOf(name) {
+    const n = name || '';
+    return /스틱|고구마바/.test(n) ? '스틱·바' : /말랭이|큐브/.test(n) ? '말랭이' : /누룽지/.test(n) ? '누룽지'
+         : /오트밀/.test(n) ? '오트밀' : /칩|과자|스낵/.test(n) ? '칩·스낵' : '기타';
+  }
+  // 품명 → 완제품 1개 중량(g): '90g' 90 · '50G*25입' 1250 · '80g_5개' 400 · '20g*10ea' 200 · '50g(40개)' 2000 · '1.2kg' 1200
+  //   총중량이 따로 적혀 있으면 그대로('400g(20g*20개입)' 400). per(박스입수)와 같은 숫자는 박스 입수 표기라 곱하지 않음('297G (16ea)' 297).
+  //   unitOnly: 첫 중량만 (1차 파우치 규격명용 — 'N입'은 바깥 포장 얘기)
+  function ipsuWeightCands(name, qa) {   // 해석 후보(앞이 기본). 총중량이 따로 적혀 있으면 하나뿐
+    const s = name || '';
+    const ws = [...s.matchAll(/(\\d+(?:\\.\\d+)?)\\s*(kg|g)(?![a-zA-Z])/gi)].map(m => (+m[1]) * (m[2].toLowerCase() === 'kg' ? 1000 : 1));
+    if (!ws.length) return [];
+    const mm = s.match(/(?:[*×]\\s*(\\d+))|(?:[xX_(]\\s*(\\d+)\\s*(?:입|개입|번들|개|봉|ea|포|장))/i);
+    let mult = mm ? +(mm[1] || mm[2]) : 1;
+    const big = Math.max(...ws), small = Math.min(...ws);
+    if (ws.length > 1 && big >= small * mult * 0.9) return [big];
+    if (mult === 1 && qa > 1 && ws.length === 1) mult = qa;   // 품명이 잘려 'N개'가 빠진 경우 BOM 1차 수로
+    return mult > 1 ? [small * mult, small] : [small];
+  }
+  function ipsuWeightOf(name, unitOnly) {
+    if (unitOnly) { const m = (name || '').match(/(\\d+(?:\\.\\d+)?)\\s*(kg|g)(?![a-zA-Z])/i); return m ? (+m[1]) * (m[2].toLowerCase() === 'kg' ? 1000 : 1) : 0; }
+    return ipsuWeightCands(name)[0] || 0;
+  }
+  // 완제품 1개 중량 — '(16ea)'(박스 입수 표기) vs '(10개)'(속 포장 개수)처럼 두 갈래면 박스 부피상 그럴듯한 쪽(제품군 대략 밀도 기준)
+  const IPSU_DENS_PRIOR = { '말랭이': 135, '스틱·바': 85, '누룽지': 194, '오트밀': 242, '칩·스낵': 90, '기타': 135 };
+  function ipsuProductWeight(p) {
+    const cands = ipsuWeightCands(p.name, p.qa);
+    if (cands.length < 2) return cands[0] || 0;
+    const c = p.c && p.c.dim, per = p.bomPer || p.ipsu;
+    if (!c || !(per > 0)) return cands[0];
+    const wall = IPSU_WALL * 2, vol = (c.W - wall) * ((c.D || c.H) - wall) * (c.H - wall) / 1e6;
+    if (!(vol > 0)) return cands[0];
+    const prior = (IPSU_DENS_PRIOR[ipsuFamOf(p.name)] || 135) * (p.b ? 0.6 : 1);
+    const off = w => Math.abs(Math.log(per * w / vol / prior));
+    return cands.reduce((b, w) => off(w) < off(b) ? w : b);
+  }
+  function ipsuDensStats() {
+    if (_ipsuDens) return _ipsuDens;
+    const rows = [], wall = IPSU_WALL * 2;
+    for (const p of (_ipsuProducts || [])) {
+      if (!p.c || !p.c.dim) continue;
+      const per = p.bomPer || p.ipsu, w = ipsuProductWeight(p);
+      if (!(per > 0) || !(w > 0)) continue;
+      const c = p.c.dim, vol = (c.W - wall) * ((c.D || c.H) - wall) * (c.H - wall) / 1e6;
+      if (!(vol > 0)) continue;
+      const D = per * w / vol;
+      if (D < 30 || D > 600) continue;   // 품명 중량 해석이 어긋난 이상치
+      rows.push({ fam: ipsuFamOf(p.name), kind: !p.b ? '직행' : (p.b.dim && p.b.dim.form === '상자' ? '단상자' : '2차'), D });
+    }
+    const q = (a, f) => { const s = a.slice().sort((x, y) => x - y); const i = (s.length - 1) * f, lo = Math.floor(i), hi = Math.ceil(i); return s[lo] + (s[hi] - s[lo]) * (i - lo); };
+    const st = a => ({ n: a.length, med: q(a, .5), q1: q(a, .25), q3: q(a, .75) });
+    const S = { _n: rows.length }, direct = {};
+    const dAll = rows.filter(r => r.kind === '직행').map(r => r.D);
+    if (!dAll.length) return (_ipsuDens = S);
+    const allDirect = st(dAll);
+    IPSU_FAMS.forEach(f => { const v = rows.filter(r => r.fam === f && r.kind === '직행').map(r => r.D); if (v.length >= 5) direct[f] = st(v); });
+    // 내부용기(2차·단상자)는 포장 공기가 더 들어 g/L가 낮음 → 같은 제품군 직행 대비 비율(표본 적을 때 보정용)
+    const ratio = {};
+    ['2차', '단상자'].forEach(k => {
+      const rr = rows.filter(r => r.kind === k).map(r => r.D / (direct[r.fam] || allDirect).med);
+      ratio[k] = rr.length ? q(rr, .5) : 1;
+    });
+    IPSU_FAMS.forEach(f => ['직행', '2차', '단상자'].forEach(k => {
+      const v = rows.filter(r => r.fam === f && r.kind === k).map(r => r.D);
+      if (v.length >= 5) { S[f + '|' + k] = { ...st(v), src: f + '·' + k + ' ' + v.length + '개 제품' }; return; }
+      const b = direct[f] || allDirect, m = k === '직행' ? 1 : ratio[k];
+      S[f + '|' + k] = { n: b.n, med: b.med * m, q1: b.q1 * m, q3: b.q3 * m,
+        src: (direct[f] ? f + '·직행 ' : '전체 직행 ') + b.n + '개 제품' + (k === '직행' ? '' : ' × ' + k + ' 보정 ' + m.toFixed(2)) };
+    }));
+    return (_ipsuDens = S);
+  }
+  // 박스(내부공간 C)당 1차 파우치 예상 수 — 1차 중량이 없으면 null
+  function ipsuDensEstimate(C, kind) {
+    const w = _ig('ipsu-wt'); if (!(w > 0)) return null;
+    const sel = document.getElementById('ipsu-fam').value;
+    const fam = sel === 'auto' ? (_ipsuFamAuto || '기타') : sel;
+    const s = ipsuDensStats()[fam + '|' + kind]; if (!s) return null;
+    const vol = C.W * C.D * C.H / 1e6;
+    return { fam, kind, n: s.med * vol / w, lo: s.q1 * vol / w, hi: s.q3 * vol / w, gpl: s.med, src: s.src, w, vol };
+  }
+  // 목표 입수 N이 들어가는 가장 약한 눌림 찾기 (지금 눌림부터 80%까지, 배열은 고른 것 먼저) — 3D가 실제처럼 눌린 모양으로
+  //   고른 배치(세워서 등)를 먼저 끝까지 눌러 보고, 그래도 안 되면 다른 배치 중 가장 덜 눌리는 것
+  function ipsuFitComp(C, form, W, H, base, T, pattern, comp0, N) {
+    const lab = { row: '세워서 줄로', 'row-alt': '교대 뒤집기', stack: '눕혀서' };
+    const steps = [];
+    for (let c = comp0; c <= 0.8 + 1e-9; c = Math.round((c + 0.05) * 100) / 100) steps.push(c);
+    const need = p => { for (const c of steps) if (ipsuMaxFit(C, form, W, H, base, T, p, c) >= N) return c; return null; };
+    const c0 = need(pattern);
+    if (c0 != null) return { n: N, comp: c0, pattern, cap: false, note: '' };
+    let best = null;
+    for (const p of ['row', 'row-alt', 'stack'].filter(p => p !== pattern)) {
+      const c = need(p); if (c != null && (!best || c < best.c)) best = { c, p };
+    }
+    if (best) return { n: N, comp: best.c, pattern: best.p, cap: false, note: ' · ' + lab[best.p] + ' 배치' };
+    let mx = { n: 0, p: pattern };
+    for (const p of [pattern, 'row', 'row-alt', 'stack']) { const m = ipsuMaxFit(C, form, W, H, base, T, p, 0.8); if (m > mx.n) mx = { n: m, p }; }
+    return { n: Math.max(1, mx.n), comp: 0.8, pattern: mx.p, cap: true, note: ' · ⚠ 꽉 눌러도 최대 ' + mx.n + '개' };
+  }
+  // 예상 줄 표시. info = {est, n1(2차당 1차, 있으면), used(입수 칸이 비어 예상을 썼는지), r(눌림 맞춤 결과)}
+  function ipsuShowEst(info) {
+    const el = document.getElementById('ipsu-est'); if (!el) return;
+    if (!info) { el.style.display = 'none'; el.innerHTML = ''; return; }
+    if (!info.est) {
+      el.style.display = 'block';
+      el.innerHTML = '💡 <b>1차 중량(g)</b>을 넣으면 실제 제품들의 <b>박스 1L당 담기는 중량</b>으로 입수를 예상합니다'
+        + ' <span class="ie-sub">(공기·눌림 반영 — 지금 계산은 파우치를 단단한 덩어리로 봐서 실제보다 적게 나옴)</span>';
+      return;
+    }
+    const e = info.est, f = v => Math.round(v).toLocaleString();
+    const per1 = e.kind === '직행' ? '' : ' (1차 기준)';
+    let h = '⚖️ <b>중량 기준 예상 박스당 ' + f(e.n) + '개</b>' + per1
+      + ' <span class="ie-sub">보통 ' + f(e.lo) + '~' + f(e.hi) + '개</span>';
+    if (info.n1 > 1) h += ' → 내부용기당 ' + info.n1 + '개씩 = <b>' + f(e.n / info.n1) + '개</b>';
+    h += '<br><span class="ie-sub">' + escapeHtml(e.fam) + '·' + e.kind + ' ' + Math.round(e.gpl) + 'g/L × 박스 ' + e.vol.toFixed(1) + 'L ÷ '
+      + (+e.w).toLocaleString() + 'g · ' + escapeHtml(e.src) + ' 실측 기준 (보통 ±25% 안팎 — 확정은 실측)</span>';
+    if (info.used && info.r) h += ' · ' + (info.r.cap ? '<b style="color:#b45309">' + info.r.note.replace(' · ', '') + '</b>'
+      : '3D는 눌림 ' + Math.round(info.r.comp * 100) + '%로 표시');
+    if (!info.used) h += '<button onclick="ipsuUseEst()" title="입수 개수 입력 방식으로 바꾸고 입수 칸을 비워 이 예상으로 보기">이 예상으로 보기</button>';
+    el.style.display = 'block';
+    el.innerHTML = h;
+  }
+  function ipsuUseEst() {
+    document.getElementById('ipsu-mode').value = 'count';
+    document.getElementById('ipsu-n2').value = '';
+    ipsuOnMode();
+  }
+  // 제품군 '자동' = 마지막으로 고른 완제품·1차 파우치 이름으로 판정 (선택칸에 판정 결과 표시)
+  function ipsuSetFamAuto(name) {
+    _ipsuFamAuto = name ? ipsuFamOf(name) : '';
+    const o = document.querySelector('#ipsu-fam option[value="auto"]');
+    if (o) o.textContent = '자동' + (_ipsuFamAuto ? '(' + _ipsuFamAuto + ')' : '');
+  }
+
   function ipsuCalc() {
     if (!_ipsuV1) return;
     const aForm = document.getElementById('ipsu-a-form').value;
@@ -22708,21 +23497,36 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
 
     // 내부용기 없음 — 1차파우치가 외박스로 직행 (단일 단계)
     if (bForm === '없음') {
-      let layD, n2v, tag = '';
+      let layD, n2v, tag = '', compD = comp;
+      const estD = ipsuDensEstimate(C, '직행');
+      let estInfo = { est: estD, used: false };
       if (GRID) {
         layD = ipsuGridLayout(C, aForm, aW, aH, aBase, aT, pat2, comp,
           _ig('ipsu-g2c'), _ig('ipsu-g2r'), _ig('ipsu-g2l'));
         n2v = layD.count;
       } else {
-        const af = n2auto ? ipsuAutoFit(C, aForm, aW, aH, aBase, aT, pat2, comp) : null;
-        n2v = n2auto ? Math.max(1, af.n) : Math.max(1, Math.round(parseFloat(n2raw)));
-        layD = ipsuLayout(n2v, C, aForm, aW, aH, aBase, aT, n2auto ? af.pattern : pat2, comp, 0);
-        tag = n2auto ? autoTag + af.note : '';
+        // 입수: 직접 넣은 값 › (칸 비었고 중량 있으면) 중량 기준 예상 › 기하 최대.
+        // 공기 든 파우치는 눌려서 들어가므로, 그 입수가 들어가는 만큼 눌림을 자동으로 올림(최대 80%, 넘으면 용량초과 경고)
+        const N = n2auto ? (estD ? Math.max(1, Math.round(estD.n)) : 0) : Math.max(1, Math.round(parseFloat(n2raw)));
+        if (N) {
+          const r = ipsuFitComp(C, aForm, aW, aH, aBase, aT, pat2, comp, N);
+          n2v = n2auto ? r.n : N; compD = r.comp;
+          layD = ipsuLayout(n2v, C, aForm, aW, aH, aBase, aT, r.pattern, compD, 0);
+          tag = n2auto ? ' · 중량 기준 예상' + r.note : (r.cap ? '' : r.note);
+          estInfo = { est: estD, used: n2auto, r };
+        } else {
+          const af = ipsuAutoFit(C, aForm, aW, aH, aBase, aT, pat2, comp);
+          n2v = Math.max(1, af.n);
+          layD = ipsuLayout(n2v, C, aForm, aW, aH, aBase, aT, af.pattern, comp, 0);
+          tag = autoTag + af.note;
+        }
       }
+      ipsuShowEst(estInfo);
+      const compTagD = compD > 0 ? ` · 눌림 ${Math.round(compD * 100)}%` + (compD > comp ? '(자동)' : '') : '';
       _ipsuV2.render(C, layD, null);
       document.getElementById('ipsu-s2cnt').textContent = n2v;
       document.getElementById('ipsu-s2badge').textContent =
-        layD.label + tag + compTag + ipsuStats(layD, C, n2v);
+        layD.label + tag + compTagD + ipsuStats(layD, C, n2v);
       document.getElementById('ipsu-eq').textContent = '내부용기 없음 · 직행';
       document.getElementById('ipsu-total').innerHTML =
         n2v.toLocaleString() + ' <span style="font-size:13px;font-weight:600">개</span>';
@@ -22731,12 +23535,35 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       return;
     }
 
-    let Binner, Bshell = null, lay2, n2v, af2 = null, thB = 0, note2 = '';
+    let Binner, Bshell = null, lay2, n2v, af2 = null, thB = 0, note2 = '', comp2 = comp;
+    // 중량 기준 예상 — 박스당 1차 수를 내부용기당 1차 수로 나눠 박스당 내부용기 수 (2026-11-05)
+    const estK = ipsuDensEstimate(C, bForm === '단상자' ? '단상자' : '2차');
+    let n1pre = 0, n2est = 0;
+    if (estK && !GRID) {
+      if (!n1auto) n1pre = Math.max(1, Math.round(parseFloat(n1raw)));
+      else {
+        let Bpre;
+        if (bForm === '단상자') Bpre = { W: _ig('ipsu-bbw'), H: _ig('ipsu-bbh'), D: _ig('ipsu-bbd') };
+        else {
+          const bb = bForm === '스탠드' ? _ig('ipsu-bbase') : 0, bt = _ig('ipsu-bt');
+          Bpre = { W: _ig('ipsu-bw'), H: Math.max(20, _ig('ipsu-bh') - bb * 0.5), D: (bt > 0 ? bt : Math.max(bb, 4) * 1.215 * _ipsuThinMul) * (1 - comp) };
+        }
+        n1pre = Math.max(1, ipsuAutoFit(Bpre, aForm, aW, aH, aBase, aT, pat1, comp).n);
+      }
+      if (n2auto) n2est = Math.max(1, Math.round(estK.n / n1pre));
+    }
+    let estInfo = { est: estK, n1: n1pre, used: false };
     if (bForm === '단상자') {
       const W = _ig('ipsu-bbw'), D = _ig('ipsu-bbd'), H = _ig('ipsu-bbh');
       Binner = { W, H, D };
-      n2v = GRID ? Math.max(1, Math.round(_ig('ipsu-g2c') * _ig('ipsu-g2r') * _ig('ipsu-g2l')))
-        : (n2auto ? Math.max(1, ipsuMaxFitBox(C, W, D, H)) : Math.max(1, Math.round(parseFloat(n2raw))));
+      if (!GRID && n2est) {   // 단상자는 강체 — 눌림 없이 기하 최대까지만
+        const mx = Math.max(1, ipsuMaxFitBox(C, W, D, H));
+        n2v = Math.min(n2est, mx);
+        note2 = ' · 중량 기준 예상' + (n2est > mx ? ' · ⚠ 단상자라 최대 ' + mx + '개' : '');
+        estInfo = { est: estK, n1: n1pre, used: true, r: { cap: n2est > mx, comp: 0, note: ' · ⚠ 단상자라 최대 ' + mx + '개' } };
+      } else
+        n2v = GRID ? Math.max(1, Math.round(_ig('ipsu-g2c') * _ig('ipsu-g2r') * _ig('ipsu-g2l')))
+          : (n2auto ? Math.max(1, ipsuMaxFitBox(C, W, D, H)) : Math.max(1, Math.round(parseFloat(n2raw))));
       lay2 = ipsuLayoutBox(n2v, C, W, D, H);
     } else {
       const W = _ig('ipsu-bw'), H = _ig('ipsu-bh');
@@ -22746,6 +23573,14 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
           _ig('ipsu-g2c'), _ig('ipsu-g2r'), _ig('ipsu-g2l'));
         n2v = lay2.count;
         thB = lay2.derivedT;   // 배열에서 산출된 2차 실제 두께
+      } else if (n2est || !n2auto) {
+        // 직접 넣은 입수 또는 중량 기준 예상 → 그만큼 들어가게 2차파우치 눌림 자동 (1단계 캐비티는 원래 눌림 그대로)
+        const N2 = n2auto ? n2est : Math.max(1, Math.round(parseFloat(n2raw)));
+        const r = ipsuFitComp(C, bForm, W, H, base, T, pat2, comp, N2);
+        n2v = n2auto ? r.n : N2; comp2 = r.comp;
+        lay2 = ipsuLayout(n2v, C, bForm, W, H, base, T, r.pattern, comp2, 0);
+        note2 = n2auto ? ' · 중량 기준 예상' + r.note : (r.cap ? '' : r.note);
+        if (n2auto) estInfo = { est: estK, n1: n1pre, used: true, r };
       } else {
         af2 = n2auto ? ipsuAutoFit(C, bForm, W, H, base, T, pat2, comp) : null;
         n2v = n2auto ? Math.max(1, af2.n) : Math.max(1, Math.round(parseFloat(n2raw)));
@@ -22761,7 +23596,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       Binner = { W, H: Math.max(20, H - base * 0.5), D: bodyB * (1 - comp) };
       Bshell = ipsuOrient(ipsuPouchGeomC(bForm, W, H, base, T, comp, thB), '세움', false).geom;
     }
-    let lay1, n1v, note1 = '', tag1 = '';
+    let lay1, n1v, note1 = '', tag1 = '', comp1 = comp;
     if (GRID) {
       lay1 = ipsuGridLayout(Binner, aForm, aW, aH, aBase, aT, pat1, comp,
         _ig('ipsu-g1c'), _ig('ipsu-g1r'), _ig('ipsu-g1l'));
@@ -22769,10 +23604,15 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     } else {
       const af1 = n1auto ? ipsuAutoFit(Binner, aForm, aW, aH, aBase, aT, pat1, comp) : null;
       n1v = n1auto ? Math.max(1, af1.n) : Math.max(1, Math.round(parseFloat(n1raw)));
-      const sf1 = n1auto ? null : ipsuPickPattern(Binner, aForm, aW, aH, aBase, aT, pat1, comp);
-      note1 = n1auto ? af1.note : sf1.note;
       tag1 = n1auto ? autoTag : '';
-      lay1 = ipsuLayout(n1v, Binner, aForm, aW, aH, aBase, aT, n1auto ? af1.pattern : sf1.pattern, comp, 0);
+      if (n1auto) {
+        note1 = af1.note;
+        lay1 = ipsuLayout(n1v, Binner, aForm, aW, aH, aBase, aT, af1.pattern, comp, 0);
+      } else {   // 직접 넣은 입수 → 그만큼 들어가게 1차파우치 눌림 자동 (2026-11-05)
+        const r1 = ipsuFitComp(Binner, aForm, aW, aH, aBase, aT, pat1, comp, n1v);
+        comp1 = r1.comp; note1 = r1.cap ? '' : r1.note;
+        lay1 = ipsuLayout(n1v, Binner, aForm, aW, aH, aBase, aT, r1.pattern, comp1, 0);
+      }
     }
 
     _ipsuV1.render(Binner, lay1, Bshell);
@@ -22780,11 +23620,14 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const c1 = n1v, c2 = n2v;
     document.getElementById('ipsu-s1cnt').textContent = c1;
     document.getElementById('ipsu-s2cnt').textContent = c2;
+    const compTag1 = comp1 > 0 ? ` · 눌림 ${Math.round(comp1 * 100)}%` + (comp1 > comp ? '(자동)' : '') : '';
     document.getElementById('ipsu-s1badge').textContent =
-      lay1.label + tag1 + note1 + compTag + ipsuStats(lay1, Binner, c1);
+      lay1.label + tag1 + note1 + compTag1 + ipsuStats(lay1, Binner, c1);
+    const compTag2 = comp2 > 0 ? ` · 눌림 ${Math.round(comp2 * 100)}%` + (comp2 > comp ? '(자동)' : '') : '';
     document.getElementById('ipsu-s2badge').textContent =
-      lay2.label + (!GRID && n2auto ? autoTag + (af2 ? af2.note : '') : note2)
-      + (bForm === '단상자' ? '' : compTag) + ipsuStats(lay2, C, c2);   // 단상자는 강체라 압축 없음
+      lay2.label + (!GRID && n2auto && !n2est ? autoTag + (af2 ? af2.note : '') : note2)
+      + (bForm === '단상자' ? '' : compTag2) + ipsuStats(lay2, C, c2);
+    ipsuShowEst(estInfo);   // 단상자는 강체라 압축 없음
     document.getElementById('ipsu-eq').textContent = `${c1} × ${c2} =`;
     document.getElementById('ipsu-total').innerHTML =
       (c1 * c2).toLocaleString() + ' <span style="font-size:13px;font-weight:600">개</span>';
@@ -22907,7 +23750,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
 
     // 계산기로 스크롤
     const calc = document.querySelector('.pcalc-panel');
-    if (calc) calc.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    if (calc) { tabReveal(calc); calc.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }   // 규격·입수 탭에서 누르면 단가·원가 탭으로
   }
 
   function renderSpecList() {
