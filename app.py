@@ -16542,6 +16542,17 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .nt-list li:first-child { border-top: 0; }
   .nt-code { flex: 0 0 auto; font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace; font-size: 13px; font-weight: 800; color: #3730a3; background: #eef2ff; border-radius: 6px; padding: 2px 8px; cursor: pointer; }
   .nt-code:hover { background: #c7d2fe; }
+  /* 알림 항목 클릭 = 그 상세 (2026-11-12): 줄 전체가 눌림 + 오른쪽 '›' */
+  .nt-list li.nt-go { cursor: pointer; border-radius: 8px; margin: 0 -8px; padding: 7px 8px; transition: background .12s; }
+  .nt-list li.nt-go:hover { background: #f1f5f9; }
+  .nt-list li.nt-go:hover .nt-code { background: #c7d2fe; }
+  .nt-list li.nt-go::after { content: '›'; margin-left: auto; padding-left: 8px; color: #94a3b8; font-weight: 800; font-size: 17px; line-height: 1; align-self: center; }
+  .nt-list li.nt-go:hover::after { color: #4f46e5; }
+  .nt-go.busy { opacity: .55; cursor: progress; }
+  .nt-text.nt-go, .nt-lead.nt-go { cursor: pointer; color: #4338ca; }
+  .nt-text.nt-go:hover, .nt-lead.nt-go:hover { text-decoration: underline; }
+  .nt-link { display: inline-block; margin-top: 10px; padding: 7px 14px; border-radius: 8px; background: #eef2ff; color: #3730a3; font-size: 14px; font-weight: 700; text-decoration: none; }
+  .nt-link:hover { background: #c7d2fe; }
   .nt-text { font-size: 14.5px; color: var(--text-2); line-height: 1.65; margin-top: 8px; }
   .nt-foot { padding: 14px 28px 18px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; border-top: 1px solid var(--border); background: var(--surface-2); }
   .nt-btn { padding: 9px 16px; font-size: 13.5px; font-weight: 700; border-radius: 9px; background: #fff; cursor: pointer; border: 1px solid; }
@@ -21578,7 +21589,57 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     }
   }
   function setNotifyKind(k) { _ntKind = k; renderNotify(); document.getElementById('notify-body').scrollTop = 0; }
-  function ntOpenItem(code) { document.getElementById('notify-modal').classList.remove('show'); openItemModal(code); }
+  // ── 알림 항목 클릭 = 그 상세 (2026-11-12 사용자 "알림센터 각 항목을 클릭하면 해당 상세"): 예전엔 작은 품번 칩만 눌렸고(일반 품목 창),
+  //    채널 품절·거래처·데이터 줄은 아무 반응 없었음. 상세는 알림 센터 위에 띄움 → 닫으면 알림 목록으로 돌아옴.
+  //    완제품(E·G·H·I) = 수급 플래너 상세(품목 창은 이름·재고가 비어 나옴), 자재 = 품목 창, 채널 품절 = 그 채널·SKU 상세,
+  //    거래처 = 외주재고 입력(링크·기록 현황), 데이터 = 데이터 상태
+  function _ntLift() {   // 알림 센터보다 아래 깔리는 상세 창을 위로 — 닫히면 원래 높이로
+    const nt = document.getElementById('notify-modal');
+    if (!nt.classList.contains('show')) return;
+    const base = parseInt(getComputedStyle(nt).zIndex, 10) || 129;
+    document.querySelectorAll('.modal-overlay.show').forEach(o => {
+      if (o === nt || o.dataset.ntLift) return;
+      const z = parseInt(getComputedStyle(o).zIndex, 10);
+      if (!isNaN(z) && z > base) return;
+      o.dataset.ntLift = o.style.zIndex || '-';
+      o.style.zIndex = base + 2;
+      const mo = new MutationObserver(() => {
+        if (o.classList.contains('show')) return;
+        o.style.zIndex = o.dataset.ntLift === '-' ? '' : o.dataset.ntLift;
+        delete o.dataset.ntLift; mo.disconnect();
+      });
+      mo.observe(o, { attributes: true, attributeFilter: ['class'] });
+    });
+  }
+  async function ntGo(el) {
+    const k = el.dataset.k, c = el.dataset.c || '', ch = el.dataset.ch || '';
+    el.classList.add('busy');
+    try {
+      if (k === 'health') { openDataHealth(); return; }
+      if (k === 'vendor') { openVendorLinks(); return; }
+      if (k === 'chstock' && c) {
+        try {
+          const d = await (await fetch('/api/channel_stock?all=1')).json();
+          const it = (d.items || []).find(x => x.channel_name === ch && (x.code === c || String(x.sku) === c));
+          if (it) { openChsDetail(it.channel, String(it.sku)); return; }
+        } catch (e) {}
+      }
+      if (!c) return;
+      if ('EGHI'.indexOf(c.charAt(0)) >= 0) {
+        try {
+          const d = await (await fetch('/api/supply_plan_detail?code=' + encodeURIComponent(c))).json();
+          if (!d.error) { openPlanDetail(c); return; }
+        } catch (e) {}
+      }
+      openItemModal(c);
+    } finally { el.classList.remove('busy'); _ntLift(); }
+  }
+  function ntPanel(sel) {   // 안내 줄('채널 품절 경보 패널에서…') = 알림 닫고 그 패널로
+    const p = document.querySelector(sel); if (!p) return;
+    document.getElementById('notify-modal').classList.remove('show');
+    panelOpen(p); scrollToPanel(p, true);
+  }
+  function ntVendor() { openVendorLinks(); _ntLift(); }
   function _ntDayLabel(day) {
     const t = new Date(), p = n => String(n).padStart(2, '0');
     const iso = dt => dt.getFullYear() + '-' + p(dt.getMonth() + 1) + '-' + p(dt.getDate());
@@ -21587,8 +21648,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const base = (dd.getMonth() + 1) + '월 ' + dd.getDate() + '일 (' + '일월화수목금토'[dd.getDay()] + ')';
     return day === iso(t) ? '오늘 · ' + base : (day === iso(y) ? '어제 · ' + base : base);
   }
-  // 본문: '·'로 시작하는 줄은 목록(품번은 칩, '이름: 내용'은 이름 굵게), 목록 앞 첫 줄은 요약 줄, 나머지는 문단
-  function _ntBody(text) {
+  // 본문: '·'로 시작하는 줄은 목록(품번은 칩, '이름: 내용'은 이름 굵게), 목록 앞 첫 줄은 요약 줄, 나머지는 문단.
+  // 목록 줄은 통째로 눌러 그 상세(ntGo), 안내 줄은 그 패널·메뉴로 (2026-11-12)
+  function _ntBody(text, kind) {
     const lines = String(text || '').split(String.fromCharCode(10)).map(s => s.trim()).filter(Boolean);
     let h = '', list = [], seenList = false;
     const flush = () => { if (list.length) { h += '<ul class="nt-list">' + list.join('') + '</ul>'; list = []; } };
@@ -21596,15 +21658,35 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       const c0 = l.charAt(0);
       if (c0 === '·' || c0 === '•' || c0 === '-') {
         seenList = true;
-        let s = l.slice(1).trim(), chip = '';
-        const m = s.match(/^([A-Z][0-9]{4})[ ]+(.*)$/);
-        if (m) { chip = '<span class="nt-code" title="클릭 = 품목 정보" onclick="ntOpenItem(&quot;' + m[1] + '&quot;)">' + m[1] + '</span>'; s = m[2]; }
+        let s = l.slice(1).trim(), chip = '', data = '', tip = '', lead = '';
+        const m = s.match(/^([A-Z][0-9]{4}|ZQ[0-9]+)[ ]+(.*)$/);
+        const m2 = !m && kind === 'chstock' ? s.match(/^(.+?)[ ]+([A-Z][0-9]{4})[ ]+(.*)$/) : null;   // '쿠팡 로켓 I0116 품명 — 재고 …'
+        if (m) { chip = m[1]; s = m[2]; }
+        else if (m2) { chip = m2[2]; lead = m2[1]; s = m2[3]; }
+        if (chip) {
+          data = ' data-c="' + chip + '"' + (lead ? ' data-ch="' + escapeHtml(lead) + '"' : '');
+          tip = kind === 'chstock' ? '클릭 = 이 채널 재고 흐름·납품 주기·다음 납품 예상'
+              : ('EGHI'.indexOf(chip.charAt(0)) >= 0 ? '클릭 = 수급 플래너 상세 (판매 속도·앞으로 재고 예상·창고별 재고)' : '클릭 = 품목 상세 (재고·발주·입고)');
+        } else if (kind === 'vendor') tip = '클릭 = 외주재고 입력 링크·기록 현황';
+        else if (kind === 'health') tip = '클릭 = 데이터 상태 상세';
         const ci = s.indexOf(': ');
-        const txt = (!chip && ci > 0 && ci < 20) ? '<b>' + escapeHtml(s.slice(0, ci)) + '</b>' + escapeHtml(s.slice(ci)) : escapeHtml(s);
-        list.push('<li>' + chip + '<span>' + txt + '</span></li>');
+        const txt = (lead ? '<b>' + escapeHtml(lead) + '</b> ' : '')
+          + ((!chip && ci > 0 && ci < 20) ? '<b>' + escapeHtml(s.slice(0, ci)) + '</b>' + escapeHtml(s.slice(ci)) : escapeHtml(s));
+        list.push('<li' + (tip ? ' class="nt-go" data-k="' + kind + '"' + data + ' onclick="ntGo(this)" title="' + tip + '"' : '') + '>'
+          + (chip ? '<span class="nt-code">' + chip + '</span>' : '') + '<span>' + txt + '</span></li>');
       } else {
         flush();
-        h += (!seenList && !h) ? '<div class="nt-lead">' + escapeHtml(l) + '</div>' : '<div class="nt-text">' + escapeHtml(l) + '</div>';
+        // 안내 줄: 채널 품절 → 그 패널, 거래처 기록·외주재고 입력 → 입력 링크 창, 월간 리포트 → 리포트 열기 단추
+        let go = '';
+        if ((kind === 'chstock' && l.indexOf('채널 품절 경보 패널') >= 0) || (kind === 'daily' && l.indexOf('채널 품절') === 0)) go = 'ntPanel(&quot;.chstock-panel&quot;)';
+        else if (l.indexOf('외주재고 입력') >= 0 || (kind === 'daily' && l.indexOf('거래처 기록') === 0)) go = 'ntVendor()';
+        const cls = (!seenList && !h) ? 'nt-lead' : 'nt-text';
+        h += go ? '<div class="' + cls + ' nt-go" onclick="' + go + '" title="클릭 = 이동">' + escapeHtml(l) + ' ›</div>' : '<div class="' + cls + '">' + escapeHtml(l) + '</div>';
+        const ri = l.indexOf('/report/monthly?ym=');
+        if (ri >= 0) {
+          const ym = l.substr(ri + 19, 6);
+          if (/^[0-9]{6}$/.test(ym)) h += '<a class="nt-link" href="/report/monthly?ym=' + ym + '" target="_blank" rel="noopener">📊 ' + ym.slice(0, 4) + '년 ' + (+ym.slice(4)) + '월 리포트 열기</a>';
+        }
       }
     });
     flush();
@@ -21630,7 +21712,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         + '<span class="nt-kind" style="background:' + bg + ';color:' + fg + '">' + escapeHtml(NOTIFY_KIND[x.kind] || x.kind) + '</span>'
         + escapeHtml(x.title) + (x.id > _ntSeen ? '<span class="nt-new">NEW</span>' : '') + '</div>'
         + '<span class="nt-time">' + escapeHtml(String(x.ts || '').slice(11, 16)) + (sent ? ' · ' + sent : '') + '</span></div>'
-        + _ntBody(x.body) + '</div>';
+        + _ntBody(x.body, x.kind) + '</div>';
     });
     body.innerHTML = h;
   }
