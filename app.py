@@ -11340,8 +11340,16 @@ def api_bom_usage():
 # ====== 시안 변경 소진 계획 (2026-11-11, 부재료 관리 4번) ======
 # 저장 위치 = inv_month 폴더: update_cloud가 GCP로 md5 동기화하는 곳이라 스크립트를 안 고쳐도 됨. 수정은 호스트 PC에서만(GCP는 읽기 전용).
 DESIGN_PLAN_PATH = f'{DATA_DIR}/inv_month/design_plan.csv'
-DESIGN_COLS = ['code', 'product', 'status', 'target', 'group', 'memo', 'created']
+DESIGN_COLS = ['code', 'product', 'status', 'target', 'group', 'memo', 'created', 'src', 'mid', 'murl']
 DESIGN_STATUS = ('대기', '발주완료', '완료')
+# Monday 연결 (2026-11-12 사용자 "먼데이 내용을 시안 변경 계획에 — 고구마말랭이 2차 파우치 전량 숨구멍으로 바뀜"):
+# 핵심업무 보드에서 이름에 포장재 관련 말이 있는 항목의 하위 아이템 중 품번으로 시작하는 것 → 계획 행.
+# 상위 항목 이름 = 묶음, 상위 목표일 = 전환 목표일(비어 있을 때만), 하위 상태 '완료'(또는 상위가 완료 그룹) = 완료.
+# Monday에서 하위 아이템을 지우면 계획에서도 빠짐. 화면 ✕는 Monday 항목이면 숨김('제외') — 다음 동기화 때 다시 생기지 않게.
+DESIGN_MONDAY_BOARDS = ('5031763807', '5031779083')   # 01_단기 핵심업무, 02_중장기 핵심업무 (Maehong L&F)
+DESIGN_MONDAY_WORDS = ('파우치', '포장', '시안', '디자인', '리뉴얼', '구멍', '라벨', '단상자', 'RRP', '박스', '부자재')
+DESIGN_MONDAY_EVERY = 600   # 초 — 패널을 열 때 이만큼 지났으면 뒤에서 다시 가져옴(두 보드 7~10초라 화면은 안 기다림)
+_DESIGN_MON = {'at': 0.0, 'ok': 0.0, 'err': ''}   # at = 마지막 시도, ok = 마지막 성공
 DESIGN_SAFETY_DAYS = 7     # 신규 시안 발주 권장일 = 소진 예상일 − 리드타임 − 이 날짜
 DESIGN_DEFAULT_LEAD = 14   # 실측 리드타임이 없을 때
 _DESIGN_LOCK = threading.Lock()
@@ -11359,19 +11367,121 @@ def _leadtimes_cached():
 def _design_load():
     if not os.path.exists(DESIGN_PLAN_PATH):
         return []
-    return pd.read_csv(DESIGN_PLAN_PATH, dtype=str, encoding='utf-8-sig').fillna('').to_dict('records')
+    rows = pd.read_csv(DESIGN_PLAN_PATH, dtype=str, encoding='utf-8-sig').fillna('').to_dict('records')
+    for r in rows:   # 예전 파일(열 7개)도 읽히게
+        for c in DESIGN_COLS:
+            r.setdefault(c, '')
+    return rows
 
 
 def _design_save(rows):
     tmp = DESIGN_PLAN_PATH + '.tmp'
     os.makedirs(os.path.dirname(DESIGN_PLAN_PATH), exist_ok=True)
-    pd.DataFrame(rows, columns=DESIGN_COLS).to_csv(tmp, index=False, encoding='utf-8-sig')
+    pd.DataFrame(rows, columns=DESIGN_COLS).fillna('').to_csv(tmp, index=False, encoding='utf-8-sig')
     os.replace(tmp, DESIGN_PLAN_PATH)
+
+
+def _monday_q(q):
+    """Monday GraphQL 읽기 한 번."""
+    import requests as _req
+    key = os.getenv('MONDAY_API_KEy')
+    if not key:
+        raise RuntimeError('Monday API 키 없음')
+    j = _req.post('https://api.monday.com/v2', json={'query': q}, headers={'Authorization': key, 'API-Version': '2024-10'}, timeout=30).json()
+    if j.get('errors'):
+        raise RuntimeError(str(j['errors'])[:200])
+    return j.get('data') or {}
+
+
+def _monday_design_items():
+    """핵심업무 보드에서 이름에 포장재 관련 말이 있는 아이템(+하위 아이템) — 이름만 먼저 훑고 맞는 것만 자세히 읽음."""
+    ids = []
+    for b in DESIGN_MONDAY_BOARDS:
+        cursor = None
+        for _ in range(20):
+            if cursor:
+                page = _monday_q('{ next_items_page(limit: 500, cursor: "%s") { cursor items { id name } } }' % cursor).get('next_items_page') or {}
+            else:
+                page = ((_monday_q('{ boards(ids: %s) { items_page(limit: 500) { cursor items { id name } } } }' % b).get('boards') or [{}])[0].get('items_page')) or {}
+            ids += [str(it['id']) for it in page.get('items') or [] if any(w.lower() in str(it.get('name') or '').lower() for w in DESIGN_MONDAY_WORDS)]
+            cursor = page.get('cursor')
+            if not cursor:
+                break
+    out = []
+    for i in range(0, len(ids), 100):
+        out += _monday_q('{ items(ids: [%s], limit: 100) { id name url group { title } column_values { text column { title } } subitems { id name url column_values { text column { title } } } } }'
+                         % ','.join(ids[i:i + 100])).get('items') or []
+    return out
+
+
+def _design_sync_monday(force=False, bg=False):
+    """핵심업무 보드 → 시안 변경 계획 CSV 병합 (호스트 PC만, 기본 10분에 한 번, bg=True면 뒤에서). 실패해도 계획은 그대로 두고 오류만 기록."""
+    if not _IS_HOST_PC or (not force and time.time() - _DESIGN_MON['at'] < DESIGN_MONDAY_EVERY):
+        return
+    _DESIGN_MON['at'] = time.time()
+    if bg:
+        threading.Thread(target=_design_sync_monday_run, daemon=True).start()
+    else:
+        _design_sync_monday_run()
+
+
+def _design_sync_monday_run():
+    def cols(x):
+        return {c['column']['title']: (c.get('text') or '') for c in x.get('column_values') or [] if c.get('column')}
+    try:
+        subs = []
+        for it in _monday_design_items():
+            name = str(it.get('name') or '').strip()
+            if not it.get('subitems'):
+                continue
+            cv = cols(it)
+            pdone = '완료' in str((it.get('group') or {}).get('title', '')) or '완료' in (cv.get('업무상태'), cv.get('진행단계'))
+            for s in it['subitems']:
+                m = re.match(r'\s*([A-Da-d][0-9]{4})', str(s.get('name') or ''))
+                if m:
+                    subs.append({'code': m.group(1).upper(), 'group': name[:40], 'target': cv.get('목표일', '')[:10],
+                                 'done': pdone or cols(s).get('상태', '') in ('완료', 'Done'),
+                                 'mid': str(s.get('id') or ''), 'murl': str(s.get('url') or ''), 'memo': str(s.get('name') or '').strip()[:80]})
+    except Exception as e:
+        _DESIGN_MON['err'] = str(e)[:200]
+        return
+    _DESIGN_MON['err'], _DESIGN_MON['ok'] = '', time.time()
+    with _DESIGN_LOCK:
+        rows = _design_load()
+        by = {r['code']: r for r in rows}
+        seen, changed, today = set(), False, datetime.now().strftime('%Y-%m-%d')
+        for s in subs:
+            seen.add(s['mid'])
+            r = by.get(s['code'])
+            if r is None:
+                r = {'code': s['code'], 'product': '', 'status': '완료' if s['done'] else '대기', 'target': s['target'], 'group': s['group'],
+                     'memo': s['memo'], 'created': today, 'src': 'monday', 'mid': s['mid'], 'murl': s['murl']}
+                rows.append(r)
+                by[s['code']] = r
+                changed = True
+                continue
+            new = dict(r, src='monday', mid=s['mid'], murl=s['murl'])
+            for k in ('group', 'target', 'memo'):   # 화면에서 고친 값은 그대로, 빈 칸만 채움
+                if not new.get(k) and s[k]:
+                    new[k] = s[k]
+            if s['done'] and new.get('status') not in ('완료', '제외'):
+                new['status'] = '완료'
+            if new != r:
+                r.update(new)
+                changed = True
+        keep = [r for r in rows if not (r.get('src') == 'monday' and r.get('mid') and r['mid'] not in seen)]   # Monday에서 지운 하위 아이템
+        if len(keep) != len(rows):
+            rows, changed = keep, True
+        if changed:
+            _design_save(rows)
 
 
 @app.route('/api/design_plan', methods=['GET'])
 def api_design_plan():
-    """시안 변경 계획 — 품번별 잔량·월 사용·소진 예상일·신규 시안 발주 권장일·전환 목표일에 남는 재고. 수정이 바로 보여야 해서 캐시 안 함."""
+    """시안 변경 계획 — 품번별 잔량·월 사용·소진 예상일·신규 시안 발주 권장일·전환 목표일에 남는 재고. 수정이 바로 보여야 해서 캐시 안 함.
+    호스트 PC에선 열 때 Monday 핵심업무 보드를 병합(10분 간격 뒤에서, ?sync=1이면 기다렸다 바로)."""
+    sync = request.args.get('sync') == '1'
+    _design_sync_monday(force=sync, bg=not sync)
     ex = _call_json(api_excess_materials, '/api/excess_materials')
     by = {x['code']: x for x in ex.get('items', [])}
     mon = _submat_monthly()[0]
@@ -11379,7 +11489,7 @@ def api_design_plan():
     names = _mat_names()
     today = pd.Timestamp(datetime.now().date())
     fmt = lambda t: t.strftime('%Y-%m-%d') if t is not None else ''
-    plans = _design_load()
+    plans = [p for p in _design_load() if p.get('status') != '제외']   # 제외 = Monday 항목을 화면에서 숨긴 것
     items = []
     for p in plans:
         c = str(p.get('code', '')).strip().upper()
@@ -11415,13 +11525,16 @@ def api_design_plan():
             lv = 'soon'
         else:
             lv = 'wait'
-        items.append({'code': c, 'name': names.get(c, ''), 'product': p.get('product', ''), 'status': status, 'target': target, 'group': p.get('group', ''), 'memo': p.get('memo', ''),
+        items.append({'code': c, 'name': names.get(c, '') or re.sub(r'^\s*[A-Da-d][0-9]{4}\s*', '', p.get('memo', '')), 'product': p.get('product', ''), 'status': status, 'target': target,
+                      'group': p.get('group', ''), 'memo': p.get('memo', ''), 'src': p.get('src', ''), 'murl': p.get('murl', ''),
                       'stock': round(stock, 1), 'long': it.get('long', 0), 'm': round(m, 1), 'cover': round(cover, 1) if cover is not None else None, 'price': round(price, 2), 'value': int(stock * price),
                       'lead': lt_days, 'lead_real': bool(lt), 'run_out': fmt(run_out), 'order_by': fmt(order_by), 'lv': lv, 'has_item': c in by,
                       'left': round(left, 1) if left is not None else None, 'left_value': int(left * price) if left is not None else None, 'short': round(short, 1) if short is not None else None})
     planned = {x['code'] for x in items}
     cands = sorted(({'code': c, 'name': n, 'stock': by.get(c, {}).get('stock', 0)} for c, n in names.items() if _is_submat(c) and c not in planned), key=lambda x: x['code'])
-    return jsonify({'ok': True, 'items': items, 'candidates': cands, 'editable': _IS_HOST_PC, 'today': fmt(today)})
+    mon_at = datetime.fromtimestamp(_DESIGN_MON['ok']).strftime('%m/%d %H:%M') if _DESIGN_MON['ok'] else ''
+    return jsonify({'ok': True, 'items': items, 'candidates': cands, 'editable': _IS_HOST_PC, 'today': fmt(today),
+                    'monday': {'n': sum(1 for x in items if x['src'] == 'monday'), 'at': mon_at, 'err': _DESIGN_MON['err']}})
 
 
 @app.route('/api/design_plan/save', methods=['POST'])
@@ -11434,13 +11547,16 @@ def api_design_plan_save():
     with _DESIGN_LOCK:
         rows = _design_load()
         if op == 'add':
-            have = {r['code'] for r in rows}
+            have = {r['code']: r for r in rows}
             today = datetime.now().strftime('%Y-%m-%d')
             for c in d.get('codes') or []:
                 c = str(c).strip().upper()
-                if _is_submat(c) and c not in have:
-                    rows.append({'code': c, 'product': '', 'status': '대기', 'target': '', 'group': str(d.get('group') or '')[:40], 'memo': '', 'created': today})
-                    have.add(c)
+                if c in have and have[c].get('status') == '제외':   # 숨겼던 Monday 항목을 다시 추가
+                    have[c]['status'] = '대기'
+                elif _is_submat(c) and c not in have:
+                    rows.append({'code': c, 'product': '', 'status': '대기', 'target': '', 'group': str(d.get('group') or '')[:40], 'memo': '', 'created': today,
+                                 'src': '', 'mid': '', 'murl': ''})
+                    have[c] = rows[-1]
         elif op == 'set':
             field, value, code = d.get('field'), str(d.get('value') or '').strip(), str(d.get('code') or '').strip().upper()
             if field not in ('status', 'target', 'group', 'memo') or (field == 'status' and value not in DESIGN_STATUS):
@@ -11452,7 +11568,10 @@ def api_design_plan_save():
                     r[field] = value[:80]
         elif op == 'del':
             code = str(d.get('code') or '').strip().upper()
-            rows = [r for r in rows if r['code'] != code]
+            for r in rows:
+                if r['code'] == code and r.get('src') == 'monday':
+                    r['status'] = '제외'   # Monday 항목은 숨김만 — 지우면 다음 동기화 때 다시 생김
+            rows = [r for r in rows if r['code'] != code or r.get('src') == 'monday']
         else:
             return jsonify({'ok': False, 'error': '잘못된 요청'}), 400
         _design_save(rows)
@@ -14858,6 +14977,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .dp-add button:hover { background: #fce7f3; }
   .dp-ctl { font: inherit; font-size: 11.5px; padding: 2px 4px; border: 1px solid var(--border); border-radius: 6px; background: #fff; }
   .dp-ctl:disabled { background: #f8fafc; color: #64748b; }
+  .dp-mon { display: inline-block; margin-right: 5px; padding: 0 5px; border-radius: 4px; background: #6366f1; color: #fff; font-size: 10px; font-weight: 800; text-decoration: none; vertical-align: 1px; }
+  .dp-mon:hover { background: #4f46e5; }
+  .dp-grp { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   /* 재고 비교 차이 원인 (2026-11-11) */
   .sc-why { display: inline-block; margin: 1px 3px 1px 0; padding: 1px 6px; border-radius: 7px; font-size: 10.5px; font-weight: 700; white-space: nowrap; }
   .sc-cause { border: 1px solid var(--b); background: var(--b); color: var(--c); font: inherit; font-size: 11px; font-weight: 700; padding: 1px 8px; border-radius: 8px; margin-left: 4px; cursor: pointer; }
@@ -16720,6 +16842,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       <div><span class="chart-title">🎨 시안 변경 소진 계획</span><span class="chart-sub">바꿀 부재료의 잔량 → 소진 예상일 · 신규 시안 발주 시점 · 전환일에 남는 재고 · 클릭=상세</span></div>
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <div class="vk-chips"><button class="vk-chip on" data-f="open" onclick="setDpFilter('open',this)">진행 중</button><button class="vk-chip" data-f="all" onclick="setDpFilter('all',this)">전체</button></div>
+        <button class="po-cal-btn" id="dp-sync" onclick="dpSync()" title="Monday 핵심업무 보드(포장재 변경 항목의 하위 아이템)에서 지금 다시 가져오기">↻ Monday</button>
         <input id="dp-q" type="text" placeholder="품번/품명 검색 · 추가" oninput="renderDesignPlan()" style="width:190px;padding:5px 9px;font-size:12px;border:1px solid var(--border);border-radius:6px">
         <div id="dp-count" style="font-size:11px;color:var(--text-3);font-weight:600;white-space:nowrap"></div>
       </div>
@@ -20949,7 +21072,15 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     await loadDesignPlan();
   }
   function dpSet(el, field) { _dpPost({ op: 'set', code: el.closest('tr').dataset.c, field: field, value: el.value }); }
-  function dpDel(el) { const c = el.closest('tr').dataset.c; if (confirm(c + ' 계획을 목록에서 지울까요?')) _dpPost({ op: 'del', code: c }); }
+  function dpDel(el) {
+    const tr = el.closest('tr'), c = tr.dataset.c, mon = tr.dataset.src === 'monday';
+    if (confirm(mon ? c + '은 Monday에서 온 항목이라 이 목록에서만 숨겨요(Monday는 그대로). 숨길까요?' : c + ' 계획을 목록에서 지울까요?')) _dpPost({ op: 'del', code: c });
+  }
+  async function dpSync() {
+    const b = document.getElementById('dp-sync'); b.disabled = true; b.textContent = '가져오는 중…';
+    try { const d = await (await fetch('/api/design_plan?sync=1')).json(); if (d.ok) { _dpData = d; renderDesignPlan(); } } catch (e) {}
+    b.disabled = false; b.textContent = '↻ Monday';
+  }
   function dpAdd(codes) { document.getElementById('dp-q').value = ''; _dpPost({ op: 'add', codes: codes }); }
   function renderDesignPlan() {
     const d = _dpData, list = document.getElementById('dp-list'); if (!d) return;
@@ -20958,7 +21089,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const sumLeft = open.reduce((s, x) => s + (x.left_value || 0), 0), idleV = open.filter(x => x.lv === 'idle').reduce((s, x) => s + x.value, 0);
     document.getElementById('dp-summary').innerHTML = '진행 중 <b>' + open.length + '품번</b> · <b style="color:#b91c1c">지금 발주 ' + open.filter(x => x.lv === 'now').length + '</b> · <b style="color:#c2410c">곧 발주(2주 안) ' + open.filter(x => x.lv === 'soon').length + '</b>'
       + (sumLeft ? ' · 전환 목표일에 남을 재고 <b style="color:#9d174d">' + won(sumLeft) + '원</b>' : '') + (idleV ? ' · 사용 없는 잔량 <b>' + won(idleV) + '원</b>' : '')
-      + ' · 발주 권장일 = 소진 예상일 − 리드타임(실측, 없으면 14일) − 7일' + (ed ? '' : ' · <b>수정은 회사 PC 대시보드에서</b>');
+      + ' · 발주 권장일 = 소진 예상일 − 리드타임(실측, 없으면 14일) − 7일' + (ed ? '' : ' · <b>수정은 회사 PC 대시보드에서</b>')
+      + (d.monday ? ' · Monday 연결 <b>' + d.monday.n + '품번</b>' + (d.monday.err ? ' <span style="color:#b91c1c">(가져오기 실패: ' + escapeHtml(d.monday.err.slice(0, 60)) + ')</span>' : (d.monday.at ? ' (' + d.monday.at + ' 가져옴)' : '')) : '');
+    document.getElementById('dp-sync').style.display = ed ? '' : 'none';
     // 검색어가 있으면 계획에 없는 품번을 추가 후보로 (호스트 PC만)
     const add = document.getElementById('dp-add');
     const cand = q && ed ? d.candidates.filter(x => (x.code + ' ' + x.name).toLowerCase().includes(q)) : [];
@@ -20979,10 +21112,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         const left = x.left == null ? '<span style="color:#cbd5e1">목표일 입력</span>' : (x.short > 0 ? '<span style="color:#1d4ed8;font-weight:700" title="목표일 전에 구 시안이 바닥남">' + fmtInt(Math.round(x.short)) + '개 모자람</span>'
           : (x.left > 0 ? '<b style="color:#9d174d">' + fmtInt(Math.round(x.left)) + '개</b><div style="font-size:10px;color:#9d174d">' + (x.price ? won(x.left_value) + '원 폐기 예상' : '단가 없음') + '</div>' : '<span style="color:#15803d;font-weight:700">딱 맞게 소진</span>'));
         const run = x.m > 0 ? (x.run_out ? md(x.run_out) : '10년 이상') : '<span style="color:#9a3412">사용 없음</span>';
-        return '<tr data-c="' + escapeHtml(x.code) + '" data-x="' + (x.has_item ? 1 : 0) + '" onclick="if (this.dataset.x === &quot;1&quot;) openExcessDetail(this.dataset.c)" title="' + (x.has_item ? '클릭 = 월별 사용·쓰는 제품·발주 이력' : '재고가 없어 상세가 없어요') + '">'
+        return '<tr data-c="' + escapeHtml(x.code) + '" data-src="' + escapeHtml(x.src || '') + '" data-x="' + (x.has_item ? 1 : 0) + '" onclick="if (this.dataset.x === &quot;1&quot;) openExcessDetail(this.dataset.c)" title="' + (x.has_item ? '클릭 = 월별 사용·쓰는 제품·발주 이력' : '재고가 없어 상세가 없어요') + '">'
           + '<td><span class="ex-badge" style="background:' + st[2] + ';color:' + st[1] + '">' + st[0] + '</span></td>'
           + '<td><select class="dp-ctl" ' + stop + ' onchange="dpSet(this, &quot;status&quot;)"' + dis + '>' + ['대기', '발주완료', '완료'].map(s => '<option' + (s === x.status ? ' selected' : '') + '>' + s + '</option>').join('') + '</select></td>'
-          + '<td style="font-weight:700;white-space:nowrap">' + escapeHtml(x.code) + '</td><td style="min-width:200px">' + escapeHtml(x.name) + '</td><td style="white-space:nowrap;color:var(--text-3)">' + escapeHtml(x.group || '') + '</td>'
+          + '<td style="font-weight:700;white-space:nowrap">' + escapeHtml(x.code) + '</td><td style="min-width:200px">' + escapeHtml(x.name) + '</td><td style="color:var(--text-3)"><div class="dp-grp" title="' + escapeHtml(x.group || '') + '">' + (x.src === 'monday' ? '<a class="dp-mon" href="' + escapeHtml(x.murl || '#') + '" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Monday에서 보기 — ' + escapeHtml(x.memo || '') + '">M</a>' : '') + escapeHtml(x.group || '') + '</div></td>'
           + '<td style="text-align:right;white-space:nowrap">' + fmtInt(Math.round(x.stock)) + (x.long > 0 ? '<div style="font-size:10px;color:#94a3b8">폐기·장기 ' + fmtInt(Math.round(x.long)) + '</div>' : '') + '</td>'
           + '<td style="text-align:right;white-space:nowrap">' + (x.m > 0 ? fmtInt(Math.round(x.m)) : '-') + '</td><td style="text-align:right;white-space:nowrap">' + run + '</td>'
           + '<td style="text-align:right;white-space:nowrap;font-weight:700;color:' + (x.lv === 'now' ? '#b91c1c' : x.lv === 'soon' ? '#c2410c' : 'inherit') + '" title="리드타임 ' + x.lead + '일' + (x.lead_real ? '(실측)' : '(기본)') + '">' + md(x.order_by) + '</td>'
