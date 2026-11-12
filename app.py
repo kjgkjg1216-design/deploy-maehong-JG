@@ -13276,6 +13276,34 @@ def api_po_erp():
     return jsonify({'items': rows[:15], 'total': len(rows), 'kind': kind})
 
 
+_CO_SUFFIX_RE = re.compile(r'농업회사법인|영농조합법인|유한회사|주식회사|\(주\)|\(유\)|㈜')
+
+
+def _co_short(s):
+    """화면용 짧은 상호 — '주식회사어기여차크리에이티브' → '어기여차크리에이티브', '(주)대영알와이(DAEYOUNGRY)' → '대영알와이'."""
+    s0 = str(s or '').strip()
+    s = re.sub(r'\s*\([A-Za-z0-9 .,&\-]*\)', '', _CO_SUFFIX_RE.sub('', s0))
+    return re.sub(r'\s+', ' ', s).strip() or s0
+
+
+_SPEC_VENDOR_CACHE = {}
+
+
+def _spec_vendor_map():
+    """부자재 규격 보드 품번 → 업체(아이템명). 업체가 하나뿐인 품번만, ZQ(여러 품목이 같이 쓰는 공용 코드)는 제외.
+    예상입고일 발주 업체에서 아마란스 최근 6개월 발주가 없을 때 보조로 씀 (2026-11-12)."""
+    key = id(MONDAY_DF)
+    if _SPEC_VENDOR_CACHE.get('k') != key:
+        tmp = {}
+        if MONDAY_DF is not None and not MONDAY_DF.empty:
+            for _, r in MONDAY_DF[MONDAY_DF['보드명'] == '부자재 규격'].iterrows():
+                c, v = str(r.get('품번', '')).strip().upper(), str(r.get('아이템명', '')).strip()
+                if c and v and v.lower() != 'nan':
+                    tmp.setdefault(c, set()).add(v)
+        _SPEC_VENDOR_CACHE.update(k=key, v={c: next(iter(vs)) for c, vs in tmp.items() if len(vs) == 1 and not c.startswith('ZQ')})
+    return _SPEC_VENDOR_CACHE['v']
+
+
 @app.route('/api/po_pending', methods=['GET'])
 @cached_api()
 def api_po_pending():
@@ -13308,8 +13336,12 @@ def api_po_pending():
         # 먼데이 '발주업체'가 비어 있는 건이 많아 아마란스 최근 발주의 거래처를 함께 (2026-11-04, 캘린더에 발주 업체 표시)
         _erp = _erp_orders(_sv('아이템명') or _sv('품번'), 'po')
         maker = _erp[0]['vendor'] if _erp else ''
+        # 발주 업체(목록 품번 옆 칸, 2026-11-12 사용자 "발주가 들어간 업체"): 먼데이 발주업체 › 아마란스 최근 발주 거래처 › 부자재 규격 보드 업체
+        spec_v = '' if (_sv('발주업체') or maker) else _spec_vendor_map().get((_sv('아이템명') or _sv('품번')).upper(), '')
+        sup, sup_src = ((_sv('발주업체'), 'monday') if _sv('발주업체') else (maker, 'erp') if maker else (spec_v, 'spec') if spec_v else ('', ''))
         po_detail = [{'label': k, 'value': v} for k, v in (
-            ('품번', _sv('아이템명') or _sv('품번')), ('품명', _sv('품명')), ('발주업체', _sv('발주업체') or (maker + ' (아마란스 최근 발주)' if maker else '')), ('입고처', _sv('입고처')),
+            ('품번', _sv('아이템명') or _sv('품번')), ('품명', _sv('품명')),
+            ('발주업체', _sv('발주업체') or (maker + ' (아마란스 최근 발주)' if maker else (spec_v + ' (부자재 규격 보드 업체)' if spec_v else ''))), ('입고처', _sv('입고처')),
             ('발주 요청일', _sv('발주 요청일')), ('요청수량', _n('요청수량')), ('실발주 수량', _n('실발주 수량')),
             ('잔량', (f"{remain['qty']:,}{remain.get('unit', '')}" if remain and remain.get('qty') else '')),
             ('입고 예정', eta_display or '미정'), ('진행 그룹', _sv('그룹'))) if v]
@@ -13323,6 +13355,7 @@ def api_po_pending():
             'request_date': str(r.get('발주 요청일', '')).strip(),
             'vendor': str(r.get('발주업체', '')).strip(),
             'maker': maker,   # 아마란스 최근 발주 거래처 — 먼데이 발주업체가 비었을 때 캘린더 줄에 씀
+            'supplier': sup, 'supplier_short': _co_short(sup), 'supplier_src': sup_src,
             'destination': str(r.get('입고처', '')).strip(),
             'schedule_entries': entries,
             'updates': _extract_po_updates(upd),  # 전체 말풍선 (작성자 무관)
@@ -13353,6 +13386,7 @@ def api_po_pending():
             'qty': str(r.get('입항 물량', '')).strip(),
             'request_date': str(r.get('선적 일정', '')).strip(),
             'vendor': str(r.get('수입원', '')).strip(),
+            'supplier': str(r.get('수입원', '')).strip(), 'supplier_short': _co_short(r.get('수입원', '')), 'supplier_src': 'monday' if str(r.get('수입원', '')).strip() else '',
             'destination': str(r.get('상태', '')).strip(),  # 선적 예정/입항 중
             'schedule_entries': [],
             'updates': _extract_po_updates(str(r.get('업데이트', '') or '').strip()),
@@ -13414,6 +13448,7 @@ def api_po_pending():
                 'qty': qty,
                 'request_date': '',
                 'vendor': vendor,
+                'supplier': vendor, 'supplier_short': _co_short(vendor), 'supplier_src': 'monday' if vendor else '',
                 'destination': str(r.get('그룹', '')).strip(),
                 'schedule_entries': [],
                 'updates': imp_updates,
@@ -15785,6 +15820,47 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   /* '미정'·'보류' 배지는 행 종류(raw/import-raw) 배경색 덮어쓰기보다 우선 → 가독성 확보 */
   .po-inline-row .po-inline-chip.empty { background: #fee2e2; color: #b91c1c; border: 1px solid #fca5a5; }
   .po-inline-row .po-inline-chip.hold { background: #ffedd5; color: #c2410c; border: 1px solid #fdba74; }
+  /* 원/부자재 예상입고일·외주 입고 물량 (2026-11-12, 사용자 "좀 더 보기 편하게" → "외주도 같은 방식"): 날짜 칸을 맨 앞으로 + 지남·오늘·7일 안·그 뒤·미정 묶음.
+     전엔 날짜 칩이 지난 날짜·오늘·다음 주 모두 같은 빨강이라 급한 건이 안 보였음. 외주는 확인 필요·보류 묶음 + 희망일(요청 입고일) 표시 */
+  .pd-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; }
+  .pd-bar .po-inline-search { flex: 1 1 160px; width: auto; margin-bottom: 0; }
+  .pd-bar .vk-chip i { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 4px; }
+  .po-inline-row.pd { grid-template-columns: 66px 84px minmax(0, 1fr) auto auto auto; }
+  .pd-sec { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 6px; padding: 7px 10px 5px; font-size: 11.5px; font-weight: 800;
+            color: var(--pc); background: var(--surface, #fff); border-bottom: 2px solid var(--pc); }
+  .pd-sec .n { font-size: 10.5px; padding: 0 7px; border-radius: 9px; background: var(--pc); color: #fff; font-variant-numeric: tabular-nums; }
+  .pd-sec .h { font-size: 10.5px; font-weight: 600; color: var(--text-3); }
+  .pd-sec.late { --pc: #dc2626; } .pd-sec.today { --pc: #ea580c; } .pd-sec.week { --pc: #2563eb; } .pd-sec.later { --pc: #64748b; } .pd-sec.none { --pc: #94a3b8; } .pd-sec.hold { --pc: #c2410c; }
+  .pd-date { display: flex; flex-direction: column; align-items: center; justify-content: center; align-self: stretch; gap: 1px; padding: 3px 2px;
+             border-radius: 8px; line-height: 1.15; text-align: center; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .pd-date b { font-size: 11.5px; font-weight: 800; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+  .pd-date small { font-size: 9.5px; font-weight: 700; opacity: .9; }
+  .pd-date.late { background: #fee2e2; color: #b91c1c; }
+  .pd-date.today { background: #ea580c; color: #fff; }
+  .pd-date.week { background: #dbeafe; color: #1d4ed8; }
+  .pd-date.later { background: #f1f5f9; color: #475569; }
+  .pd-date.none { border: 1px dashed #cbd5e1; color: #64748b; }
+  .pd-date.hold { background: #ffedd5; color: #c2410c; }
+  .pd-date small.over { color: #b91c1c; }
+  .pd-want { color: #b91c1c; font-weight: 700; }
+  @container (max-width: 640px) {
+    .po-inline-row.pd { grid-template-columns: 66px 84px minmax(0, 1fr); }
+    .po-inline-row.pd > :first-child { grid-column: 1; grid-row: 1 / span 2; }
+    .po-inline-row.pd > :nth-child(2) { grid-column: 2; grid-row: 1; }
+    .po-inline-row.pd > :nth-child(3) { grid-column: 3; grid-row: 1; }
+    .po-inline-row.pd > .po-inline-extra { grid-column: 2 / -1; grid-row: 2; justify-self: stretch; }
+  }
+  /* 원/부자재 예상입고일만: 품번 칸을 줄이고(5글자) 그 옆에 발주 업체 칸 (2026-11-12 사용자 "품번 옆 빈칸에 발주가 들어간 업체"). 좁으면 업체는 품번 아래 */
+  #po-inline-list .po-inline-row.pd { grid-template-columns: 66px 50px 116px minmax(0, 1fr) auto auto auto; }
+  .pd-sup { font-size: 11px; font-weight: 700; color: #334155; letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pd-sup.spec { color: #64748b; font-weight: 600; }
+  .pd-sup.none { color: #cbd5e1; }
+  @container (max-width: 640px) {
+    #po-inline-list .po-inline-row.pd { grid-template-columns: 66px 84px minmax(0, 1fr); }
+    #po-inline-list .po-inline-row.pd > .pd-sup { grid-column: 2; grid-row: 2; }
+    #po-inline-list .po-inline-row.pd > :nth-child(4) { grid-column: 3; grid-row: 1; }
+    #po-inline-list .po-inline-row.pd > .po-inline-extra { grid-column: 3; grid-row: 2; }
+  }
 
   /* ───── PO Pending Modal ───── */
   .po-row {
@@ -16533,6 +16609,15 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     .po-inline-extra .po-inline-dest { max-width: 100%; }
     .po-inline-extra .po-inline-qty { max-width: 140px; }
     .po-inline-name { font-size: 11px; }
+    .po-inline-row.pd { grid-template-columns: 60px 76px minmax(0, 1fr); }
+    .po-inline-row.pd > :first-child { grid-column: 1; grid-row: 1 / span 2; }
+    .po-inline-row.pd > :nth-child(2) { grid-column: 2; grid-row: 1; }
+    .po-inline-row.pd > :nth-child(3) { grid-column: 3; grid-row: 1; }
+    .po-inline-row.pd > .po-inline-extra { grid-column: 2 / -1; grid-row: 2; justify-self: stretch; }
+    #po-inline-list .po-inline-row.pd { grid-template-columns: 60px 76px minmax(0, 1fr); }
+    #po-inline-list .po-inline-row.pd > .pd-sup { grid-column: 2; grid-row: 2; }
+    #po-inline-list .po-inline-row.pd > :nth-child(4) { grid-column: 3; grid-row: 1; }
+    #po-inline-list .po-inline-row.pd > .po-inline-extra { grid-column: 3; grid-row: 2; }
     /* 모바일 가로 넘침 방지(2026-09-04): 그리드 자식 min-width:auto 때문에 긴 품명이 1fr 칸을 밀어 화면 밖으로 나가던 문제 */
     .chart-panel, .chart-grid > *, .po-inline-row > *, .alert-row > *, .po-inline-list, .alert-list { min-width: 0; }
     .po-inline-name, .alert-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -16721,7 +16806,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       </div>
       <div id="po-inline-count" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
     </div>
-    <input id="po-inline-search" class="po-inline-search" type="text" placeholder="품번/품명 검색…" oninput="renderPoInline()">
+    <div class="pd-bar">
+      <input id="po-inline-search" class="po-inline-search" type="text" placeholder="품번/품명 검색…" oninput="renderPoInline()">
+      <div class="vk-chips" id="po-inline-types"></div>
+    </div>
     <div id="po-inline-list" class="po-inline-list"><div class="loading" style="padding:16px">로딩 중...</div></div>
   </div>
   <div class="chart-panel os-inline">
@@ -16732,7 +16820,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       </div>
       <div id="os-inline-count" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
     </div>
-    <input id="os-inline-search" class="po-inline-search" type="text" placeholder="품번/품명 검색…" oninput="renderOsInline()">
+    <div class="pd-bar">
+      <input id="os-inline-search" class="po-inline-search" type="text" placeholder="품번/품명 검색…" oninput="renderOsInline()">
+      <div class="vk-chips" id="os-inline-types"></div>
+    </div>
     <div id="os-inline-list" class="po-inline-list"><div class="loading" style="padding:16px">로딩 중...</div></div>
   </div>
   <div class="chart-panel scope-jasa alert-span">
@@ -18770,30 +18861,81 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       document.getElementById('po-inline-list').innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>';
     }
   }
+  // ───── 예상입고일·외주 입고 공용 (2026-11-12): 오늘 기준 날짜 칸·지남/오늘/7일 안/그 뒤 묶음·종류 칩 ─────
+  // 'YYYY-MM-DD…' → [y, m, d] — 못 읽거나 9999 같은 자리표시면 null
+  function _pdDay(s) {
+    const p = String(s || '').slice(0, 10).split('-').map(Number);
+    return (p.length === 3 && p[0] > 2000 && p[0] < 9000 && p[1] >= 1 && p[1] <= 12 && p[2] >= 1 && p[2] <= 31) ? p : null;
+  }
+  function _pdCtx() {   // diff([y,m,d]) = 오늘부터 며칠 뒤(지난 날은 음수), md(n) = 오늘+n일의 'M/D'
+    const now = new Date(), T0 = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+    return {
+      diff: p => Math.round((Date.UTC(p[0], p[1] - 1, p[2]) - T0) / 86400000),
+      md: n => { const d = new Date(T0 + n * 86400000); return (d.getUTCMonth() + 1) + '/' + d.getUTCDate(); },
+    };
+  }
+  function _pdBucket(n) { return n < 0 ? 'late' : n === 0 ? 'today' : n <= 7 ? 'week' : 'later'; }
+  function _pdDateHtml(p, n, title) {   // 날짜 칸: 날짜·요일 + 며칠 지남/오늘/며칠 뒤
+    const wd = '일월화수목금토'.charAt(new Date(p[0], p[1] - 1, p[2]).getDay());
+    return '<span class="pd-date ' + _pdBucket(n) + '" title="' + escapeHtml(title) + '"><b>' + p[1] + '/' + p[2] + ' ' + wd + '</b><small>'
+      + (n < 0 ? (-n) + '일 지남' : n === 0 ? '오늘' : n + '일 뒤') + '</small></span>';
+  }
+  function _pdChipsHtml(TY, counts, total, cur, fn) {   // 전체 + 지금 있는 종류만
+    if (!total) return '';
+    const b = (k, label) => '<button type="button" class="vk-chip' + (cur === k ? ' on' : '') + '" onclick="' + fn + '(&quot;' + k + '&quot;)">' + label + '</button>';
+    return b('all', '전체 ' + total) + TY.filter(y => counts[y[0]]).map(y => b(y[0], '<i style="background:' + y[2] + '"></i>' + y[1] + ' ' + counts[y[0]])).join('');
+  }
+  function _pdGroupsHtml(SEC, B, row) {   // 묶음마다 감싸서 스크롤할 때 묶음 제목이 위에 붙어 있다가 다음 묶음 제목이 밀어냄
+    return SEC.filter(s => B[s[0]].length).map(s => '<div class="pd-grp"><div class="pd-sec ' + s[0] + '">' + s[1] + '<span class="n">' + B[s[0]].length + '</span>'
+      + (s[2] ? '<span class="h">' + s[2] + '</span>' : '') + '</div>' + B[s[0]].map(row).join('') + '</div>').join('');
+  }
+  let _poInlineType = 'all';   // 종류 칩: all / po(부자재) / raw(원료) / import_raw(수입 원료)
+  function setPoInlineType(t) { _poInlineType = t; renderPoInline(); document.getElementById('po-inline-list').scrollTop = 0; }
   function renderPoInline() {
     const list = document.getElementById('po-inline-list');
     const cnt = document.getElementById('po-inline-count');
     const q = (document.getElementById('po-inline-search').value || '').toLowerCase().trim();
     const all = _poInlineItems;
-    const items = q
-      ? all.filter(it => (it.code||'').toLowerCase().includes(q) || (it.name||'').toLowerCase().includes(q) || (it.contract||'').toLowerCase().includes(q))
-      : all;
-    const pending = items.filter(x => !x.has_schedule).length;
-    cnt.textContent = items.length + '/' + all.length + '건 · 미정 ' + pending;
+    const C = _pdCtx(), diff = C.diff, md = C.md;
+    // 종류 칩
+    const TY = [['po', '부자재', '#059669'], ['raw', '원료', '#7c3aed'], ['import_raw', '수입 원료', '#0369a1']], tc = {};
+    all.forEach(x => { tc[x.type] = (tc[x.type] || 0) + 1; });
+    if (_poInlineType !== 'all' && !tc[_poInlineType]) _poInlineType = 'all';
+    document.getElementById('po-inline-types').innerHTML = _pdChipsHtml(TY, tc, all.length, _poInlineType, 'setPoInlineType');
+    const items = all.filter(it => (_poInlineType === 'all' || it.type === _poInlineType)
+      && (!q || (it.code||'').toLowerCase().includes(q) || (it.name||'').toLowerCase().includes(q) || (it.contract||'').toLowerCase().includes(q) || (it.supplier||'').toLowerCase().includes(q)));
+    // 지남·오늘·7일 안·그 뒤·미정 — 날짜로 못 읽는 일정 글자(예: '11월 중순')는 미정 묶음 맨 앞에 그 글자 그대로
+    const B = { late: [], today: [], week: [], later: [], none: [] };
+    items.forEach(it => {
+      const p = it.has_schedule ? _pdDay(it.eta_sort) : null, n = p ? diff(p) : 0;
+      B[p ? _pdBucket(n) : 'none'].push({ it: it, p: p, n: n });
+    });
+    B.none.forEach(x => { const r = _pdDay(x.it.request_date); x.ago = r ? -diff(r) : null; });
+    B.none.sort((a, b) => (a.it.has_schedule ? 0 : 1) - (b.it.has_schedule ? 0 : 1) || (a.ago == null) - (b.ago == null) || (b.ago || 0) - (a.ago || 0));
+    cnt.innerHTML = (items.length !== all.length ? items.length + '/' : '') + all.length + '건'
+      + (B.late.length ? ' · <b style="color:#dc2626">지남 ' + B.late.length + '</b>' : '')
+      + (B.today.length ? ' · <b style="color:#ea580c">오늘 ' + B.today.length + '</b>' : '') + ' · 미정 ' + B.none.length;
     if (!items.length) {
       list.innerHTML = '<div class="alert-empty">' + (q ? '검색 결과 없음' : '발주완료 항목 없음') + '</div>';
       return;
     }
-    list.innerHTML = items.map(it => {
+    const row = x => {
+        const it = x.it;
         const code = escapeHtml(it.code || '-');
         const name = escapeHtml(it.name || '');
         const isImport = it.type === 'import_raw';
         const typeCls = it.type === 'raw' ? ' raw' : isImport ? ' import-raw' : '';
         const qtyText = (it.type === 'raw' || isImport) ? (it.qty || '') : (it.qty ? fmtNum(it.qty) : '');
         const qtyChip = qtyText ? '<span class="po-inline-qty" title="' + escapeHtml(qtyText) + '">' + escapeHtml(qtyText) + '</span>' : '<span></span>';
-        const chip = it.has_schedule
-          ? '<span class="po-inline-chip">' + escapeHtml(it.eta_display || '-') + '</span>'
-          : '<span class="po-inline-chip empty">미정</span>';
+        // 날짜 칸 (맨 앞): 날짜·요일 + 며칠 지남/오늘/며칠 뒤, 미정은 발주 요청 후 며칠
+        let date;
+        if (x.p) {
+          date = _pdDateHtml(x.p, x.n, '입고 예정 ' + String(it.eta_sort).slice(0, 10));
+        } else {
+          const t = it.has_schedule ? (it.eta_display || '미정') : '미정';
+          date = '<span class="pd-date none" title="' + (x.ago != null ? '발주 요청일 ' + escapeHtml(String(it.request_date).slice(0, 10)) : '입고 예정일 미정') + '"><b>' + escapeHtml(t) + '</b>'
+            + (x.ago != null && x.ago >= 0 ? '<small>' + (x.ago === 0 ? '오늘 요청' : '요청 ' + x.ago + '일 전') + '</small>' : '') + '</span>';
+        }
         const destChip = it.destination
           ? '<span class="po-inline-dest" title="클릭하여 펼치기/접기" onclick="event.stopPropagation();this.classList.toggle(\\'expanded\\')">' + escapeHtml(it.destination) + '</span>'
           : '<span></span>';
@@ -18809,11 +18951,21 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
           : '<div><div class="po-inline-name" title="' + name + '">' + name + '</div></div>';
         // 클릭 = 그 건의 Monday 내역 + 말풍선 (2026-10-23: 부자재·원료도 — 예전엔 발주완료 전체 목록 창이 열렸음)
         const clickFn = 'onclick="showImportDetail(' + _poInlineItems.indexOf(it) + ')" style="cursor:pointer" title="클릭 = 이 건 내역·말풍선 대화"';
-        return '<div class="po-inline-row' + typeCls + '" ' + clickFn + '>'
-             + '<span class="po-inline-code">' + code + '</span>'
+        // 발주 업체 칸 (2026-11-12 사용자 "품번 옆 빈칸에 발주가 들어간 업체"): 먼데이 발주업체 › 아마란스 최근 발주 › 부자재 규격 보드 업체.
+        // 수입 원료는 예전에 품번 칸에 수입원을 썼음 → 수입원은 이 칸으로, 품번 칸은 '수입'
+        const sup = it.supplier_short || '';
+        const supTitle = it.supplier
+          ? '발주 업체: ' + it.supplier + (it.supplier_src === 'erp' ? ' (아마란스 최근 발주 거래처)' : it.supplier_src === 'spec' ? ' (부자재 규격 보드 업체 — 아마란스 최근 6개월 발주 없음)' : '')
+          : '발주 업체 정보 없음 — 아마란스 최근 6개월 발주·부자재 규격 보드에 없음';
+        return '<div class="po-inline-row pd' + typeCls + '" ' + clickFn + '>' + date
+             + '<span class="po-inline-code">' + (isImport ? '수입' : code) + '</span>'
+             + '<span class="pd-sup' + (sup ? (it.supplier_src === 'spec' ? ' spec' : '') : ' none') + '" title="' + escapeHtml(supTitle) + '">' + (sup ? escapeHtml(sup) : '–') + '</span>'
              + nameBlock
-             + '<span class="po-inline-extra">' + qtyChip + destChip + remainChip + '</span>' + chip + '</div>';
-      }).join('');
+             + '<span class="po-inline-extra">' + qtyChip + destChip + remainChip + '</span></div>';
+    };
+    const SEC = [['late', '⚠ 입고일 지남', '늦어지는 중이거나 Monday 미반영'], ['today', '오늘 입고', ''], ['week', '7일 안', md(1) + ' ~ ' + md(7)],
+                 ['later', '그 뒤', md(8) + '부터'], ['none', '일정 미정', '발주 요청 오래된 순']];
+    list.innerHTML = _pdGroupsHtml(SEC, B, row);
   }
 
   // ───── 원/부자재 입고일정 캘린더 ─────
@@ -18950,8 +19102,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const sub = it.type === 'import_raw' && it.contract ? '<div class="dsub">' + escapeHtml(it.contract) + '</div>' : '';
     const qtyText = (it.type === 'raw' || it.type === 'import_raw') ? (it.qty || '') : (it.qty ? fmtNum(it.qty) : '');
     // 발주 업체 → 입고처를 한 줄에 (2026-11-04 사용자 "어떤 업체로 발주가 나갔는지 캘린더만 봐서는 모름") · 클릭 = 이 건 상세
-    const vend = it.vendor || it.maker;   // 먼데이 발주업체, 비었으면 아마란스 최근 발주 거래처
-    const dest = (vend ? ' · ' + escapeHtml(_coShort(vend)) + (it.destination ? ' → ' + escapeHtml(it.destination) : '') : (it.destination ? ' · ' + escapeHtml(it.destination) : ''));
+    const vend = it.supplier_short || _coShort(it.vendor || it.maker);   // 발주 업체 = 먼데이 발주업체 › 아마란스 최근 발주 거래처 › 부자재 규격 보드 업체 (짧은 상호)
+    const dest = (vend ? ' · ' + escapeHtml(vend) + (it.destination ? ' → ' + escapeHtml(it.destination) : '') : (it.destination ? ' · ' + escapeHtml(it.destination) : ''));
     return '<div class="pocal-drow clk" onclick="showImportDetail(' + _poInlineItems.indexOf(it) + ')" title="클릭 = 발주 업체·아마란스 발주 내역·말풍선">'
          + '<span class="tag ' + it.type + '"></span>'
          + '<span class="dcode">' + code + '</span>'
@@ -22128,37 +22280,58 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     if (e.target.id === 'spec-preview-modal') closeSpecPreview();
   });
 
+  let _osInlineGrp = 'all';   // 그룹 칩: all / done(발주완료) / req(생산요청) / hold(확인필요)
+  function setOsInlineGrp(g) { _osInlineGrp = g; renderOsInline(); document.getElementById('os-inline-list').scrollTop = 0; }
   function renderOsInline() {
     const list = document.getElementById('os-inline-list');
     const cnt = document.getElementById('os-inline-count');
     const q = (document.getElementById('os-inline-search').value || '').toLowerCase().trim();
     const all = _osInlineItems;
-    const items = q
-      ? all.filter(it => (it.code||'').toLowerCase().includes(q) || (it.name||'').toLowerCase().includes(q))
-      : all;
-    const hold = items.filter(x => x.is_hold).length;
-    const requesting = items.filter(x => x.is_requesting).length;
-    const pending = items.filter(x => !x.has_schedule && !x.is_hold && !x.is_requesting).length;
-    cnt.textContent = items.length + '/' + all.length + '건 · 미정 ' + pending + ' · 생산요청 ' + requesting + ' · 보류 ' + hold;
+    const C = _pdCtx(), diff = C.diff, md = C.md;
+    const gk = it => it.is_hold ? 'hold' : it.is_requesting ? 'req' : 'done';
+    // 그룹 칩 (2026-11-12)
+    const TY = [['done', '발주완료', '#059669'], ['req', '생산요청', '#7c3aed'], ['hold', '확인필요', '#dc2626']], tc = {};
+    all.forEach(x => { const k = gk(x); tc[k] = (tc[k] || 0) + 1; });
+    if (_osInlineGrp !== 'all' && !tc[_osInlineGrp]) _osInlineGrp = 'all';
+    document.getElementById('os-inline-types').innerHTML = _pdChipsHtml(TY, tc, all.length, _osInlineGrp, 'setOsInlineGrp');
+    const items = all.filter(it => (_osInlineGrp === 'all' || gk(it) === _osInlineGrp)
+      && (!q || (it.code||'').toLowerCase().includes(q) || (it.name||'').toLowerCase().includes(q)));
+    // 지남·오늘·7일 안·그 뒤 / 일정 미정(발주완료·생산요청) / 확인 필요·보류 — w = 희망일(먼데이 '요청 입고일')
+    const B = { late: [], today: [], week: [], later: [], none: [], hold: [] };
+    items.forEach(it => {
+      const p = it.has_schedule ? _pdDay(it.eta_sort) : null, n = p ? diff(p) : 0, w = _pdDay(it.requested_eta);
+      B[it.is_hold ? 'hold' : p ? _pdBucket(n) : 'none'].push({ it: it, p: p, n: n, w: w, wn: w ? diff(w) : null });
+    });
+    const byDate = (a, b) => String(a.it.eta_sort).localeCompare(String(b.it.eta_sort)) || (a.it._sort_group || 0) - (b.it._sort_group || 0);
+    ['late', 'today', 'week', 'later'].forEach(k => B[k].sort(byDate));
+    const byWant = (a, b) => (a.wn == null) - (b.wn == null) || (a.wn || 0) - (b.wn || 0) || String(a.it.request_date || '').localeCompare(String(b.it.request_date || ''));
+    B.none.sort((a, b) => (a.it._sort_group || 0) - (b.it._sort_group || 0) || byWant(a, b));
+    B.hold.sort(byWant);
+    cnt.innerHTML = (items.length !== all.length ? items.length + '/' : '') + all.length + '건'
+      + (B.late.length ? ' · <b style="color:#dc2626">지남 ' + B.late.length + '</b>' : '')
+      + (B.today.length ? ' · <b style="color:#ea580c">오늘 ' + B.today.length + '</b>' : '')
+      + ' · 미정 ' + B.none.length + ' · 보류 ' + B.hold.length;
     if (!items.length) {
       list.innerHTML = '<div class="alert-empty">' + (q ? '검색 결과 없음' : '외주 입고 항목 없음') + '</div>';
       return;
     }
-    list.innerHTML = items.map(it => {
+    const row = x => {
+      const it = x.it;
       const code = escapeHtml(it.code || '-');
       const name = escapeHtml(it.name || '');
-      let chip;
-      if (it.is_hold) {
-        chip = '<span class="po-inline-chip hold">보류</span>';
-      } else if (it.is_requesting) {
-        chip = it.has_schedule
-          ? '<span class="po-inline-chip" style="background:#7c3aed;color:#fff">' + escapeHtml(it.eta_display) + '</span>'
-          : '<span class="po-inline-chip" style="background:#7c3aed;color:#fff">생산요청</span>';
+      // 날짜 칸 (맨 앞): 일정 있으면 날짜·며칠 뒤, 없으면 미정/보류 + 희망일(지났으면 빨강)
+      let date;
+      if (x.p) {
+        date = _pdDateHtml(x.p, x.n, '입고 예정 ' + String(it.eta_sort).slice(0, 10) + (it.requested_eta ? ' · 요청 입고일 ' + it.requested_eta : ''));
       } else {
-        chip = it.has_schedule
-          ? '<span class="po-inline-chip">' + escapeHtml(it.eta_display || '-') + '</span>'
-          : '<span class="po-inline-chip empty">미정</span>';
+        const r = _pdDay(it.request_date);
+        date = '<span class="pd-date ' + (it.is_hold ? 'hold' : 'none') + '" title="' + escapeHtml((it.requested_eta ? '요청 입고일 ' + it.requested_eta : '요청 입고일 없음') + (it.request_date ? ' · 외주 요청일 ' + it.request_date : '')) + '">'
+          + '<b>' + (it.is_hold ? '보류' : '미정') + '</b>'
+          + (x.w ? '<small' + (x.wn < 0 ? ' class="over"' : '') + '>희망 ' + x.w[1] + '/' + x.w[2] + '</small>' : (r ? '<small>요청 ' + (-diff(r)) + '일 전</small>' : ''))
+          + '</span>';
       }
+      // 희망일보다 늦게 잡힌 일정 — 거래처 독촉용
+      const lateWant = (x.p && x.w && x.n > x.wn) ? '<span class="pd-want" title="요청 입고일 ' + escapeHtml(it.requested_eta) + '">희망일보다 ' + (x.n - x.wn) + '일 늦음</span>' : '';
       const destChip = it.destination
         ? '<span class="po-inline-dest" title="클릭하여 펼치기/접기" onclick="event.stopPropagation();this.classList.toggle(\\'expanded\\')">' + escapeHtml(it.destination) + '</span>'
         : '<span></span>';
@@ -22173,15 +22346,18 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         ? '<button class="spec-doc-btn" onclick="event.stopPropagation();openSpecMenu(event,\\'' + escapeHtml(it.item_id) + '\\')" '
           + 'title="시방서 보기">📄 시방서</button>'
         : '<span></span>';
-      return '<div class="po-inline-row os" onclick="openOsModal()">'
+      return '<div class="po-inline-row pd os" onclick="openOsModal()">' + date
            + '<div style="display:flex;flex-direction:column;align-items:flex-start;gap:1px">'
            + '<span class="po-inline-code">' + code + '</span>'
            + '<span style="font-size:10px;font-weight:700;color:' + groupColor + ';letter-spacing:-0.01em">' + groupLabel + '</span>'
            + '</div>'
            + '<div><div class="po-inline-name" title="' + name + '">' + name + '</div>'
-           + '<div class="po-inline-sub">' + vendor + '</div></div>'
-           + '<span class="po-inline-extra">' + specBtn + qtyChip + destChip + '</span>' + chip + '</div>';
-    }).join('');
+           + '<div class="po-inline-sub">' + vendor + (vendor && lateWant ? ' · ' : '') + lateWant + '</div></div>'
+           + '<span class="po-inline-extra">' + specBtn + qtyChip + destChip + '</span></div>';
+    };
+    const SEC = [['late', '⚠ 입고일 지남', '늦어지는 중이거나 Monday 미반영'], ['today', '오늘 입고', ''], ['week', '7일 안', md(1) + ' ~ ' + md(7)],
+                 ['later', '그 뒤', md(8) + '부터'], ['none', '일정 미정', '발주완료 → 생산요청 · 희망일 빠른 순'], ['hold', '확인 필요 · 보류', '희망일 빠른 순']];
+    list.innerHTML = _pdGroupsHtml(SEC, B, row);
   }
 
   async function openOsModal() {
