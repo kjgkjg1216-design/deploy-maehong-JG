@@ -13304,6 +13304,65 @@ def _spec_vendor_map():
     return _SPEC_VENDOR_CACHE['v']
 
 
+def _norm_item(s):
+    """품명·비고 비교용 — 괄호 안·공백·기호를 빼고 소문자 ('바로먹는 곤약쌀 2kg(통) 용기라벨' = '바로먹는 곤약쌀 2kg 용기라벨')."""
+    return re.sub(r'[\s_\-/*·.,:;]+', '', re.sub(r'\([^)]*\)', '', str(s or ''))).lower()
+
+
+_ERP_ITEM_IDX = {}
+
+
+def _erp_item_index():
+    """아마란스 발주정보·입고정보 행 → (날짜, 품번 앞부분, 품명 정규화, 비고 정규화, 거래처, 원래 품번, 설명, 출처). 데이터가 바뀌면 다시 만듦."""
+    key = (id(ORDER_DF), id(RCV_DF))
+    if _ERP_ITEM_IDX.get('k') != key:
+        rows = []
+        for df, dcol, src in ((ORDER_DF, '발주일자', '발주'), (RCV_DF, '입고일자', '입고')):
+            if df is None or df.empty or '거래처명' not in df.columns or '품번' not in df.columns:
+                continue
+            blank = pd.Series([''] * len(df), index=df.index)
+            for d, c, n, note, v in zip(df[dcol] if dcol in df.columns else blank, df['품번'], df['품명'] if '품명' in df.columns else blank,
+                                        df['비고'] if '비고' in df.columns else blank, df['거래처명']):
+                v = str(v).strip()
+                if v:
+                    c = str(c).strip()
+                    rows.append((str(d).replace('-', '')[:8], re.sub(r'\(.*$', '', c).strip().upper(), _norm_item(n), _norm_item(note), v,
+                                 c, (str(note).strip() or str(n).strip())[:40], src))
+        _ERP_ITEM_IDX.update(k=key, v=rows)
+    return _ERP_ITEM_IDX['v']
+
+
+def _erp_supplier_guess(code, name, days=400):
+    """같은 품번 6개월 발주로 업체가 안 잡힐 때 아마란스 발주·입고 기록에서 찾기 (2026-11-12 사용자 "ZQ는 아마란스 발주현황·입고현황에서 확인 가능").
+    ZQ 공용 코드는 아마란스에 'ZQ06(비용)'처럼 꼬리가 붙고 실제 품목은 비고에 적힘, 같은 물건이 다른 품번(ZQ383 등)으로 발주되기도 함.
+    ① 품번 앞부분이 같은 행(ZQ는 품명·비고도 맞아야) ② 그 품번을 한 업체에만 발주해 왔으면 그 업체(ZQ06 흡수제 = 티피지 19건 전부)
+    ③ 품번이 달라도 품명이 같은 행 — 앞 순서 먼저, 그 안에서 최근 행. 없으면 None."""
+    code, nm = (code or '').strip().upper(), _norm_item(name)
+    cut = (datetime.now() - _timedelta(days=days)).strftime('%Y%m%d')
+    mk = lambda rank, d, v, c0, desc, src: {'rank': rank, 'd': d, 'vendor': v, 'code': c0, 'desc': desc, 'src': src,
+                                            'date': f'{d[:4]}-{d[4:6]}-{d[6:]}' if len(d) == 8 else ''}
+    best, same_vendors, same_last = None, set(), None
+    for d, base, n, note, v, c0, desc, src in _erp_item_index():
+        if d < cut:
+            continue
+        if base == code:
+            same_vendors.add(v)
+            if same_last is None or d > same_last['d']:
+                same_last = mk(2, d, v, c0, '— 이 품번은 이 업체에만 발주', src)
+            if code.startswith('ZQ') and not (len(nm) >= 2 and (nm == n or nm == note or (len(nm) >= 4 and (nm in note or nm in n)))):
+                continue
+            rank = 3
+        elif len(nm) >= 4 and nm == n:
+            rank = 1
+        else:
+            continue
+        if best is None or (rank, d) > (best['rank'], best['d']):
+            best = mk(rank, d, v, c0, desc, src)
+    if (best is None or best['rank'] < 2) and same_last and len(same_vendors) == 1:
+        best = same_last
+    return best
+
+
 @app.route('/api/po_pending', methods=['GET'])
 @cached_api()
 def api_po_pending():
@@ -13334,14 +13393,24 @@ def api_po_pending():
         _sv = lambda c: '' if str(r.get(c, '') or '').strip().lower() in ('', 'nan') else str(r.get(c, '')).strip()
         _n = lambda c: (f'{int(float(_sv(c))):,}' if re.fullmatch(r'\d+(\.0+)?', _sv(c)) else _sv(c))   # 80000 → 80,000
         # 먼데이 '발주업체'가 비어 있는 건이 많아 아마란스 최근 발주의 거래처를 함께 (2026-11-04, 캘린더에 발주 업체 표시)
-        _erp = _erp_orders(_sv('아이템명') or _sv('품번'), 'po')
+        _code = _sv('아이템명') or _sv('품번')
+        _erp = _erp_orders(_code, 'po')
         maker = _erp[0]['vendor'] if _erp else ''
-        # 발주 업체(목록 품번 옆 칸, 2026-11-12 사용자 "발주가 들어간 업체"): 먼데이 발주업체 › 아마란스 최근 발주 거래처 › 부자재 규격 보드 업체
-        spec_v = '' if (_sv('발주업체') or maker) else _spec_vendor_map().get((_sv('아이템명') or _sv('품번')).upper(), '')
-        sup, sup_src = ((_sv('발주업체'), 'monday') if _sv('발주업체') else (maker, 'erp') if maker else (spec_v, 'spec') if spec_v else ('', ''))
+        # 발주 업체(목록 품번 옆 칸, 2026-11-12 사용자 "발주가 들어간 업체"): 먼데이 발주업체 › 아마란스 최근 발주(같은 품번 6개월)
+        # › 아마란스 발주·입고 기록에서 품번 꼬리·비고·품명으로(ZQ 공용 코드·오래된 발주, 400일) › 부자재 규격 보드 업체
+        sup, sup_src, sup_note = _sv('발주업체'), 'monday', '먼데이 발주업체'
+        if not sup and maker:
+            sup, sup_src, sup_note = maker, 'erp', '아마란스 최근 발주 거래처'
+        if not sup:
+            g = _erp_supplier_guess(_code, _sv('품명'))
+            if g:
+                sup, sup_src, sup_note = g['vendor'], 'erp', f"아마란스 {g['src']} {g['date']} · {g['code']} {g['desc']}".strip()
+        if not sup:
+            sup = _spec_vendor_map().get(_code.upper(), '')
+            sup_src, sup_note = ('spec', '부자재 규격 보드 업체 — 아마란스 발주·입고 기록 없음') if sup else ('', '')
         po_detail = [{'label': k, 'value': v} for k, v in (
-            ('품번', _sv('아이템명') or _sv('품번')), ('품명', _sv('품명')),
-            ('발주업체', _sv('발주업체') or (maker + ' (아마란스 최근 발주)' if maker else (spec_v + ' (부자재 규격 보드 업체)' if spec_v else ''))), ('입고처', _sv('입고처')),
+            ('품번', _code), ('품명', _sv('품명')),
+            ('발주업체', (sup + ('' if sup_src == 'monday' else ' (' + sup_note + ')')) if sup else ''), ('입고처', _sv('입고처')),
             ('발주 요청일', _sv('발주 요청일')), ('요청수량', _n('요청수량')), ('실발주 수량', _n('실발주 수량')),
             ('잔량', (f"{remain['qty']:,}{remain.get('unit', '')}" if remain and remain.get('qty') else '')),
             ('입고 예정', eta_display or '미정'), ('진행 그룹', _sv('그룹'))) if v]
@@ -13355,7 +13424,7 @@ def api_po_pending():
             'request_date': str(r.get('발주 요청일', '')).strip(),
             'vendor': str(r.get('발주업체', '')).strip(),
             'maker': maker,   # 아마란스 최근 발주 거래처 — 먼데이 발주업체가 비었을 때 캘린더 줄에 씀
-            'supplier': sup, 'supplier_short': _co_short(sup), 'supplier_src': sup_src,
+            'supplier': sup, 'supplier_short': _co_short(sup), 'supplier_src': sup_src, 'supplier_note': sup_note,
             'destination': str(r.get('입고처', '')).strip(),
             'schedule_entries': entries,
             'updates': _extract_po_updates(upd),  # 전체 말풍선 (작성자 무관)
@@ -18955,8 +19024,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         // 수입 원료는 예전에 품번 칸에 수입원을 썼음 → 수입원은 이 칸으로, 품번 칸은 '수입'
         const sup = it.supplier_short || '';
         const supTitle = it.supplier
-          ? '발주 업체: ' + it.supplier + (it.supplier_src === 'erp' ? ' (아마란스 최근 발주 거래처)' : it.supplier_src === 'spec' ? ' (부자재 규격 보드 업체 — 아마란스 최근 6개월 발주 없음)' : '')
-          : '발주 업체 정보 없음 — 아마란스 최근 6개월 발주·부자재 규격 보드에 없음';
+          ? '발주 업체: ' + it.supplier + (it.supplier_note ? ' (' + it.supplier_note + ')' : '')
+          : '발주 업체 정보 없음 — 아마란스 발주·입고 기록·부자재 규격 보드에 없음';
         return '<div class="po-inline-row pd' + typeCls + '" ' + clickFn + '>' + date
              + '<span class="po-inline-code">' + (isImport ? '수입' : code) + '</span>'
              + '<span class="pd-sup' + (sup ? (it.supplier_src === 'spec' ? ' spec' : '') : ' none') + '" title="' + escapeHtml(supTitle) + '">' + (sup ? escapeHtml(sup) : '–') + '</span>'
