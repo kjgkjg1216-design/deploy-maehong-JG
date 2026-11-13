@@ -10846,6 +10846,7 @@ def api_demand_shift_detail():
 EXCESS_MONTHS = 6       # 월 사용량 평균을 내는 최근 완결 달 수
 EXCESS_BUY_DAYS = 90    # 이 기간에 구매가 있으면 '최근 구매' — 사용 기록이 없어도 신제품 준비분으로 보고 과잉에서 뺌
 _MONTH_FLOW = {}        # ym → (지문, {'mat': {(거래처, 품번): {open, inb, cur, use}}, 'prod': {(거래처, 품번): 생산량}})
+_MONTH_FLOW_LOCK = threading.RLock()
 _ISSUE_USE = {}
 _PRICE_TBL = {}
 _MAT_NAMES = {}
@@ -10871,21 +10872,40 @@ def _month_flow(ym):
     hit = _MONTH_FLOW.get(ym)
     if hit and hit[0] == (s_mt, x_mt):
         return hit[1]
+    # 부재료 관리 탭은 세 패널이 동시에 불러 같은 달을 셋이 따로 읽었음 → 한 번만 읽고 나머지는 기다렸다 씀 (2026-11-13)
+    with _MONTH_FLOW_LOCK:
+        hit = _MONTH_FLOW.get(ym)
+        if hit and hit[0] == (s_mt, x_mt):
+            return hit[1]
+        return _month_flow_build(ym, snap, s_mt, x_mt)
+
+
+def _month_flow_build(ym, snap, s_mt, x_mt):
     if s_mt and s_mt >= x_mt:
         df = pd.read_csv(snap, encoding='utf-8-sig', dtype=str).fillna('')
     else:
         df = _month_inv_df(ym)[0]
     mat, prod, blk = {}, {}, {}
+    # 날짜별 값 (2026-11-13 사용자 "생산일·출고일에 따라 사용량이 다름 → 더 정확하게"):
+    # days = 'YYYY-MM-DD' / daily = (거래처, 자재) 일별 사용 / fgd = (거래처, 완제품) 일별 생산 /
+    # semi = (거래처, 반제품 이름) {'p': 일별 채운 양(반제품 생산), 'o': 일별 담은 양(반제품 출고, 양수)} / semi_mat = (거래처, 자재, 반제품 이름) 그 반제품 칸 안 행의 일별 사용
+    days, daily, fgd, semi, semi_mat = [], {}, {}, {}, {}
     dm, mon = _daily_col_map(df) if df is not None else ({}, None)
     if dm and mon == int(ym[4:]):
         def col(c):
             return pd.to_numeric(df[c].astype(str).str.replace(',', '', regex=False), errors='coerce').fillna(0).tolist()
-        use = [sum(x) for x in zip(*[col(c) for c in dm.values()])]
+        dkeys = sorted(dm)
+        days = [f'{ym[:4]}-{ym[4:6]}-{k:02d}' for k in dkeys]
+        rowd = list(zip(*[col(dm[k]) for k in dkeys]))   # 행별 일별 값
+        use = [sum(x) for x in rowd]
         op, inb, cur = col(COL_창고재고), col(COL_원가재고), col(COL_재고량)
         codes = df[COL_품목].astype(str).str.strip().str.upper().tolist()
         vend = df[COL_원산지].astype(str).str.strip().tolist()
         spec = df[COL_규격].astype(str).str.strip().tolist()
+        pname = df[COL_품명].astype(str).str.strip().tolist()
+        add = lambda dst, k, vals: dst.__setitem__(k, [a + b for a, b in zip(dst[k], vals)] if k in dst else list(vals))
         cur_prod = {}   # 거래처별 지금 블록의 제품 — 자재 행은 바로 위 '제품(생산)' 행 제품 블록에 속함
+        cur_semi = {}   # 거래처별 지금 반제품 칸 이름 (다음 '제품(생산)' 행이 나오면 끝)
         for i, c in enumerate(codes):
             v = vend[i]
             if not v or v == 'nan':
@@ -10899,10 +10919,20 @@ def _month_flow(ym):
                 b = blk.setdefault((v, c), {})
                 p = cur_prod.get(v, '')
                 b[p] = b.get(p, 0.0) + use[i]
+                add(daily, (v, c), rowd[i])
+                if cur_semi.get(v):
+                    add(semi_mat, (v, c, cur_semi[v]), rowd[i])
+            elif '반제품(생산)' in spec[i]:
+                cur_semi[v] = pname[i]
+                add(semi.setdefault((v, pname[i]), {}), 'p', rowd[i])
+            elif '반제품(출고)' in spec[i]:
+                add(semi.setdefault((v, pname[i]), {}), 'o', [abs(x) for x in rowd[i]])
             elif '제품(생산)' in spec[i] and '반제품' not in spec[i]:
                 prod[(v, c)] = prod.get((v, c), 0.0) + use[i]
                 cur_prod[v] = c
-    out = {'mat': mat, 'prod': prod, 'blk': blk}
+                cur_semi[v] = ''
+                add(fgd, (v, c), rowd[i])
+    out = {'mat': mat, 'prod': prod, 'blk': blk, 'days': days, 'daily': daily, 'fgd': fgd, 'semi': semi, 'semi_mat': semi_mat}
     s_mt = os.path.getmtime(snap) if os.path.exists(snap) else 0   # 방금 스냅샷을 다시 썼을 수 있음
     _MONTH_FLOW[ym] = ((s_mt, x_mt), out)
     return out
@@ -11233,22 +11263,89 @@ def api_stock_compare_detail():
 
 
 # ====== BOM 대비 실사용 (2026-11-11, 부재료 관리 3번) ======
-@app.route('/api/bom_usage', methods=['GET'])
-@cached_api()
-def api_bom_usage():
-    """거래처×부재료 실사용 vs BOM 소요. 실사용 = 재고파악 일별 사용 합, BOM 소요 = 그 거래처 제품(생산) 수량 × BOM 전개(실소요량).
-    달별 값을 내려 화면에서 기간을 골라 합산. 판정은 화면이 기간 합계로 계산."""
+def _bom_months():
     cur = datetime.now().strftime('%Y%m')
     months, ym = [], VENDOR_PORTAL_FIRST_YM
     while ym < cur:
         months.append(ym)
         ym = _ym_shift(ym, 1)
+    return months
+
+
+def _day_kind(a, b):
+    """날짜 하나 비교 — a = 기준(채운 양 또는 완제품 필요량), b = 재고파악에 적힌 사용.
+    same 같음 · more/less 수량 다름 · miss 기준은 있는데 사용 0(입력 누락) · minus 마이너스 입력(재고 조정) · nofill 기준 없이 사용(조정·폐기 등)."""
+    if b < 0:
+        return 'minus'
+    if a <= 0:
+        return 'nofill' if b > 0 else ''
+    if b == 0:
+        return 'miss'
+    return 'same' if abs(a - b) < 0.5 else ('more' if b > a else 'less')
+
+
+def _fg_need_daily(f, idx):
+    """그 달 (거래처, 부재료) 일별 완제품 필요량 = Σ 완제품 일별 생산 × BOM 개당 소요."""
+    need = {}
+    for (v, p), dl in f['fgd'].items():
+        if v not in ACTIVE_VENDORS or p not in idx:
+            continue
+        for c, per in _explode_bom(p).items():
+            if _is_submat(c) and c not in EXPENSED_MATERIALS:
+                k = (v, c)
+                need[k] = [a + q * per for a, q in zip(need[k], dl)] if k in need else [q * per for q in dl]
+    return need
+
+
+def _bom_daymatch(months):
+    """날짜까지 맞춰 볼 수 있는 (거래처, 부재료) → ('fill', 반제품 이름) | ('fg', '') (2026-11-13 사용자 "생산일·출고일에 따라 사용량이 다름").
+    fill = 1차 파우치처럼 재고파악 반제품 칸에서 '채운 날 = 사용한 날'로 적히는 자재(더고은 B0077: 124일 중 113일 같음) → 채운 양(반제품 생산)과 비교.
+    fg = 2차 포장재처럼 완제품 생산일에 같이 적히는 자재 → 그날 완제품 필요량과 비교.
+    기록 있는 날의 60% 이상(최소 5일)이 같아야 함 — 데이웰즈처럼 반제품 칸에 자재를 다 적지만 날짜가 안 맞는 곳은 달 합계 비교 그대로."""
     idx = _get_bom_index()
-    act, exp, src, nobom = {}, {}, {}, {}
+    fill_cnt, fg_cnt = {}, {}
+
+    def tally(t, a_list, u):
+        for a, b in zip(a_list, u):
+            if a or b:
+                t[1] += 1
+                t[0] += int(a > 0 and abs(a - b) < 0.5)
+    for y in months:
+        f = _month_flow(y)
+        for (v, c, nm), u in f['semi_mat'].items():
+            s = f['semi'].get((v, nm), {}).get('p')
+            if s and v in ACTIVE_VENDORS and _is_submat(c) and c not in EXPENSED_MATERIALS:
+                tally(fill_cnt.setdefault((v, c), {}).setdefault(nm, [0, 0]), s, u)
+        for k, a_list in _fg_need_daily(f, idx).items():
+            u = f['daily'].get(k)
+            if u:
+                tally(fg_cnt.setdefault(k, [0, 0]), a_list, u)
+    out = {}
+    for k, by in fill_cnt.items():
+        nm, (same, tot) = max(by.items(), key=lambda kv: kv[1][0])
+        if same >= 5 and same >= 0.6 * tot:
+            out[k] = ('fill', nm)
+    for k, (same, tot) in fg_cnt.items():
+        if k not in out and same >= 5 and same >= 0.6 * tot:
+            out[k] = ('fg', '')
+    return out
+
+
+@app.route('/api/bom_usage', methods=['GET'])
+@cached_api()
+def api_bom_usage():
+    """거래처×부재료 실사용 vs BOM 소요. 실사용 = 재고파악 일별 사용 합, BOM 소요 = 그 거래처 제품(생산) 수량 × BOM 전개(실소요량).
+    달별 값을 내려 화면에서 기간을 골라 합산. 판정은 화면이 기간 합계로 계산.
+    날짜 기준 자재(_bom_daymatch)는 날마다 비교해 실사용 = 기준이 있는 날 사용만, 마이너스·기준 없는 날 사용은 '조정', 기준은 있는데 사용 0은 '누락'으로 따로 (2026-11-13).
+    그중 채운 단계 자재(fill)는 BOM 소요 = 채운 양(반제품 생산), 완제품 기준 필요량은 efg로 참고만."""
+    months = _bom_months()
+    idx = _get_bom_index()
+    dmatch = _bom_daymatch(months)
+    act, exp, src, nobom, efg, extra = {}, {}, {}, {}, {}, {}
     for y in months:
         f = _month_flow(y)
         for k, e in f['mat'].items():
-            if k[0] in ACTIVE_VENDORS and _is_submat(k[1]) and k[1] not in EXPENSED_MATERIALS and e['use']:
+            if k[0] in ACTIVE_VENDORS and _is_submat(k[1]) and k[1] not in EXPENSED_MATERIALS and e['use'] and k not in dmatch:
                 act.setdefault(k, {})[y] = e['use']
         for (v, p), q in f['prod'].items():
             if v not in ACTIVE_VENDORS or q <= 0:
@@ -11258,10 +11355,44 @@ def api_bom_usage():
                 continue
             for c, per in _explode_bom(p).items():
                 if _is_submat(c) and c not in EXPENSED_MATERIALS:
-                    d = exp.setdefault((v, c), {})
+                    tgt = efg if dmatch.get((v, c), ('',))[0] == 'fill' else exp   # 채운 단계 자재는 완제품 기준을 참고로만
+                    d = tgt.setdefault((v, c), {})
                     d[y] = d.get(y, 0.0) + q * per
                     s = src.setdefault((v, c), {}).setdefault(p, {'per': per, 'q': {}})
                     s['q'][y] = s['q'].get(y, 0.0) + q
+        # 날짜 기준 자재 — 날마다 같음/조정/누락
+        need = _fg_need_daily(f, idx) if dmatch else {}
+        for k, (kind, nm) in dmatch.items():
+            u = f['daily'].get(k)
+            a_list = f['semi'].get((k[0], nm), {}).get('p') if kind == 'fill' else need.get(k)
+            if not u and not a_list:
+                continue
+            n = len(f['days'])
+            s = {'act': 0.0, 'exp': 0.0, 'adj': 0.0, 'miss': 0.0, 'rec': 0.0, 'nadj': 0, 'nmiss': 0, 'ndiff': 0}
+            for a, b in zip(a_list or [0.0] * n, u or [0.0] * n):
+                kd = _day_kind(a, b)
+                if not kd:
+                    continue
+                s['rec'] += b
+                s['exp'] += max(a, 0.0)
+                if kd in ('minus', 'nofill'):
+                    s['adj'] += b
+                    s['nadj'] += 1
+                    if a > 0:
+                        s['miss'] += a
+                        s['nmiss'] += 1
+                elif kd == 'miss':
+                    s['miss'] += a
+                    s['nmiss'] += 1
+                else:
+                    s['act'] += b
+                    s['ndiff'] += int(kd != 'same')
+            if s['act'] or s['exp'] or s['rec']:
+                act.setdefault(k, {})[y] = s['act']
+                if kind == 'fill':
+                    exp.setdefault(k, {})[y] = s['exp']
+                for kk in ('rec', 'adj', 'miss', 'nadj', 'nmiss', 'ndiff'):
+                    extra.setdefault(k, {}).setdefault(kk, {})[y] = s[kk]
     months = [y for y in months if any(y in d for d in act.values()) or any(y in d for d in exp.values())]
     names, pn = _mat_names(), _sales_name_map()
     # 한쪽만 있는 건(실사용만 / BOM 소요만)의 진짜 원인 — 'BOM에 없음'이라고만 하면 BOM 누락으로 오해 (2026-11-11 사용자 지적)
@@ -11325,16 +11456,67 @@ def api_bom_usage():
                 d['kind'] = 'norow'
             return d
         return None
-    items = []
+    items, used_semi = [], set()
+    arr = lambda d: [round(d.get(y, 0.0), 1) for y in months]
     for k in sorted(set(act) | set(exp)):
         v, c = k
         srcs = sorted(src.get(k, {}), key=lambda p: -sum(src[k][p]['q'].values()))
-        items.append({'vendor': v, 'code': c, 'name': names.get(c, ''), 'price': round(_mat_price(c)[0], 2),
-                      'a': [round(act.get(k, {}).get(y, 0.0), 1) for y in months], 'e': [round(exp.get(k, {}).get(y, 0.0), 1) for y in months],
-                      'src': [{'code': p, 'name': pn.get(p, ''), 'per': round(s['per'], 4), 'q': [round(s['q'].get(y, 0.0), 1) for y in months]} for p, s in src.get(k, {}).items()],
-                      'diag': diag(v, c, bool(act.get(k)), bool(exp.get(k)), srcs)})
+        it = {'vendor': v, 'code': c, 'name': names.get(c, ''), 'price': round(_mat_price(c)[0], 2),
+              'a': arr(act.get(k, {})), 'e': arr(exp.get(k, {})),
+              'src': [{'code': p, 'name': pn.get(p, ''), 'per': round(s['per'], 4), 'q': [round(s['q'].get(y, 0.0), 1) for y in months]} for p, s in src.get(k, {}).items()],
+              'diag': diag(v, c, bool(act.get(k)), bool(exp.get(k)), srcs)}
+        dmk = dmatch.get(k)
+        if dmk:   # 날짜 기준 자재: dm = fill(채운 양 기준)·fg(완제품 생산일 기준), 조정·누락 따로
+            it['dm'], it['semi'] = dmk
+            for kk in ('rec', 'adj', 'miss', 'nadj', 'nmiss', 'ndiff'):
+                it[kk] = arr(extra.get(k, {}).get(kk, {}))
+            if dmk[0] == 'fill':
+                it['efg'] = arr(efg.get(k, {}))
+                used_semi.add((v, dmk[1]))
+        else:   # 완제품이 채운 단계 자재를 쓰면(같은 거래처) 그 반제품 흐름을 상세에 참고로
+            for p in src.get(k, {}):
+                ref = next((dmatch[(v, m)][1] for m in _explode_bom(p) if dmatch.get((v, m), ('',))[0] == 'fill'), '')
+                if ref:
+                    it['semi_ref'] = ref
+                    used_semi.add((v, ref))
+                    break
+        items.append(it)
+    # 반제품 흐름 (채운 양·담은 양, 달별) — 상세 창의 '쌓인 반제품'용
+    semis = {}
+    for y in months:
+        f = _month_flow(y)
+        for (v, nm), d in f['semi'].items():
+            if (v, nm) in used_semi:
+                t = semis.setdefault(v + '|' + nm, {'vendor': v, 'name': nm, 'in': {}, 'out': {}})
+                t['in'][y] = sum(d.get('p', []))
+                t['out'][y] = sum(d.get('o', []))
+    for t in semis.values():
+        t['in'], t['out'] = arr(t['in']), arr(t['out'])
     return jsonify({'ok': True, 'months': months, 'items': items, 'vendors': [v for v in ACTIVE_VENDORS if any(x['vendor'] == v for x in items)], 'expensed': sorted(EXPENSED_MATERIALS),
+                    'semis': semis,
                     'nobom': sorted(({'vendor': v, 'code': p, 'name': pn.get(p, ''), 'q': int(q)} for (v, p), q in nobom.items()), key=lambda x: -x['q'])})
+
+
+@app.route('/api/bom_usage_daily', methods=['GET'])
+@cached_api()
+def api_bom_usage_daily():
+    """BOM 대비 실사용 상세 — 날짜별 대조 (2026-11-13). 날짜 기준 자재만: 기준(채운 양 또는 완제품 필요량) vs 기록 사용, 날마다 같음·조정·누락·수량 다름."""
+    v, c = (request.args.get('vendor') or '').strip(), (request.args.get('code') or '').strip().upper()
+    months = _bom_months()
+    dmk = _bom_daymatch(months).get((v, c))
+    if not dmk:
+        return jsonify({'ok': True, 'dm': '', 'rows': []})
+    idx, rows = _get_bom_index(), []
+    for y in months:
+        f = _month_flow(y)
+        n = len(f['days'])
+        u = f['daily'].get((v, c)) or [0.0] * n
+        a_list = (f['semi'].get((v, dmk[1]), {}).get('p') if dmk[0] == 'fill' else _fg_need_daily(f, idx).get((v, c))) or [0.0] * n
+        for d, a, b in zip(f['days'], a_list, u):
+            kd = _day_kind(a, b)
+            if kd:
+                rows.append({'d': d, 'a': round(a, 1), 'b': round(b, 1), 'k': kd})
+    return jsonify({'ok': True, 'dm': dmk[0], 'semi': dmk[1], 'rows': rows})
 
 
 # ====== 시안 변경 소진 계획 (2026-11-11, 부재료 관리 4번) ======
@@ -15095,7 +15277,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .sm-how .tip b { color: #fff; }
   .sm-how:hover .tip, .sm-how:focus .tip, .sm-how.open .tip { display: block; }
   .ex-kpis.k6 { grid-template-columns: repeat(6, minmax(0, 1fr)); }
-  @container (max-width: 620px) { .ex-kpis, .ex-kpis.k6 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .ex-kpis.k7 { grid-template-columns: repeat(7, minmax(0, 1fr)); }
+  @container (max-width: 1100px) { .ex-kpis.k7 { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+  @container (max-width: 620px) { .ex-kpis, .ex-kpis.k6, .ex-kpis.k7 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   .excess-panel .chart-head, .bomuse-panel .chart-head, .design-panel .chart-head { flex-wrap: wrap; row-gap: 6px; }
   .chart-panel.bomuse-panel { grid-column: span 30; border-top: 3px solid #7c3aed; container-type: inline-size; }   /* BOM 대비 실사용 (2026-11-11) */
   .chart-panel.design-panel { grid-column: span 30; border-top: 3px solid #db2777; container-type: inline-size; }   /* 시안 변경 소진 계획 (2026-11-11) */
@@ -17028,7 +17212,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         <div id="bu-count" style="font-size:11px;color:var(--text-3);font-weight:600;white-space:nowrap"></div>
       </div>
     </div>
-    <div id="bu-kpis" class="ex-kpis k6"></div>
+    <div id="bu-kpis" class="ex-kpis k7"></div>
     <div id="bu-note" class="ex-note"></div>
     <div id="bu-list" class="ex-list"><div class="loading" style="padding:20px">로딩 중...</div></div>
   </div>
@@ -19654,11 +19838,15 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         { type: 'line', label: '발주', data: m.map(x => x.po || null), borderColor: '#dc2626', backgroundColor: '#dc2626', borderWidth: 0, pointRadius: 5, pointStyle: 'rectRot', showLine: false, order: 1 }],
         { titles: m.map(x => x.ym.slice(0, 4) + '년 ' + Number(x.ym.slice(4)) + '월'), note: '주황: 재고파악 파일의 외주처 일별 사용 합계 · 보라: 자사창고에서 생산으로 나간 양 · 빨간 표시: 그 달 발주량' });
     } else if (_lensdKind === 'bomuse') {
-      const i0 = _buIdx(), x = d.x;
-      _lensChart(d.months.map(y => y.slice(2, 4) + '/' + y.slice(4)), [
-        { type: 'bar', label: '실사용', data: x.a.slice(i0), backgroundColor: '#f59e0b', borderRadius: 3 },
-        { type: 'bar', label: 'BOM 소요', data: x.e.slice(i0), backgroundColor: '#a78bfa', borderRadius: 3 }],
-        { note: '주황: 재고파악 일별 사용 합계 · 보라: 그 달 제품(생산) 수량 × BOM 실소요량(로스 포함)' });
+      const i0 = _buIdx(), x = d.x, fill = x.dm === 'fill';
+      const ds = [{ type: 'bar', label: '실사용', data: x.a.slice(i0), backgroundColor: '#f59e0b', borderRadius: 3 },
+                  { type: 'bar', label: fill ? '채운 양' : 'BOM 소요', data: x.e.slice(i0), backgroundColor: '#a78bfa', borderRadius: 3 }];
+      // 날짜 기준 자재: 조정(마이너스·기준 없는 날 사용)을 회색 막대로 — 실사용에서 뺀 것 (2026-11-13)
+      if (x.dm && (x.adj || []).slice(i0).some(v => v)) ds.push({ type: 'bar', label: '조정(실사용에서 뺌)', data: x.adj.slice(i0), backgroundColor: '#94a3b8', borderRadius: 3 });
+      _lensChart(d.months.map(y => y.slice(2, 4) + '/' + y.slice(4)), ds,
+        { note: x.dm
+            ? (fill ? '주황: 반제품을 채운 날의 사용 · 보라: 채운 양(반제품 생산)' : '주황: 완제품을 만든 날의 사용 · 보라: 그날 완제품 × 개당 소요') + ' · 회색: 마이너스 입력·기준 없는 날 사용(조정) — 날짜별 표 참고'
+            : '주황: 재고파악 일별 사용 합계 · 보라: 그 달 제품(생산) 수량 × BOM 실소요량(로스 포함)' });
     } else if (_lensdKind === 'dgap') {
       const r = d.days;
       _lensChart(r.map(x => x.d), [
@@ -21198,7 +21386,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   // ───── BOM 대비 실사용 (2026-11-11, 부재료 관리 3번) ─────
   let _buData = null, _buMode = 'check', _buVendor = '', _buPeriod = 0;
   const _buSortS = { k: '', dir: 0 };
-  const BU_ST = { over: ['초과 사용', '#c2410c', '#ffedd5'], under: ['덜 사용', '#1d4ed8', '#dbeafe'], odd: ['단위·BOM 점검', '#b91c1c', '#fee2e2'], noexp: ['실사용만 있음', '#6d28d9', '#ede9fe'], noact: ['BOM 소요만 있음', '#475569', '#e2e8f0'], ok: ['일치', '#15803d', '#dcfce7'] };
+  const BU_ST = { over: ['초과 사용', '#c2410c', '#ffedd5'], under: ['덜 사용', '#1d4ed8', '#dbeafe'], odd: ['단위·BOM 점검', '#b91c1c', '#fee2e2'], adj: ['조정·누락', '#b45309', '#fef3c7'], noexp: ['실사용만 있음', '#6d28d9', '#ede9fe'], noact: ['BOM 소요만 있음', '#475569', '#e2e8f0'], ok: ['일치', '#15803d', '#dcfce7'] };
+  // 날짜별 대조 구분 (/api/bom_usage_daily k)
+  const BU_DAY = { same: ['같음', '#15803d'], more: ['사용이 많음', '#c2410c'], less: ['사용이 적음', '#1d4ed8'], miss: ['입력 누락', '#b45309'], minus: ['마이너스 입력(조정)', '#b91c1c'], nofill: ['기준 없는 날 사용(조정)', '#7c3aed'] };
   // 한쪽만 있는 건의 실제 원인 (서버 diag.kind) — 대부분 BOM 누락이 아니라 재고파악 파일 쪽 사정 (2026-11-11 사용자 지적)
   const BU_WHY = { notinbom: ['BOM 미등록 자재', '#b91c1c', '#fee2e2'], noprod: ['생산 칸 비어 있음', '#b45309', '#fef3c7'], oldcode: ['옛 품번 블록', '#6d28d9', '#ede9fe'],
                    subst: ['BOM과 다른 자재', '#0f766e', '#ccfbf1'], othercode: ['다른 제품 BOM 자재', '#1d4ed8', '#dbeafe'], zero: ['사용량 미입력', '#475569', '#e2e8f0'], norow: ['재고파악에 행 없음', '#475569', '#e2e8f0'] };
@@ -21213,12 +21403,17 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   }
   function _buIdx() { const n = _buData.months.length; return _buPeriod ? Math.max(0, n - _buPeriod) : 0; }
   // 고른 기간·거래처로 합산해 판정: 일치 ±10% / 초과 1.1~1.5배 / 덜 사용 0.5~0.9배 / 그 밖은 로스로 보기엔 커서 단위·BOM 점검
+  // 날짜 기준 자재(x.dm: fill = 채운 날 기준, fg = 완제품 생산일 기준)는 실사용 = 기준이 있는 날 사용만, 조정·누락은 따로 (2026-11-13)
+  // 실사용·BOM이 맞아도 사용 칸에 조정(마이너스·기준 없는 날 사용)이나 입력 누락이 있으면 '조정·누락'
   function _buRows() {
-    const i0 = _buIdx(), sum = a => a.slice(i0).reduce((s, v) => s + v, 0);
+    const i0 = _buIdx(), sum = a => (a || []).slice(i0).reduce((s, v) => s + v, 0);
     return _buData.items.filter(x => !_buVendor || x.vendor === _buVendor).map(x => {
       const act = sum(x.a), exp = sum(x.e), r = exp > 0 ? act / exp : null;
-      const st = act <= 0 && exp <= 0 ? '' : exp <= 0 ? 'noexp' : act <= 0 ? 'noact' : (r > 1.5 || r < 0.5) ? 'odd' : r > 1.1 ? 'over' : r < 0.9 ? 'under' : 'ok';
-      return Object.assign({}, x, { act: act, exp: exp, r: r, st: st, diff: act - exp, won: (act - exp) * x.price });
+      const adj = sum(x.adj), miss = sum(x.miss), nadj = sum(x.nadj), nmiss = sum(x.nmiss);
+      let st = act <= 0 && exp <= 0 ? '' : exp <= 0 ? 'noexp' : act <= 0 ? 'noact' : (r > 1.5 || r < 0.5) ? 'odd' : r > 1.1 ? 'over' : r < 0.9 ? 'under' : 'ok';
+      if (x.dm && (nadj || nmiss) && (st === 'ok' || st === '')) st = 'adj';
+      return Object.assign({}, x, { act: act, exp: exp, r: r, st: st, diff: act - exp, won: (act - exp) * x.price,
+                                    adjS: adj, missS: miss, nadjS: nadj, nmissS: nmiss, ndiffS: sum(x.ndiff), recS: sum(x.rec) });
     }).filter(x => x.st);
   }
   function setBuMode(m) { _buMode = m; renderBomUsage(); document.getElementById('bu-list').scrollTop = 0; }
@@ -21239,14 +21434,19 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       return '<button type="button" class="ex-kpi' + (_buMode === m ? ' on' : '') + '" style="--c:' + c + '" onclick="setBuMode(&quot;' + m + '&quot;)">' + label + '<b>' + xs.length + '<span style="font-size:12px;font-weight:600;color:var(--text-3)"> 건</span></b><span>' + (a && m !== 'ok' ? _exWon(a) + '원' : '') + (sub ? (a && m !== 'ok' ? ' · ' : '') + sub : '') + '</span></button>'; };
     document.getElementById('bu-kpis').innerHTML = tile('check', '점검 필요', '#7c3aed', '초과·덜 사용 금액') + tile('over', '초과 사용', '#c2410c', '1.1~1.5배') + tile('under', '덜 사용', '#1d4ed8', '0.5~0.9배')
       + tile('odd', '단위·BOM 점검', '#b91c1c', '1.5배↑·0.5배↓ · 금액 판단 보류')
+      + tile('adj', '조정·누락', '#b45309', '사용은 맞고 기록에 조정·누락')
       + (() => { const one = g('one'), nb = one.filter(x => x.diag && x.diag.kind === 'notinbom').length; return tile('one', '한쪽만 있음', '#6d28d9', nb ? 'BOM 미등록 ' + nb + ' · 재고파악 쪽 ' + (one.length - nb) : '재고파악 파일 쪽 원인'); })()
       + tile('ok', '일치', '#15803d', '±10% · 전체 ' + rows.length + '건 중');
     const ms = d.months.slice(_buIdx()), mm = y => Number(y.slice(4)) + '월';
     const nb = d.nobom.filter(x => !_buVendor || x.vendor === _buVendor);
     document.getElementById('bu-note').innerHTML = (ms.length ? '<b>' + mm(ms[0]) + '~' + mm(ms[ms.length - 1]) + ' 합계</b>' : '') + (_buVendor ? ' · ' + escapeHtml(_buVendor) : ' · 거래처 전체')
       + (nb.length ? ' · <span style="color:#b45309" title="' + escapeHtml(nb.map(x => x.vendor + ' ' + x.code + ' ' + x.name + ' ' + fmtInt(x.q) + '개').join(' / ')) + '">BOM 없는 생산 품번 ' + nb.length + '개는 계산에서 빠짐(' + escapeHtml(nb.slice(0, 2).map(x => x.code).join('·')) + (nb.length > 2 ? '…' : '') + ')</span>' : '')
+      + (() => { const all = _buRows(), nf = all.filter(x => x.dm === 'fill').length, ng = all.filter(x => x.dm === 'fg').length;
+          return nf + ng ? ' · <span title="재고파악에 날마다 같은 값으로 적히는 자재는 날짜까지 맞춰 비교">날짜 기준 ' + (nf + ng) + '건' + (nf ? '(채운 날 ' + nf + ')' : '') + '</span>' : ''; })()
       + _smHow('<b>비율</b> = 실사용 ÷ BOM 소요 — 100%면 BOM대로 쓴 것<br><b>실사용</b> = 재고파악 일별 사용<br><b>BOM 소요</b> = 그 거래처 제품(생산) 수량 × BOM 실소요량(로스 포함)<br><b>차이 금액</b> = 차이 × 최신 발주단가 — 초과·덜 사용만 금액으로 봄'
-        + '<br>판정: 일치 ±10% · 초과 1.1~1.5배 · 덜 사용 0.5~0.9배 · 그 밖은 단위·BOM 점검'
+        + '<br><b>날짜 기준</b> — 재고파악에 날마다 같은 값으로 적히는 자재는 날짜까지 맞춰 비교해요<br>· 1차 파우치처럼 반제품을 <b>채운 날</b> 쓰는 자재 → BOM 소요 = 채운 양(반제품 생산)<br>· 2차 포장재처럼 <b>완제품 생산일</b>에 적히는 자재 → 그날 완제품 필요량'
+        + '<br>· 마이너스 입력·기준 없는 날 사용 = <b>조정</b>, 기준은 있는데 사용 0 = <b>누락</b> → 실사용에서 빼고 따로 표시'
+        + '<br>판정: 일치 ±10% · 초과 1.1~1.5배 · 덜 사용 0.5~0.9배 · 그 밖은 단위·BOM 점검 · 맞는데 조정·누락이 있으면 조정·누락'
         + ((d.expensed || []).length ? '<br>비용처리 소모품은 제외(' + escapeHtml(d.expensed.join('·')) + ')' : ''));
     renderBomList();
   }
@@ -21269,7 +21469,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         // 맨 앞 칸 = 비율(실사용 ÷ BOM 소요) + 판정, 한쪽만 있는 건은 어느 쪽만 있는지 + 원인
         const lead = x.st === 'noexp' ? _smLead('실사용만', st[0], st, '실사용은 있는데 BOM 소요가 없음')
           : x.st === 'noact' ? _smLead('BOM만', st[0], st, 'BOM 소요는 있는데 실사용 기록이 없음')
-          : _smLead(Math.round(x.r * 100) + '%', st[0], st, '실사용 ÷ BOM 소요 — 100%면 BOM대로');
+          : _smLead(x.r != null ? Math.round(x.r * 100) + '%' : '-', st[0], st, '실사용 ÷ BOM 소요 — 100%면 BOM대로');
         // 한쪽만 있는 건은 품명 아래에 근거 한 줄 (어느 제품 블록·어느 짝 자재 때문인지)
         const b0 = dg && dg.blocks && dg.blocks[0];
         const hint = !dg ? '' : '<div class="sm-sub">' + ({
@@ -21281,9 +21481,14 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
           zero: (b0 ? b0.p + ' 생산 ' + fmtInt(b0.prod) + '개 · ' : '') + '이 자재 행 사용량이 비어 있음',
           norow: '재고파악에 이 거래처의 이 자재 행이 없음' }[dg.kind] || '') + '</div>';
         const wtxt = (x.won > 0 ? '+' : (x.won < 0 ? '−' : '')) + _exWon(Math.abs(x.won));
-        return '<tr data-v="' + escapeHtml(x.vendor) + '" data-c="' + escapeHtml(x.code) + '" onclick="openBuDetail(this.dataset.v, this.dataset.c)" title="클릭 = 월별 비교·쓰는 제품"><td>' + lead + '</td>'
-          + '<td style="white-space:nowrap;font-weight:700;color:var(--text-2)">' + escapeHtml(x.vendor) + '</td><td style="font-weight:800;white-space:nowrap">' + escapeHtml(x.code) + '</td><td style="min-width:210px"><div class="sm-name">' + escapeHtml(x.name) + '</div>' + hint + '</td>'
-          + '<td style="text-align:right;white-space:nowrap">' + (x.act > 0 ? fmtInt(Math.round(x.act)) : '<span style="color:#cbd5e1">-</span>') + '</td><td style="text-align:right;white-space:nowrap">' + (x.exp > 0 ? fmtInt(Math.round(x.exp)) : '<span style="color:#cbd5e1">-</span>') + '</td>'
+        // 날짜 기준 자재: 어느 날짜 기준인지 + 조정·누락 (2026-11-13)
+        const dmLine = !x.dm ? '' : '<div class="sm-sub">' + (x.dm === 'fill' ? '채운 날 기준 · ' + escapeHtml((x.semi || '').slice(0, 22)) : '완제품 생산일 기준')
+          + (x.nadjS ? ' · <b style="color:#b45309">조정 ' + sg(x.adjS) + ' (' + x.nadjS + '일)</b>' : '') + (x.nmissS ? ' · <b style="color:#b45309">누락 ' + fmtInt(Math.round(x.missS)) + ' (' + x.nmissS + '일)</b>' : '') + '</div>';
+        const small = t => '<div style="font-size:11px;color:#94a3b8;margin-top:1px">' + t + '</div>';
+        return '<tr data-v="' + escapeHtml(x.vendor) + '" data-c="' + escapeHtml(x.code) + '" onclick="openBuDetail(this.dataset.v, this.dataset.c)" title="클릭 = 월별 비교·쓰는 제품' + (x.dm ? '·날짜별 대조' : '') + '"><td>' + lead + '</td>'
+          + '<td style="white-space:nowrap;font-weight:700;color:var(--text-2)">' + escapeHtml(x.vendor) + '</td><td style="font-weight:800;white-space:nowrap">' + escapeHtml(x.code) + '</td><td style="min-width:210px"><div class="sm-name">' + escapeHtml(x.name) + '</div>' + hint + dmLine + '</td>'
+          + '<td style="text-align:right;white-space:nowrap">' + (x.act > 0 ? fmtInt(Math.round(x.act)) : '<span style="color:#cbd5e1">-</span>') + (x.dm && Math.abs(x.recS - x.act) >= 1 ? small('기록 ' + fmtInt(Math.round(x.recS))) : '') + '</td>'
+          + '<td style="text-align:right;white-space:nowrap">' + (x.exp > 0 ? fmtInt(Math.round(x.exp)) : '<span style="color:#cbd5e1">-</span>') + (x.dm === 'fill' ? small('채운 양') : '') + '</td>'
           + '<td style="text-align:right;white-space:nowrap;font-weight:700;color:' + (money(x) ? st[1] : '#94a3b8') + '">' + sg(x.diff) + '</td>'
           + '<td class="sm-amt"' + (money(x) ? '' : ' title="단위·BOM이 맞지 않거나 한쪽만 있어 참고용"') + '>'
           + (!x.price ? '<span style="color:#94a3b8">단가 없음</span>' : money(x) ? '<b>' + wtxt + '</b>' + _smBar(Math.abs(x.won) / maxWon, st[1], '목록에서 가장 큰 차이 금액 대비') : '<span style="color:#94a3b8">' + wtxt + ' (참고)</span>') + '</td></tr>';
@@ -21294,7 +21499,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     else {
       const key = x => (x.st === 'noexp' || x.st === 'noact') ? 'one' : x.st;
       const G = [['over', '초과 사용', '#c2410c', 'BOM보다 1.1~1.5배 — 로스가 크거나 BOM 소요량이 적게 등록'], ['under', '덜 사용', '#1d4ed8', 'BOM의 0.5~0.9배 — 사용량 입력 누락이거나 BOM 소요량이 많게 등록'],
-                 ['odd', '단위·BOM 점검', '#b91c1c', '1.5배 넘거나 0.5배 미만 — 로스로 보기엔 커서 금액 판단 보류'], ['one', '한쪽만 있음', '#6d28d9', '실사용이나 BOM 소요 한쪽만 — 대부분 재고파악 파일 쪽 원인']];
+                 ['odd', '단위·BOM 점검', '#b91c1c', '1.5배 넘거나 0.5배 미만 — 로스로 보기엔 커서 금액 판단 보류'],
+                 ['adj', '조정·누락', '#b45309', '날짜별로 맞춰 보면 사용은 맞는데, 사용 칸에 재고 조정(마이너스 등)이나 입력 누락이 있음'],
+                 ['one', '한쪽만 있음', '#6d28d9', '실사용이나 BOM 소요 한쪽만 — 대부분 재고파악 파일 쪽 원인']];
       body = G.map(g => {
         const xs = rows.filter(x => key(x) === g[0]); if (!xs.length) return '';
         const a = xs.reduce((s, x) => s + (money(x) && x.price ? Math.abs(x.won) : 0), 0);
@@ -21331,29 +21538,89 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   }
   function renderBuDetail() {
     const d = _lensd, x = d.x, i0 = _buIdx(), f = v => fmtInt(Math.round(v)), pct = x.r != null ? Math.round(x.r * 100) : null;
-    const amt = x.price ? _exWon(Math.abs(x.won)) + '원' : '단가 없음';
+    const amt = x.price ? _exWon(Math.abs(x.won)) + '원' : '단가 없음', sg = v => (v > 0 ? '+' : '') + f(v);
+    const fill = x.dm === 'fill', base = fill ? '채운 양' : 'BOM 소요';
     const W = {
-      over: 'BOM대로면 <b>' + f(x.exp) + '개</b>면 되는데 실제로 <b>' + f(x.act) + '개(' + pct + '%)</b>를 썼어요. 더 쓴 <b>' + f(x.diff) + '개</b>는 ' + amt + '어치예요.<br>→ 로스가 크거나, BOM 소요량이 실제보다 적게 등록됐을 수 있어요.',
-      under: 'BOM 소요 <b>' + f(x.exp) + '개</b>보다 적은 <b>' + f(x.act) + '개(' + pct + '%)</b>만 사용으로 기록됐어요.<br>→ 재고파악 사용량 입력이 빠졌거나, BOM 소요량이 실제보다 많게 등록됐는지 확인하세요.',
-      odd: '실사용 <b>' + f(x.act) + '개</b>와 BOM 소요 <b>' + f(x.exp) + '개</b>가 <b>' + pct + '%</b>로 크게 달라요. 로스로 보기엔 차이가 너무 커요.<br>→ 단위(낱개·묶음), BOM 소요량, 품번이 다른 제품 쪽에 적혔는지부터 확인하세요.',
+      over: (fill ? '채운 양' : 'BOM') + '대로면 <b>' + f(x.exp) + '개</b>면 되는데 실제로 <b>' + f(x.act) + '개(' + pct + '%)</b>를 썼어요. 더 쓴 <b>' + f(x.diff) + '개</b>는 ' + amt + '어치예요.<br>→ 로스가 크거나, BOM 소요량이 실제보다 적게 등록됐을 수 있어요.',
+      under: base + ' <b>' + f(x.exp) + '개</b>보다 적은 <b>' + f(x.act) + '개(' + pct + '%)</b>만 사용으로 기록됐어요.<br>→ 재고파악 사용량 입력이 빠졌거나, BOM 소요량이 실제보다 많게 등록됐는지 확인하세요.',
+      odd: '실사용 <b>' + f(x.act) + '개</b>와 ' + base + ' <b>' + f(x.exp) + '개</b>가 <b>' + pct + '%</b>로 크게 달라요. 로스로 보기엔 차이가 너무 커요.<br>→ 단위(낱개·묶음), BOM 소요량, 품번이 다른 제품 쪽에 적혔는지부터 확인하세요.',
+      adj: '날짜별로 맞춰 보면 사용 <b>' + f(x.act) + '개</b>가 ' + base + ' <b>' + f(x.exp) + '개</b>와 맞아요' + (pct != null ? ' (' + pct + '%)' : '') + '.<br>대신 사용 칸에 '
+        + [x.nadjS ? '<b>조정 ' + sg(x.adjS) + '개(' + x.nadjS + '일)</b>' : '', x.nmissS ? '<b>입력 누락 ' + f(x.missS) + '개(' + x.nmissS + '일)</b>' : ''].filter(Boolean).join(', ')
+        + '이 있어요 — 실사용에서 빼고 따로 봤어요.<br>→ 아래 날짜별 표에서 그날 재고 실사 조정인지, 입력을 빠뜨린 건지 거래처에 확인하세요.',
       noexp: '이 거래처에서 <b>' + f(x.act) + '개</b>를 썼는데, BOM으로 계산한 소요량이 없어요.',
       noact: 'BOM대로면 <b>' + f(x.exp) + '개</b>가 필요한데 재고파악에 사용 기록이 없어요.',
-      ok: '실사용과 BOM 소요가 ±10% 안에서 맞아요 (' + pct + '%).'
+      ok: '실사용과 ' + (fill ? '채운 양이' : 'BOM 소요가') + ' ±10% 안에서 맞아요 (' + pct + '%).'
     }[x.st] + ((x.st === 'noexp' || x.st === 'noact') && x.diag ? '<br>' + _buWhyText(x) : '');
-    let h = '<div class="npd-why" style="background:#f5f3ff;border-color:#ddd6fe">' + W + '</div>';
+    // 날짜 기준 자재: 어떤 기준으로 맞췄는지 (2026-11-13 사용자 "생산일과 출고일에 따라 사용량이 다를 수 있음")
+    const how = !x.dm ? '' : '<div style="margin-bottom:6px;font-weight:700;color:#5b21b6">' + (fill
+      ? '📅 이 자재는 반제품 <b>' + escapeHtml(x.semi) + '</b>을 채우는 날 쓰여서, 완제품 생산이 아니라 <b>채운 양과 같은 날짜</b>로 비교했어요.'
+      : '📅 이 자재는 완제품을 만든 날 같이 적혀서, <b>그날 완제품 필요량</b>과 날짜별로 비교했어요.') + '</div>';
+    let h = '<div class="npd-why" style="background:#f5f3ff;border-color:#ddd6fe">' + how + W + '</div>';
     const dg = (x.st === 'noexp' || x.st === 'noact') && x.diag ? x.diag : null;
     if (dg && (dg.blocks || []).length) h += '<div class="npd-sec">재고파악 제품 블록</div><table class="npd-tbl"><thead><tr><th>블록 제품</th><th>생산(올해)</th><th>BOM</th><th>이 자재 사용</th></tr></thead><tbody>'
       + dg.blocks.map(b => '<tr><td>' + escapeHtml(b.p) + ' ' + escapeHtml((b.name || '').slice(0, 30)) + '</td><td>' + fmtInt(b.prod) + '</td><td>' + (b.bom ? '있음' : '<b style="color:#b91c1c">없음</b>') + '</td><td>' + fmtInt(b.use) + '</td></tr>').join('') + '</tbody></table>';
-    h += '<div class="npd-kpis">' + _ld.kpi('실사용', f(x.act), '') + _ld.kpi('BOM 소요', f(x.exp), '로스 포함') + _ld.kpi('비율', pct != null ? pct + '%' : '-', '실사용 ÷ BOM')
-      + _ld.kpi('차이', (x.diff > 0 ? '+' : '') + f(x.diff), '') + _ld.kpi('차이 금액', x.price ? (x.won >= 0 ? '+' : '−') + _exWon(Math.abs(x.won)) : '-', x.price ? '단가 ' + fmtNum(x.price) + '원' : '단가 없음')
-      + _ld.kpi('기간', d.months.length + '개월', d.months.length ? Number(d.months[0].slice(4)) + '월~' + Number(d.months[d.months.length - 1].slice(4)) + '월' : '') + '</div>';
-    h += _ld.chartBlock('월별 실사용 · BOM 소요', '');
-    if (x.src.length) h += '<div class="npd-sec">BOM 소요 계산 — 이 거래처 제품 생산 × 개당 소요</div><table class="npd-tbl"><thead><tr><th>제품</th><th>개당 소요</th><th>기간 생산</th><th>BOM 소요</th></tr></thead><tbody>'
+    const per = d.months.length ? Number(d.months[0].slice(4)) + '월~' + Number(d.months[d.months.length - 1].slice(4)) + '월' : '';
+    h += '<div class="npd-kpis">' + (x.dm
+      ? _ld.kpi(fill ? '채운 양' : 'BOM 소요', f(x.exp), fill ? '반제품 생산 = 쓴 날 기준' : '그날 완제품 × 개당') + _ld.kpi('실사용', f(x.act), '기준 있는 날 사용') + _ld.kpi('비율', pct != null ? pct + '%' : '-', '실사용 ÷ ' + base)
+        + _ld.kpi('조정', x.nadjS ? sg(x.adjS) : '없음', x.nadjS ? x.nadjS + '일 · 마이너스·기준 없는 날' : '') + _ld.kpi('입력 누락', x.nmissS ? f(x.missS) : '없음', x.nmissS ? x.nmissS + '일 · 기준 있는데 사용 0' : '')
+        + _ld.kpi('기록 합계', f(x.recS), per)
+      : _ld.kpi('실사용', f(x.act), '') + _ld.kpi('BOM 소요', f(x.exp), '로스 포함') + _ld.kpi('비율', pct != null ? pct + '%' : '-', '실사용 ÷ BOM')
+        + _ld.kpi('차이', (x.diff > 0 ? '+' : '') + f(x.diff), '') + _ld.kpi('차이 금액', x.price ? (x.won >= 0 ? '+' : '−') + _exWon(Math.abs(x.won)) : '-', x.price ? '단가 ' + fmtNum(x.price) + '원' : '단가 없음')
+        + _ld.kpi('기간', d.months.length + '개월', per)) + '</div>';
+    h += _ld.chartBlock('월별 실사용 · ' + base, '');
+    const ym = y => y.slice(2, 4) + '/' + y.slice(4), at = (a, i) => (a || [])[i0 + i] || 0;
+    // 달별 표 — 날짜 기준 자재는 기준·같은 날 사용·조정·누락·기록 합계
+    if (x.dm) h += '<div class="npd-sec">달별 — ' + base + ' vs 실사용 · 조정 · 누락</div><table class="npd-tbl"><thead><tr><th>달</th><th>' + base + '</th><th>실사용</th><th>조정</th><th>입력 누락</th><th>기록 합계</th></tr></thead><tbody>'
+      + d.months.map((y, i) => { const aj = at(x.adj, i), ms = at(x.miss, i);
+          return '<tr><td>' + ym(y) + '</td><td>' + f(at(x.e, i)) + '</td><td>' + f(at(x.a, i)) + '</td><td' + (aj ? ' style="color:#b45309;font-weight:700"' : '') + '>' + (aj ? sg(aj) : '-') + '</td><td' + (ms ? ' style="color:#b45309;font-weight:700"' : '') + '>' + (ms ? f(ms) : '-') + '</td><td>' + f(at(x.rec, i)) + '</td></tr>'; }).join('') + '</tbody></table>';
+    // 반제품 흐름 — 채운 양·담은 양·쌓인 양 (채워 두고 아직 완제품에 안 담은 것 때문에 달마다 어긋남)
+    const sk = x.semi || x.semi_ref, sm = sk && (_buData.semis || {})[x.vendor + '|' + sk];
+    if (sm) {
+      let run = 0;
+      h += '<div class="npd-sec">반제품 흐름 — ' + escapeHtml(sk) + ' (' + escapeHtml(x.vendor) + ')</div>'
+        + '<div class="npd-note" style="margin:-2px 0 6px">채운 양 − 담은 양이 쌓여요(채워 두고 아직 완제품에 안 담은 양, 기간 시작 대비). 달마다 1차 파우치와 완제품 기준이 어긋나는 건 이 때문이에요.' + (fill ? ' 담은 양과 완제품 필요량(완제품 × 개당)이 맞는지 보면 BOM 개당 소요가 맞는지 알 수 있어요.' : '') + '</div>'
+        + '<table class="npd-tbl"><thead><tr><th>달</th><th>채운 양</th><th>담은 양</th>' + (fill ? '<th>완제품 필요량</th>' : '') + '<th>쌓인 양(누적)</th></tr></thead><tbody>'
+        + d.months.map((y, i) => { const a = at(sm.in, i), o = at(sm.out, i); run += a - o;
+            return '<tr><td>' + ym(y) + '</td><td>' + f(a) + '</td><td>' + f(o) + '</td>' + (fill ? '<td>' + f(at(x.efg, i)) + '</td>' : '') + '<td style="font-weight:700;color:' + (run < 0 ? '#1d4ed8' : '#b45309') + '">' + sg(run) + '</td></tr>'; }).join('')
+        + '</tbody></table>';
+    }
+    // 날짜별 대조 — 다른 날만 먼저, '모든 날' 누르면 전부 (서버에서 받아 옴)
+    if (x.dm) h += '<div class="npd-sec" style="display:flex;align-items:center;gap:8px">날짜별 대조 <span id="bu-day-sum" style="font-size:11.5px;font-weight:600;color:var(--text-3)"></span>'
+      + '<button type="button" class="vk-chip" id="bu-day-all" style="margin-left:auto;border:1px solid #e2e8f0" onclick="_buDayAll = !_buDayAll; renderBuDaily()">모든 날 보기</button></div><div id="bu-daily"><div class="loading" style="padding:12px">날짜별 값 불러오는 중…</div></div>';
+    if (x.src.length) h += '<div class="npd-sec">' + (fill ? '참고: 완제품 기준 필요량 (담는 단계) — 완제품 생산 × 개당 소요' : 'BOM 소요 계산 — 이 거래처 제품 생산 × 개당 소요') + '</div><table class="npd-tbl"><thead><tr><th>제품</th><th>개당 소요</th><th>기간 생산</th><th>' + (fill ? '필요량' : 'BOM 소요') + '</th></tr></thead><tbody>'
       + x.src.map(s => { const pq = s.q.slice(i0).reduce((a, v) => a + v, 0); return '<tr><td>' + escapeHtml(s.code) + ' ' + escapeHtml((s.name || '').slice(0, 34)) + '</td><td>' + fmtNum(s.per) + '</td><td>' + f(pq) + '</td><td>' + f(pq * s.per) + '</td></tr>'; }).join('') + '</tbody></table>';
     else h += '<div class="npd-note">이 거래처 재고파악의 생산 제품 BOM에는 이 자재가 없어요.</div>';
     h += _ld.itemBtn(x.code);
     document.getElementById('lensd-body').innerHTML = h;
     drawLensdChart();
+    if (x.dm) loadBuDaily(x.vendor, x.code);
+  }
+  // 날짜별 대조 (2026-11-13) — /api/bom_usage_daily, 고른 기간 달만
+  let _buDay = null, _buDayAll = false;
+  async function loadBuDaily(v, c) {
+    _buDay = null; _buDayAll = false;
+    try {
+      const r = await (await fetch('/api/bom_usage_daily?vendor=' + encodeURIComponent(v) + '&code=' + encodeURIComponent(c))).json();
+      if (!_lensd || !_lensd.x || _lensd.x.code !== c || _lensd.x.vendor !== v) return;   // 그사이 다른 상세를 열었으면 버림
+      _buDay = r; renderBuDaily();
+    } catch (e) { const el = document.getElementById('bu-daily'); if (el) el.innerHTML = '<div class="npd-note" style="color:#ef4444">날짜별 값을 못 불러왔어요: ' + escapeHtml(e.message) + '</div>'; }
+  }
+  function renderBuDaily() {
+    const el = document.getElementById('bu-daily'); if (!el || !_buDay) return;
+    const ms = new Set(_lensd.months), fill = _buDay.dm === 'fill', f = v => fmtInt(Math.round(v));
+    const rows = (_buDay.rows || []).filter(r => ms.has(r.d.slice(0, 4) + r.d.slice(5, 7)));
+    const odd = rows.filter(r => r.k !== 'same'), show = _buDayAll ? rows : odd;
+    const cnt = {}; odd.forEach(r => { cnt[r.k] = (cnt[r.k] || 0) + 1; });
+    document.getElementById('bu-day-sum').textContent = '기록 있는 날 ' + rows.length + '일 중 같은 날 ' + (rows.length - odd.length) + '일'
+      + (odd.length ? ' · 다른 날 ' + odd.length + '일 (' + Object.keys(cnt).map(k => BU_DAY[k][0] + ' ' + cnt[k]).join(', ') + ')' : '');
+    const b = document.getElementById('bu-day-all'); if (b) b.textContent = _buDayAll ? '다른 날만 보기' : '모든 날 보기';
+    if (!show.length) { el.innerHTML = '<div class="npd-note">날마다 ' + (fill ? '채운 양' : '완제품 필요량') + '과 사용이 같아요 👍</div>'; return; }
+    const wd = s => '일월화수목금토'.charAt(new Date(+s.slice(0, 4), +s.slice(5, 7) - 1, +s.slice(8, 10)).getDay());
+    el.innerHTML = '<div style="max-height:320px;overflow:auto"><table class="npd-tbl"><thead><tr><th>날짜</th><th>' + (fill ? '채운 양' : '완제품 필요량') + '</th><th>사용(기록)</th><th>차이</th><th>구분</th></tr></thead><tbody>'
+      + show.map(r => { const k = BU_DAY[r.k] || ['', '#64748b'], df = r.b - r.a;
+          return '<tr' + (r.k !== 'same' ? ' style="background:#fffbeb"' : '') + '><td>' + r.d.slice(5).replace('-', '/') + ' (' + wd(r.d) + ')</td><td>' + (r.a ? f(r.a) : '-') + '</td><td>' + f(r.b) + '</td>'
+            + '<td style="font-weight:700;color:' + (Math.abs(df) < 0.5 ? '#94a3b8' : k[1]) + '">' + (Math.abs(df) < 0.5 ? '0' : (df > 0 ? '+' : '') + f(df)) + '</td><td><b style="color:' + k[1] + '">' + k[0] + '</b></td></tr>'; }).join('')
+      + '</tbody></table></div>';
   }
 
   // ───── 시안 변경 소진 계획 (2026-11-11, 부재료 관리 4번) ─────
