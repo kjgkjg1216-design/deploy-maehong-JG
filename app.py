@@ -15056,21 +15056,44 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .vk-tag.po { background:#ede9fe; color:#6d28d9; }
   .vk-tag.wp { background:#ffedd5; color:#c2410c; }
   /* 과잉·장기 부재료 패널 (2026-11-11): 윗줄 카드 = 금액 요약 겸 필터, 아래 표는 머리글 고정 */
-  .ex-kpis { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; margin: 2px 0 6px; }
-  .ex-kpi { text-align: left; background: #f8fafc; border: 1px solid var(--border); border-radius: 10px; padding: 7px 10px; cursor: pointer; font-family: inherit; font-size: 11px; font-weight: 700; color: var(--text-2); }
-  .ex-kpi b { display: block; font-size: 18px; font-weight: 800; color: var(--c); font-variant-numeric: tabular-nums; margin: 1px 0; }
-  .ex-kpi span { font-size: 10.5px; font-weight: 500; color: var(--text-3); }
+  /* 부재료 관리 탭 세 패널 (2026-11-13 사용자 "좀 더 보기 편하게"): 글자·줄 간격 키움, 맨 앞 판정 칸(.sm-lead)·묶음 제목 줄(.sm-grp)·금액 막대(.sm-bar)·계산 기준 접기(.sm-how) */
+  .ex-kpis { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin: 2px 0 8px; }
+  .ex-kpi { text-align: left; background: #f8fafc; border: 1px solid var(--border); border-radius: 12px; padding: 10px 13px; cursor: pointer; font-family: inherit; font-size: 12px; font-weight: 700; color: var(--text-2); }
+  .ex-kpi b { display: block; font-size: 22px; font-weight: 800; color: var(--c); font-variant-numeric: tabular-nums; margin: 2px 0; letter-spacing: -0.02em; }
+  .ex-kpi span { font-size: 11.5px; font-weight: 500; color: var(--text-3); }
   .ex-kpi:hover { border-color: var(--c); }
-  .ex-kpi.on { background: #fff; border-color: var(--c); box-shadow: inset 0 0 0 1px var(--c); }
-  .ex-note { font-size: 10.5px; color: var(--text-3); margin-bottom: 8px; line-height: 1.55; }
+  .ex-kpi.on { background: #fff; border-color: var(--c); box-shadow: inset 0 0 0 1.5px var(--c); }
+  .ex-note { font-size: 12px; color: var(--text-3); margin-bottom: 9px; line-height: 1.6; }
+  .ex-note b { color: var(--text-2); }
   .ex-list { max-height: 440px; overflow: auto; }
-  .ex-tbl { width: 100%; min-width: 900px; border-collapse: separate; border-spacing: 0; font-size: 12px; font-variant-numeric: tabular-nums; }
-  .ex-tbl thead th { position: sticky; top: 0; z-index: 1; background: #f8fafc; color: #64748b; font-size: 11px; font-weight: 700; white-space: nowrap; box-shadow: 0 1px 0 #e2e8f0; }
-  .ex-tbl td { padding: 7px 9px; border-bottom: 1px solid #f1f5f9; vertical-align: middle; }
+  .ex-tbl { width: 100%; min-width: 960px; border-collapse: separate; border-spacing: 0; font-size: 13px; font-variant-numeric: tabular-nums; }
+  .ex-tbl thead th { position: sticky; top: 0; z-index: 2; background: #f8fafc; color: #64748b; font-size: 11.5px; font-weight: 700; white-space: nowrap; box-shadow: 0 1px 0 #e2e8f0; }
+  .ex-tbl td { padding: 6px 10px; border-bottom: 1px solid #f1f5f9; vertical-align: middle; }
   .ex-tbl tbody tr { cursor: pointer; }
   .ex-tbl tbody tr:hover td { background: #f8fafc; }
-  .ex-badge { display: inline-block; padding: 1px 7px; border-radius: 8px; font-size: 10px; font-weight: 700; white-space: nowrap; }
-  .ex-loc { display: inline-block; margin: 1px 3px 1px 0; padding: 1px 6px; border-radius: 7px; font-size: 10.5px; white-space: nowrap; }
+  .ex-badge { display: inline-block; padding: 2px 8px; border-radius: 8px; font-size: 11px; font-weight: 700; white-space: nowrap; }
+  .ex-loc { display: inline-block; margin: 1px 4px 1px 0; padding: 2px 7px; border-radius: 7px; font-size: 11.5px; white-space: nowrap; }
+  .sm-lead { display: inline-flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px; min-width: 92px; padding: 4px 9px; border-radius: 9px;
+             line-height: 1.2; text-align: center; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .sm-lead b { font-size: 13.5px; font-weight: 800; }
+  .sm-lead small { font-size: 10.5px; font-weight: 700; opacity: .9; }
+  .ex-tbl tbody tr.sm-grp { cursor: default; }
+  .ex-tbl tbody tr.sm-grp td, .ex-tbl tbody tr.sm-grp:hover td { position: sticky; top: var(--sm-th, 34px); z-index: 1; background: #fff; padding: 11px 10px 6px; font-size: 13px; font-weight: 800;
+             color: var(--gc); border-bottom: 2px solid var(--gc); }
+  .sm-grp .n { display: inline-block; margin-left: 7px; padding: 0 8px; border-radius: 9px; background: var(--gc); color: #fff; font-size: 11.5px; line-height: 18px; vertical-align: 1px; }
+  .sm-grp .h { margin-left: 9px; font-size: 12px; font-weight: 600; color: var(--text-3); }
+  .sm-name { color: var(--text); }
+  .sm-sub { margin-top: 2px; font-size: 11.5px; color: #64748b; }
+  .sm-amt { text-align: right; white-space: nowrap; }
+  .sm-amt b { font-weight: 800; }
+  .sm-bar { height: 6px; margin-top: 4px; border-radius: 3px; background: #eef2f6; overflow: hidden; }
+  .sm-bar i { display: block; height: 100%; border-radius: 3px; }
+  .sm-how { position: relative; display: inline-block; margin-left: 8px; padding: 1px 9px; border-radius: 9px; background: #f1f5f9; color: #475569; font-weight: 700; cursor: help; white-space: nowrap; outline: none; }
+  .sm-how:hover, .sm-how.open { background: #e2e8f0; }
+  .sm-how .tip { display: none; position: absolute; left: 0; top: calc(100% + 6px); z-index: 30; width: max-content; max-width: min(620px, 78vw); padding: 11px 14px; border-radius: 10px;
+                 background: #0f172a; color: #e2e8f0; font-size: 12.5px; font-weight: 500; line-height: 1.75; white-space: normal; box-shadow: 0 8px 24px rgba(15,23,42,.28); cursor: default; }
+  .sm-how .tip b { color: #fff; }
+  .sm-how:hover .tip, .sm-how:focus .tip, .sm-how.open .tip { display: block; }
   .ex-kpis.k6 { grid-template-columns: repeat(6, minmax(0, 1fr)); }
   @container (max-width: 620px) { .ex-kpis, .ex-kpis.k6 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   .excess-panel .chart-head, .bomuse-panel .chart-head, .design-panel .chart-head { flex-wrap: wrap; row-gap: 6px; }
@@ -15144,6 +15167,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     body[data-dtab="order"] .chart-grid > .chart-panel > .alert-list,
     body[data-dtab="fav"] .chart-grid > .chart-panel > .alert-list { min-height: max(310px, calc(56vh - 110px)); }
     body[data-dtab="price"] .spec-list, body[data-dtab="fav"] .spec-list { max-height: max(310px, calc(62vh - 150px)); }
+    body[data-dtab="submat"] .ex-list { max-height: max(440px, calc(100vh - 400px)); }   /* 부재료 관리 탭: 패널 하나가 화면 한 장에 차게 (2026-11-13) */
   }
   /* ② 패널 머리: 칸이 좁으면 오른쪽 버튼·건수가 다음 줄로 (제목·부제목과 겹치거나 버튼 글자가 두 줄로 눌리던 것 — 매출 집중도 등) */
   .chart-head { flex-wrap: wrap; column-gap: 8px; row-gap: 6px; }
@@ -17018,6 +17042,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         <div id="dp-count" style="font-size:11px;color:var(--text-3);font-weight:600;white-space:nowrap"></div>
       </div>
     </div>
+    <div id="dp-kpis" class="ex-kpis"></div>
     <div id="dp-summary" class="ex-note"></div>
     <div id="dp-add" class="dp-add"></div>
     <div id="dp-list" class="ex-list"><div class="loading" style="padding:20px">로딩 중...</div></div>
@@ -21039,6 +21064,15 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     _scPin();
   }
 
+  // ───── 부재료 관리 탭 표 공용 (2026-11-13 사용자 "패널들을 좀 더 보기 편하게") ─────
+  // 맨 앞 판정 칸(큰 값 + 작은 설명, 판정 색) · 묶음 제목 줄 · 금액 막대 · 계산 기준(눌러서 펼침) · 묶음 제목이 머리글 아래 붙게
+  const _smLead = (main, sub, st, tip) => '<span class="sm-lead" style="background:' + st[2] + ';color:' + st[1] + '"' + (tip ? ' title="' + escapeHtml(tip) + '"' : '') + '><b>' + main + '</b>' + (sub ? '<small>' + sub + '</small>' : '') + '</span>';
+  const _smGrp = (cols, color, label, cnt, hint) => '<tr class="sm-grp" style="--gc:' + color + '"><td colspan="' + cols + '">' + label + '<span class="n">' + cnt + '</span>' + (hint ? '<span class="h">' + hint + '</span>' : '') + '</td></tr>';
+  const _smBar = (frac, color, tip) => '<div class="sm-bar"' + (tip ? ' title="' + escapeHtml(tip) + '"' : '') + '><i style="width:' + Math.max(2, Math.min(100, Math.round((frac || 0) * 100))) + '%;background:' + color + '"></i></div>';
+  const _smHow = t => '<span class="sm-how" tabindex="0" onclick="this.classList.toggle(&quot;open&quot;)">ⓘ 계산 기준<span class="tip">' + t + '</span></span>';
+  const _smCols = ws => '<colgroup>' + ws.map(w => '<col style="width:' + w + '%">').join('') + '</colgroup>';
+  function _smStick(id) { const l = document.getElementById(id), h = l && l.querySelector('thead'); if (h && h.offsetHeight) l.style.setProperty('--sm-th', (h.offsetHeight - 1) + 'px'); }   // 숨은 탭에서 그리면 높이 0 → 기본값(34px) 그대로
+
   // ───── 과잉·장기 부재료 (2026-11-11) ─────
   let _exData = null, _exMode = 'excess';
   const _exSortS = { k: '', dir: 0 };
@@ -21071,8 +21105,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     document.getElementById('ex-note').innerHTML = _exMode === 'long'
       ? '아마란스 <b>자사창고(폐기&amp;장기품목)</b> 위치의 재고입니다. 자사재고 파일에는 잡혀 있지 않아 합계에서 뺐어요. 실물이 있으면 새로 사기 전에 먼저 쓸 수 있습니다.'
         + (s.long_dup.n ? ' · <b style="color:#b91c1c">이 창고에 재고가 있는데 최근 3개월에 또 발주한 품번 ' + s.long_dup.n + '개, 겹치는 금액 ' + _exWon(s.long_dup.value) + '원</b>' : '')
-      : '재고 합계 <b>' + _exWon(s.total.value) + '원</b>(' + s.total.n + '품번, 외주처+자사창고) · 월 사용 = 최근 ' + d.months.length + '개월 실사용과 판매 환산 중 큰 값 · 금액 = 최신 발주단가'
-        + (b.new.n ? ' · 최근 구매한 신규 준비분 ' + b.new.n + '품번(' + _exWon(b.new.value) + '원)은 제외' : '') + ' · 재고 파일 ' + md(d.file_at) + ' · 아마란스 ' + md(d.ama_at);
+      : '<b>재고 합계 ' + _exWon(s.total.value) + '원</b> (' + s.total.n + '품번 · 외주처+자사창고) · 재고 파일 ' + md(d.file_at) + ' · 아마란스 ' + md(d.ama_at)
+        + _smHow('<b>소진 기간</b> = 재고 ÷ 월 사용 — 지금 속도로 몇 달 쓸 양인지<br><b>월 사용</b> = 최근 ' + d.months.length + '개월 실사용과 판매 환산 중 큰 값<br><b>금액</b> = 재고 × 최신 발주단가(없으면 단가표)'
+          + (b.new.n ? '<br>최근 구매한 <b>신규 준비분 ' + b.new.n + '품번(' + _exWon(b.new.value) + '원)</b>은 과잉에서 뺐어요' : ''));
     renderExcessList();
   }
   function renderExcessList() {
@@ -21086,22 +21121,43 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     rows = _sortRows(rows, _exSortS, (x, k) => k === 'qty' ? qty(x) : k === 'm' ? x.m : k === 'cover' ? (x.m > 0 ? qty(x) / x.m : 1e9) : k === 'value' ? amt(x) : (x.last_buy ? Number(x.last_buy) : null));
     document.getElementById('ex-count').textContent = rows.length + '품번';
     if (!rows.length) { list.innerHTML = '<div class="alert-empty">' + (q ? '검색 결과가 없습니다' : '해당하는 품번이 없습니다 👍') + '</div>'; return; }
-    const c = 'padding:7px 9px', th = (t, a) => '<th style="' + c + ';text-align:' + a + '">' + t + '</th>', sth = (k, t, b) => _sortTh(_exSortS, 'exSort', k, t, c, 'right', b);
+    const c = 'padding:8px 10px', th = (t, a) => '<th style="' + c + ';text-align:' + a + '">' + t + '</th>', sth = (k, t, b, a) => _sortTh(_exSortS, 'exSort', k, t, c, a || 'right', b);
     const chip = (t, n, bg, fg) => '<span class="ex-loc" style="background:' + bg + ';color:' + fg + '">' + escapeHtml(t) + ' <b>' + fmtInt(Math.round(n)) + '</b></span>';
-    list.innerHTML = '<table class="ex-tbl"><thead><tr>' + th('판정', 'left') + th('품번', 'left') + th('품명', 'left') + th(long ? '위치' : '재고 위치', 'left')
-      + sth('qty', '재고', '재고 수량') + sth('m', '월 사용', '월 사용량') + sth('cover', '소진 기간', '소진 기간') + sth('value', '금액', '재고 금액') + sth('buy', '최근 구매', '최근 구매일') + '</tr></thead><tbody>'
-      + rows.map(x => {
-        const st = long ? (x.rq > 0 ? ['최근 또 발주', '#b91c1c', '#fee2e2'] : (x.m > 0 ? ['사용 중', '#1d4ed8', '#dbeafe'] : ['사용 없음', '#475569', '#e2e8f0'])) : EX_ST[x.status];
-        const loc = long ? chip('폐기·장기', x.long, '#e2e8f0', '#475569')
-          : x.os.map(o => chip(o.vendor, o.q, '#fff7ed', '#c2410c')).join('') + (x.jasa > 0 ? chip('자사', x.jasa, '#eff6ff', '#1d4ed8') : '') + (x.long > 0 ? chip('폐기·장기', x.long, '#f1f5f9', '#64748b') : '');
-        const warn = x.rq > 0 && (long || ['over12', 'over6'].includes(x.status)) ? '<div style="font-size:10px;font-weight:700;color:#b91c1c" title="최근 3개월 발주 ' + fmtInt(x.rq) + '개 · ' + _exWon(x.ra) + '원">최근 발주 ' + fmtInt(x.rq) + '</div>' : '';
-        const cov = x.m > 0 ? _exCover(qty(x) / x.m) : '<span style="color:#b91c1c;font-weight:700">사용 없음</span><div style="font-size:10px;color:#94a3b8">' + (x.last_use ? '마지막 ' + x.last_use.slice(2, 4) + '/' + x.last_use.slice(4) : '올해 기록 없음') + '</div>';
-        return '<tr data-c="' + escapeHtml(x.code) + '" onclick="openExcessDetail(this.dataset.c)" title="클릭 = 월별 사용·쓰는 제품·발주 이력"><td><span class="ex-badge" style="background:' + st[2] + ';color:' + st[1] + '">' + st[0] + '</span></td>'
-          + '<td style="font-weight:700;white-space:nowrap">' + escapeHtml(x.code) + '</td><td style="min-width:210px">' + escapeHtml(x.name) + '</td><td>' + loc + '</td>'
-          + '<td style="text-align:right;white-space:nowrap">' + fmtInt(Math.round(qty(x))) + '</td><td style="text-align:right;white-space:nowrap">' + (x.m > 0 ? fmtInt(Math.round(x.m)) : '-') + '</td>'
-          + '<td style="text-align:right;white-space:nowrap">' + cov + '</td><td style="text-align:right;white-space:nowrap;font-weight:800">' + (x.price ? _exWon(amt(x)) : '<span style="font-weight:500;color:#94a3b8">단가 없음</span>') + '</td>'
-          + '<td style="text-align:right;white-space:nowrap">' + _exDate(x.last_buy) + warn + '</td></tr>';
-      }).join('') + '</tbody></table>';
+    // 판정 (+묶음 열쇠): 폐기·장기 창고는 최근 또 발주 / 사용 중 / 사용 없음
+    const stOf = x => long ? (x.rq > 0 ? ['최근 또 발주', '#b91c1c', '#fee2e2', 'dup'] : (x.m > 0 ? ['사용 중', '#1d4ed8', '#dbeafe', 'use'] : ['사용 없음', '#475569', '#e2e8f0', 'idle']))
+                           : EX_ST[x.status].concat([x.status]);
+    const maxAmt = Math.max(1, ...rows.map(x => x.price ? amt(x) : 0));
+    const now = new Date();
+    const until = cv => { const t = new Date(now.getFullYear(), now.getMonth() + Math.round(cv), 1); return '~' + String(t.getFullYear()).slice(2) + '년 ' + (t.getMonth() + 1) + '월'; };
+    const row = x => {
+      const st = stOf(x), cv = x.m > 0 ? qty(x) / x.m : null;
+      // 맨 앞 칸 = 소진 기간(재고 ÷ 월 사용) + 언제까지 쓸 양인지, 색 = 판정
+      const lead = cv == null
+        ? _smLead('사용 없음', long ? st[0] : (x.last_use ? '마지막 ' + x.last_use.slice(2, 4) + '/' + x.last_use.slice(4) : '올해 기록 없음'), st, st[0] + ' — 최근 사용·판매 기록 없음')
+        : _smLead(cv > 120 ? '10년 이상' : _exCover(cv) + '치', long ? st[0] : (cv > 120 ? '사실상 미사용' : until(cv)), st, st[0] + ' — 재고 ÷ 월 사용, 지금 속도로 쓸 수 있는 기간');
+      const loc = long ? chip('폐기·장기', x.long, '#e2e8f0', '#475569')
+        : x.os.map(o => chip(o.vendor, o.q, '#fff7ed', '#c2410c')).join('') + (x.jasa > 0 ? chip('자사', x.jasa, '#eff6ff', '#1d4ed8') : '') + (x.long > 0 ? chip('폐기·장기', x.long, '#f1f5f9', '#64748b') : '');
+      const warn = x.rq > 0 && (long || ['over12', 'over6'].includes(x.status)) ? '<div style="font-size:11px;font-weight:700;color:#b91c1c" title="최근 3개월 발주 ' + fmtInt(x.rq) + '개 · ' + _exWon(x.ra) + '원">최근 발주 ' + fmtInt(x.rq) + '</div>' : '';
+      return '<tr data-c="' + escapeHtml(x.code) + '" onclick="openExcessDetail(this.dataset.c)" title="클릭 = 월별 사용·쓰는 제품·발주 이력"><td>' + lead + '</td>'
+        + '<td style="font-weight:800;white-space:nowrap">' + escapeHtml(x.code) + '</td><td class="sm-name" style="min-width:210px">' + escapeHtml(x.name) + '</td><td>' + loc + '</td>'
+        + '<td style="text-align:right;white-space:nowrap">' + fmtInt(Math.round(qty(x))) + '</td><td style="text-align:right;white-space:nowrap">' + (x.m > 0 ? fmtInt(Math.round(x.m)) : '<span style="color:#cbd5e1">-</span>') + '</td>'
+        + '<td class="sm-amt">' + (x.price ? '<b>' + _exWon(amt(x)) + '</b>' + _smBar(amt(x) / maxAmt, st[1], '목록에서 가장 큰 금액 대비') : '<span style="color:#94a3b8">단가 없음</span>') + '</td>'
+        + '<td style="text-align:right;white-space:nowrap">' + _exDate(x.last_buy) + warn + '</td></tr>';
+    };
+    // 기본 순서일 땐 판정별로 묶고(묶음 안은 금액 큰 순), 머리글을 눌러 정렬했거나 한 가지 판정만 볼 땐 한 줄로
+    let body;
+    if (_exSortS.k || (!long && _exMode !== 'excess')) body = rows.map(row).join('');
+    else {
+      const G = long ? [['dup', '최근 또 발주', '#b91c1c', '이 창고에 재고가 있는데 최근 3개월에 또 발주'], ['use', '사용 중', '#1d4ed8', '새로 사기 전에 먼저 쓸 수 있는 재고'], ['idle', '사용 없음', '#475569', '']]
+                     : [['dead', '움직임 없음', '#b91c1c', '최근 ' + d.months.length + '개월 사용·판매 없음 — 폐기·전용 검토'], ['over12', '12개월치 초과', '#c2410c', '1년 넘게 쓸 양 — 추가 발주 중단'], ['over6', '6~12개월치', '#a16207', '반년 넘게 쓸 양']];
+      body = G.map(g => {
+        const xs = rows.filter(x => stOf(x)[3] === g[0]); if (!xs.length) return '';
+        return _smGrp(8, g[2], g[1], xs.length, '<b style="color:' + g[2] + '">' + _exWon(xs.reduce((s, x) => s + (x.price ? amt(x) : 0), 0)) + '원</b>' + (g[3] ? ' · ' + g[3] : '')) + xs.map(row).join('');
+      }).join('');
+    }
+    list.innerHTML = '<table class="ex-tbl">' + _smCols([8, 5, 30, 19, 8, 7, 13, 10]) + '<thead><tr>' + sth('cover', '소진 기간', '소진 기간(재고 ÷ 월 사용)', 'left') + th('품번', 'left') + th('품명', 'left') + th(long ? '위치' : '재고 위치', 'left')
+      + sth('qty', '재고', '재고 수량') + sth('m', '월 사용', '월 사용량') + sth('value', '금액', '재고 금액') + sth('buy', '최근 구매', '최근 구매일') + '</tr></thead><tbody>' + body + '</tbody></table>';
+    _smStick('ex-list');
   }
   function openExcessDetail(code) { _lensdMode = ''; _openLens('excess', '/api/excess_detail?code=' + encodeURIComponent(code), '🗃 과잉·장기 · ' + code, '#0f766e', code); }
   function renderExcessDetail() {
@@ -21180,16 +21236,18 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     // 금액은 로스로 볼 수 있는 범위(초과·덜 사용)만 — 단위·BOM이 틀린 건이나 한쪽만 있는 건은 금액이 부풀어 손실처럼 보이므로 뺌
     const amt = xs => xs.filter(x => x.st === 'over' || x.st === 'under').reduce((s, x) => s + Math.abs(x.won), 0);
     const tile = (m, label, c, sub) => { const xs = g(m), a = amt(xs);
-      return '<button type="button" class="ex-kpi' + (_buMode === m ? ' on' : '') + '" style="--c:' + c + '" onclick="setBuMode(&quot;' + m + '&quot;)">' + label + '<b>' + xs.length + '<span style="font-size:11px;font-weight:600;color:var(--text-3)"> 건</span></b><span>' + (a && m !== 'ok' ? _exWon(a) + '원' : '') + (sub ? (a && m !== 'ok' ? ' · ' : '') + sub : '') + '</span></button>'; };
+      return '<button type="button" class="ex-kpi' + (_buMode === m ? ' on' : '') + '" style="--c:' + c + '" onclick="setBuMode(&quot;' + m + '&quot;)">' + label + '<b>' + xs.length + '<span style="font-size:12px;font-weight:600;color:var(--text-3)"> 건</span></b><span>' + (a && m !== 'ok' ? _exWon(a) + '원' : '') + (sub ? (a && m !== 'ok' ? ' · ' : '') + sub : '') + '</span></button>'; };
     document.getElementById('bu-kpis').innerHTML = tile('check', '점검 필요', '#7c3aed', '초과·덜 사용 금액') + tile('over', '초과 사용', '#c2410c', '1.1~1.5배') + tile('under', '덜 사용', '#1d4ed8', '0.5~0.9배')
       + tile('odd', '단위·BOM 점검', '#b91c1c', '1.5배↑·0.5배↓ · 금액 판단 보류')
       + (() => { const one = g('one'), nb = one.filter(x => x.diag && x.diag.kind === 'notinbom').length; return tile('one', '한쪽만 있음', '#6d28d9', nb ? 'BOM 미등록 ' + nb + ' · 재고파악 쪽 ' + (one.length - nb) : '재고파악 파일 쪽 원인'); })()
       + tile('ok', '일치', '#15803d', '±10% · 전체 ' + rows.length + '건 중');
     const ms = d.months.slice(_buIdx()), mm = y => Number(y.slice(4)) + '월';
     const nb = d.nobom.filter(x => !_buVendor || x.vendor === _buVendor);
-    document.getElementById('bu-note').innerHTML = (ms.length ? mm(ms[0]) + '~' + mm(ms[ms.length - 1]) + ' 합계' : '') + ' · 실사용 = 재고파악 일별 사용 · BOM 소요 = 그 거래처 제품(생산) 수량 × BOM 실소요량(로스 포함) · 금액 = 차이 × 최신 발주단가'
-      + ((d.expensed || []).length ? ' · 비용처리 소모품 제외(' + escapeHtml(d.expensed.join('·')) + ')' : '')
-      + (nb.length ? ' · <span title="' + escapeHtml(nb.map(x => x.vendor + ' ' + x.code + ' ' + x.name + ' ' + fmtInt(x.q) + '개').join(' / ')) + '">BOM 없는 생산 품번 ' + nb.length + '개는 계산에서 빠짐(' + escapeHtml(nb.slice(0, 2).map(x => x.code).join('·')) + (nb.length > 2 ? '…' : '') + ')</span>' : '');
+    document.getElementById('bu-note').innerHTML = (ms.length ? '<b>' + mm(ms[0]) + '~' + mm(ms[ms.length - 1]) + ' 합계</b>' : '') + (_buVendor ? ' · ' + escapeHtml(_buVendor) : ' · 거래처 전체')
+      + (nb.length ? ' · <span style="color:#b45309" title="' + escapeHtml(nb.map(x => x.vendor + ' ' + x.code + ' ' + x.name + ' ' + fmtInt(x.q) + '개').join(' / ')) + '">BOM 없는 생산 품번 ' + nb.length + '개는 계산에서 빠짐(' + escapeHtml(nb.slice(0, 2).map(x => x.code).join('·')) + (nb.length > 2 ? '…' : '') + ')</span>' : '')
+      + _smHow('<b>비율</b> = 실사용 ÷ BOM 소요 — 100%면 BOM대로 쓴 것<br><b>실사용</b> = 재고파악 일별 사용<br><b>BOM 소요</b> = 그 거래처 제품(생산) 수량 × BOM 실소요량(로스 포함)<br><b>차이 금액</b> = 차이 × 최신 발주단가 — 초과·덜 사용만 금액으로 봄'
+        + '<br>판정: 일치 ±10% · 초과 1.1~1.5배 · 덜 사용 0.5~0.9배 · 그 밖은 단위·BOM 점검'
+        + ((d.expensed || []).length ? '<br>비용처리 소모품은 제외(' + escapeHtml(d.expensed.join('·')) + ')' : ''));
     renderBomList();
   }
   function renderBomList() {
@@ -21202,15 +21260,19 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     rows = _sortRows(rows, _buSortS, (x, k) => k === 'r' ? x.r : x[k]);
     document.getElementById('bu-count').textContent = rows.length + '건';
     if (!rows.length) { list.innerHTML = '<div class="alert-empty">' + (q ? '검색 결과가 없습니다' : '해당하는 건이 없습니다 👍') + '</div>'; return; }
-    const c = 'padding:7px 9px', th = (t, a) => '<th style="' + c + ';text-align:' + a + '">' + t + '</th>', sth = (k, t, b) => _sortTh(_buSortS, 'buSort', k, t, c, 'right', b);
+    const c = 'padding:8px 10px', th = (t, a) => '<th style="' + c + ';text-align:' + a + '">' + t + '</th>', sth = (k, t, b, a) => _sortTh(_buSortS, 'buSort', k, t, c, a || 'right', b);
     const sg = v => (v > 0 ? '+' : '') + fmtInt(Math.round(v));
-    list.innerHTML = '<table class="ex-tbl"><thead><tr>' + th('판정', 'left') + th('거래처', 'left') + th('품번', 'left') + th('품명', 'left')
-      + sth('act', '실사용', '실사용') + sth('exp', 'BOM 소요', 'BOM 소요') + sth('r', '비율', '실사용 ÷ BOM 소요') + sth('diff', '차이', '차이 수량') + sth('won', '차이 금액', '차이 금액') + '</tr></thead><tbody>'
-      + rows.map(x => {
+    const money = x => x.st === 'over' || x.st === 'under';   // 금액으로 볼 수 있는 건 (그 밖은 참고용 회색)
+    const maxWon = Math.max(1, ...rows.map(x => money(x) && x.price ? Math.abs(x.won) : 0));
+    const row = x => {
         const st = _buSt(x), dg = (x.st === 'noexp' || x.st === 'noact') && x.diag ? x.diag : null;
+        // 맨 앞 칸 = 비율(실사용 ÷ BOM 소요) + 판정, 한쪽만 있는 건은 어느 쪽만 있는지 + 원인
+        const lead = x.st === 'noexp' ? _smLead('실사용만', st[0], st, '실사용은 있는데 BOM 소요가 없음')
+          : x.st === 'noact' ? _smLead('BOM만', st[0], st, 'BOM 소요는 있는데 실사용 기록이 없음')
+          : _smLead(Math.round(x.r * 100) + '%', st[0], st, '실사용 ÷ BOM 소요 — 100%면 BOM대로');
         // 한쪽만 있는 건은 품명 아래에 근거 한 줄 (어느 제품 블록·어느 짝 자재 때문인지)
         const b0 = dg && dg.blocks && dg.blocks[0];
-        const hint = !dg ? '' : '<div style="font-size:10.5px;color:#64748b;margin-top:2px">' + ({
+        const hint = !dg ? '' : '<div class="sm-sub">' + ({
           notinbom: '아마란스 BOM(일반·외주) 어디에도 없는 자재',
           noprod: b0 ? b0.p + ' 블록에 사용만 있고 생산 칸이 0' : '생산 칸이 0',
           oldcode: b0 ? b0.p + '(생산 ' + fmtInt(b0.prod) + ')는 BOM 없는 옛 품번' : 'BOM 없는 옛 품번 블록',
@@ -21218,14 +21280,30 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
           othercode: (dg.users || []).join('·') + ' BOM 자재인데 ' + (b0 ? b0.p : '') + ' 블록에 적힘',
           zero: (b0 ? b0.p + ' 생산 ' + fmtInt(b0.prod) + '개 · ' : '') + '이 자재 행 사용량이 비어 있음',
           norow: '재고파악에 이 거래처의 이 자재 행이 없음' }[dg.kind] || '') + '</div>';
-        return '<tr data-v="' + escapeHtml(x.vendor) + '" data-c="' + escapeHtml(x.code) + '" onclick="openBuDetail(this.dataset.v, this.dataset.c)" title="클릭 = 월별 비교·쓰는 제품"><td><span class="ex-badge" style="background:' + st[2] + ';color:' + st[1] + '">' + st[0] + '</span></td>'
-          + '<td style="white-space:nowrap">' + escapeHtml(x.vendor) + '</td><td style="font-weight:700;white-space:nowrap">' + escapeHtml(x.code) + '</td><td style="min-width:210px">' + escapeHtml(x.name) + hint + '</td>'
-          + '<td style="text-align:right;white-space:nowrap">' + fmtInt(Math.round(x.act)) + '</td><td style="text-align:right;white-space:nowrap">' + (x.exp > 0 ? fmtInt(Math.round(x.exp)) : '-') + '</td>'
-          + '<td style="text-align:right;white-space:nowrap;font-weight:800;color:' + st[1] + '">' + (x.r != null ? Math.round(x.r * 100) + '%' : '-') + '</td>'
-          + '<td style="text-align:right;white-space:nowrap">' + sg(x.diff) + '</td>'
-          + '<td style="text-align:right;white-space:nowrap;' + (x.st === 'over' || x.st === 'under' ? 'font-weight:800' : 'color:#94a3b8') + '"' + (x.st === 'over' || x.st === 'under' ? '' : ' title="단위·BOM이 맞지 않거나 한쪽만 있어 참고용"') + '>'
-          + (x.price ? (x.won > 0 ? '+' : (x.won < 0 ? '−' : '')) + _exWon(Math.abs(x.won)) : '<span style="font-weight:500;color:#94a3b8">단가 없음</span>') + '</td></tr>';
-      }).join('') + '</tbody></table>';
+        const wtxt = (x.won > 0 ? '+' : (x.won < 0 ? '−' : '')) + _exWon(Math.abs(x.won));
+        return '<tr data-v="' + escapeHtml(x.vendor) + '" data-c="' + escapeHtml(x.code) + '" onclick="openBuDetail(this.dataset.v, this.dataset.c)" title="클릭 = 월별 비교·쓰는 제품"><td>' + lead + '</td>'
+          + '<td style="white-space:nowrap;font-weight:700;color:var(--text-2)">' + escapeHtml(x.vendor) + '</td><td style="font-weight:800;white-space:nowrap">' + escapeHtml(x.code) + '</td><td style="min-width:210px"><div class="sm-name">' + escapeHtml(x.name) + '</div>' + hint + '</td>'
+          + '<td style="text-align:right;white-space:nowrap">' + (x.act > 0 ? fmtInt(Math.round(x.act)) : '<span style="color:#cbd5e1">-</span>') + '</td><td style="text-align:right;white-space:nowrap">' + (x.exp > 0 ? fmtInt(Math.round(x.exp)) : '<span style="color:#cbd5e1">-</span>') + '</td>'
+          + '<td style="text-align:right;white-space:nowrap;font-weight:700;color:' + (money(x) ? st[1] : '#94a3b8') + '">' + sg(x.diff) + '</td>'
+          + '<td class="sm-amt"' + (money(x) ? '' : ' title="단위·BOM이 맞지 않거나 한쪽만 있어 참고용"') + '>'
+          + (!x.price ? '<span style="color:#94a3b8">단가 없음</span>' : money(x) ? '<b>' + wtxt + '</b>' + _smBar(Math.abs(x.won) / maxWon, st[1], '목록에서 가장 큰 차이 금액 대비') : '<span style="color:#94a3b8">' + wtxt + ' (참고)</span>') + '</td></tr>';
+    };
+    // 기본 순서 + '점검 필요'일 땐 판정별로 묶음(묶음 안은 금액 큰 순), 머리글 정렬·다른 타일은 한 줄로
+    let body;
+    if (_buSortS.k || _buMode !== 'check') body = rows.map(row).join('');
+    else {
+      const key = x => (x.st === 'noexp' || x.st === 'noact') ? 'one' : x.st;
+      const G = [['over', '초과 사용', '#c2410c', 'BOM보다 1.1~1.5배 — 로스가 크거나 BOM 소요량이 적게 등록'], ['under', '덜 사용', '#1d4ed8', 'BOM의 0.5~0.9배 — 사용량 입력 누락이거나 BOM 소요량이 많게 등록'],
+                 ['odd', '단위·BOM 점검', '#b91c1c', '1.5배 넘거나 0.5배 미만 — 로스로 보기엔 커서 금액 판단 보류'], ['one', '한쪽만 있음', '#6d28d9', '실사용이나 BOM 소요 한쪽만 — 대부분 재고파악 파일 쪽 원인']];
+      body = G.map(g => {
+        const xs = rows.filter(x => key(x) === g[0]); if (!xs.length) return '';
+        const a = xs.reduce((s, x) => s + (money(x) && x.price ? Math.abs(x.won) : 0), 0);
+        return _smGrp(8, g[2], g[1], xs.length, (a ? '<b style="color:' + g[2] + '">' + _exWon(a) + '원</b> · ' : '') + g[3]) + xs.map(row).join('');
+      }).join('');
+    }
+    list.innerHTML = '<table class="ex-tbl">' + _smCols([9, 7, 5, 37, 9, 9, 9, 15]) + '<thead><tr>' + sth('r', '비율 · 판정', '실사용 ÷ BOM 소요', 'left') + th('거래처', 'left') + th('품번', 'left') + th('품명', 'left')
+      + sth('act', '실사용', '실사용') + sth('exp', 'BOM 소요', 'BOM 소요') + sth('diff', '차이', '차이 수량') + sth('won', '차이 금액', '차이 금액') + '</tr></thead><tbody>' + body + '</tbody></table>';
+    _smStick('bu-list');
   }
   // 한쪽만 있는 건 — 원인과 할 일 (재고파악 제품 블록·BOM 짝 기준)
   function _buWhyText(x) {
@@ -21279,7 +21357,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   }
 
   // ───── 시안 변경 소진 계획 (2026-11-11, 부재료 관리 4번) ─────
-  let _dpData = null, _dpFilter = 'open';
+  let _dpData = null, _dpFilter = 'open', _dpTile = 'all';   // _dpTile: 요약 타일로 고른 범위 (all·now·soon·left·idle)
+  function setDpTile(m) { _dpTile = (_dpTile === m) ? 'all' : m; renderDesignPlan(); document.getElementById('dp-list').scrollTop = 0; }
   const _dpSortS = { k: '', dir: 0 };
   const DP_LV = { now: ['지금 발주', '#b91c1c', '#fee2e2', 0], soon: ['곧 발주', '#c2410c', '#ffedd5', 1], idle: ['사용 없음', '#9a3412', '#fed7aa', 2], wait: ['여유', '#15803d', '#dcfce7', 3], ordered: ['신규 발주됨', '#1d4ed8', '#dbeafe', 4], empty: ['재고 없음', '#475569', '#e2e8f0', 5], done: ['완료', '#64748b', '#f1f5f9', 6] };
   async function loadDesignPlan() {
@@ -21318,43 +21397,78 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const d = _dpData, list = document.getElementById('dp-list'); if (!d) return;
     const q = document.getElementById('dp-q').value.trim().toLowerCase(), won = _exWon, ed = d.editable;
     const all = d.items, open = all.filter(x => x.status !== '완료');
-    const sumLeft = open.reduce((s, x) => s + (x.left_value || 0), 0), idleV = open.filter(x => x.lv === 'idle').reduce((s, x) => s + x.value, 0);
-    document.getElementById('dp-summary').innerHTML = '진행 중 <b>' + open.length + '품번</b> · <b style="color:#b91c1c">지금 발주 ' + open.filter(x => x.lv === 'now').length + '</b> · <b style="color:#c2410c">곧 발주(2주 안) ' + open.filter(x => x.lv === 'soon').length + '</b>'
-      + (sumLeft ? ' · 전환 목표일에 남을 재고 <b style="color:#9d174d">' + won(sumLeft) + '원</b>' : '') + (idleV ? ' · 사용 없는 잔량 <b>' + won(idleV) + '원</b>' : '')
-      + ' · 발주 권장일 = 소진 예상일 − 리드타임(실측, 없으면 14일) − 7일' + (ed ? '' : ' · <b>수정은 회사 PC 대시보드에서</b>')
-      + (d.monday ? ' · Monday 연결 <b>' + d.monday.n + '품번</b>' + (d.monday.err ? ' <span style="color:#b91c1c">(가져오기 실패: ' + escapeHtml(d.monday.err.slice(0, 60)) + ')</span>' : (d.monday.at ? ' (' + d.monday.at + ' 가져옴)' : '')) : '');
+    // 요약 타일 — 누르면 그 건만 (2026-11-13: 예전엔 회색 한 줄 글이라 눈에 안 들어왔음)
+    const lefts = open.filter(x => x.left > 0), sumLeft = lefts.reduce((s, x) => s + (x.left_value || 0), 0);
+    const idles = open.filter(x => x.lv === 'idle'), idleV = idles.reduce((s, x) => s + (x.value || 0), 0);
+    const nNow = open.filter(x => x.lv === 'now').length, nSoon = open.filter(x => x.lv === 'soon').length;
+    const unit = (n, u) => n + '<span style="font-size:12px;font-weight:600;color:var(--text-3)"> ' + u + '</span>';
+    const tile = (m, label, big, c, sub) => '<button type="button" class="ex-kpi' + (_dpTile === m ? ' on' : '') + '" style="--c:' + c + '" onclick="setDpTile(&quot;' + m + '&quot;)">' + label + '<b>' + big + '</b><span>' + sub + '</span></button>';
+    document.getElementById('dp-kpis').innerHTML = tile('all', '진행 중', unit(open.length, '품번'), '#db2777', d.monday && d.monday.n ? 'Monday 연결 ' + d.monday.n + '품번' : '바꿀 부재료')
+      + tile('now', '지금 발주', unit(nNow, '건'), '#b91c1c', '신규 시안 발주 권장일이 지났거나 오늘')
+      + tile('soon', '곧 발주', unit(nSoon, '건'), '#c2410c', '발주 권장일이 2주 안')
+      + tile('left', '목표일에 남는 재고', won(sumLeft) + '원', '#9d174d', lefts.length + '품번 · 구 시안 폐기 예상')
+      + tile('idle', '사용 없는 잔량', won(idleV) + '원', '#9a3412', idles.length + '품번 · 소진 예상 없음');
+    document.getElementById('dp-summary').innerHTML = (d.monday ? 'Monday 연결 <b>' + d.monday.n + '품번</b>' + (d.monday.err ? ' <span style="color:#b91c1c">(가져오기 실패: ' + escapeHtml(d.monday.err.slice(0, 60)) + ')</span>' : (d.monday.at ? ' (' + d.monday.at + ' 가져옴)' : '')) : '바꿀 부재료를 검색해 추가하세요')
+      + (ed ? '' : ' · <b>수정은 회사 PC 대시보드에서</b>')
+      + _smHow('<b>발주 권장일</b> = 소진 예상일 − 리드타임(실측, 없으면 14일) − 7일 — 이날까지 신규 시안을 발주해야 끊기지 않음<br><b>소진 예상일</b> = 잔량 ÷ 월 사용<br><b>목표일에 남는 재고</b> = 전환 목표일까지 쓰고도 남는 구 시안 — 막대는 지금 잔량 중 남는 비율');
     document.getElementById('dp-sync').style.display = ed ? '' : 'none';
     // 검색어가 있으면 계획에 없는 품번을 추가 후보로 (호스트 PC만)
     const add = document.getElementById('dp-add');
     const cand = q && ed ? d.candidates.filter(x => (x.code + ' ' + x.name).toLowerCase().includes(q)) : [];
     add.innerHTML = cand.length ? '추가: ' + cand.slice(0, 8).map(x => '<button type="button" data-c="' + escapeHtml(x.code) + '" onclick="dpAdd([this.dataset.c])" title="재고 ' + fmtInt(Math.round(x.stock)) + '">＋ ' + escapeHtml(x.code) + ' ' + escapeHtml(x.name.slice(0, 22)) + '</button>').join('')
       + (cand.length > 1 ? '<button type="button" onclick="dpAdd(_dpData.candidates.filter(x => (x.code + &quot; &quot; + x.name).toLowerCase().includes(document.getElementById(&quot;dp-q&quot;).value.trim().toLowerCase())).map(x => x.code))">＋ 검색 결과 ' + cand.length + '개 모두</button>' : '') : '';
-    let rows = all.filter(x => (_dpFilter === 'all' || x.status !== '완료') && (!q || (x.code + ' ' + x.name + ' ' + x.group + ' ' + x.memo).toLowerCase().includes(q)));
+    const inTile = x => _dpTile === 'all' || (_dpTile === 'left' ? x.left > 0 && x.status !== '완료' : x.lv === _dpTile);
+    let rows = all.filter(x => (_dpFilter === 'all' || x.status !== '완료') && inTile(x) && (!q || (x.code + ' ' + x.name + ' ' + x.group + ' ' + x.memo).toLowerCase().includes(q)));
     rows.sort((a, b) => DP_LV[a.lv][3] - DP_LV[b.lv][3] || (a.order_by || '9').localeCompare(b.order_by || '9') || a.code.localeCompare(b.code));
     rows = _sortRows(rows, _dpSortS, (x, k) => k === 'stock' ? x.stock : k === 'm' ? x.m : k === 'run' ? (x.run_out ? Number(x.run_out.replace(/-/g, '')) : null) : k === 'order' ? (x.order_by ? Number(x.order_by.replace(/-/g, '')) : null) : (x.left_value != null ? x.left_value : null));
     document.getElementById('dp-count').textContent = rows.length + '품번';
-    if (!rows.length) { list.innerHTML = '<div class="alert-empty">' + (q ? (cand.length ? '계획에 없는 품번이에요 — 위 ＋ 버튼으로 추가하세요' : '검색 결과가 없습니다') : (all.length ? '진행 중인 계획이 없습니다 👍' : '아직 계획이 없어요. 검색창에 바꿀 부재료를 찾아 추가하세요')) + '</div>'; return; }
-    const c = 'padding:7px 9px', th = (t, a) => '<th style="' + c + ';text-align:' + a + '">' + t + '</th>', sth = (k, t, b) => _sortTh(_dpSortS, 'dpSort', k, t, c, 'right', b);
+    if (!rows.length) { list.innerHTML = '<div class="alert-empty">' + (q ? (cand.length ? '계획에 없는 품번이에요 — 위 ＋ 버튼으로 추가하세요' : '검색 결과가 없습니다') : (all.length ? (_dpTile !== 'all' ? '해당하는 건이 없습니다 👍' : '진행 중인 계획이 없습니다 👍') : '아직 계획이 없어요. 검색창에 바꿀 부재료를 찾아 추가하세요')) + '</div>'; return; }
+    const c = 'padding:8px 10px', th = (t, a) => '<th style="' + c + ';text-align:' + a + '">' + t + '</th>', sth = (k, t, b, a) => _sortTh(_dpSortS, 'dpSort', k, t, c, a || 'right', b);
     const md = s => s ? s.slice(2).replace(/-/g, '/') : '-', stop = 'onclick="event.stopPropagation()"';
-    list.innerHTML = '<table class="ex-tbl"><thead><tr>' + th('판정', 'left') + th('진행', 'left') + th('품번', 'left') + th('품명', 'left') + th('묶음', 'left')
-      + sth('stock', '잔량', '잔량(외주처+자사)') + sth('m', '월 사용', '월 사용량') + sth('run', '소진 예상', '소진 예상일') + sth('order', '발주 권장', '신규 시안 발주 권장일')
-      + th('전환 목표일', 'left') + sth('left', '목표일에 남는 재고', '전환 목표일에 남는 구 시안 재고 금액') + th('', 'left') + '</tr></thead><tbody>'
-      + rows.map(x => {
+    const diff = _pdCtx().diff, grouped = !_dpSortS.k;
+    const row = x => {
         const st = DP_LV[x.lv], dis = ed ? '' : ' disabled';
+        // 맨 앞 칸 = 신규 시안 발주 권장일 + 판정(지금 발주·곧 발주·여유…), 날짜가 없는 판정은 판정 이름
+        const op = _pdDay(x.order_by), n = op ? diff(op) : null, lt = '리드타임 ' + x.lead + '일' + (x.lead_real ? '(실측)' : '(기본)');
+        const lead = (x.lv === 'now' || x.lv === 'soon' || x.lv === 'wait') && op
+          ? _smLead(md(x.order_by), st[0] + (x.lv === 'wait' ? '' : n < 0 ? ' · ' + (-n) + '일 지남' : n === 0 ? ' · 오늘' : ' · ' + n + '일 뒤'), st, '신규 시안 발주 권장일 · ' + lt)
+          : _smLead(st[0], x.lv === 'idle' ? '소진 예상 없음' : x.lv === 'ordered' ? '신규 시안 발주 완료' : x.lv === 'empty' ? '구 시안 소진' : '', st, st[0]);
         const left = x.left == null ? '<span style="color:#cbd5e1">목표일 입력</span>' : (x.short > 0 ? '<span style="color:#1d4ed8;font-weight:700" title="목표일 전에 구 시안이 바닥남">' + fmtInt(Math.round(x.short)) + '개 모자람</span>'
-          : (x.left > 0 ? '<b style="color:#9d174d">' + fmtInt(Math.round(x.left)) + '개</b><div style="font-size:10px;color:#9d174d">' + (x.price ? won(x.left_value) + '원 폐기 예상' : '단가 없음') + '</div>' : '<span style="color:#15803d;font-weight:700">딱 맞게 소진</span>'));
+          : (x.left > 0 ? '<b style="color:#9d174d">' + fmtInt(Math.round(x.left)) + '개</b> <span style="font-size:11.5px;color:#9d174d">' + (x.price ? won(x.left_value) + '원 폐기 예상' : '단가 없음') + '</span>'
+              + _smBar(x.stock > 0 ? x.left / x.stock : 0, '#db2777', '지금 잔량 중 ' + (x.stock > 0 ? Math.round(x.left / x.stock * 100) : 0) + '%가 전환 목표일에 남음')
+            : '<span style="color:#15803d;font-weight:700">딱 맞게 소진</span>'));
         const run = x.m > 0 ? (x.run_out ? md(x.run_out) : '10년 이상') : '<span style="color:#9a3412">사용 없음</span>';
+        const mon = x.src === 'monday' ? '<a class="dp-mon" href="' + escapeHtml(x.murl || '#') + '" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Monday에서 보기 — ' + escapeHtml(x.memo || '') + '">M</a>' : '';
         return '<tr data-c="' + escapeHtml(x.code) + '" data-src="' + escapeHtml(x.src || '') + '" data-x="' + (x.has_item ? 1 : 0) + '" onclick="if (this.dataset.x === &quot;1&quot;) openExcessDetail(this.dataset.c)" title="' + (x.has_item ? '클릭 = 월별 사용·쓰는 제품·발주 이력' : '재고가 없어 상세가 없어요') + '">'
-          + '<td><span class="ex-badge" style="background:' + st[2] + ';color:' + st[1] + '">' + st[0] + '</span></td>'
+          + '<td>' + lead + '</td>'
           + '<td><select class="dp-ctl" ' + stop + ' onchange="dpSet(this, &quot;status&quot;)"' + dis + '>' + ['대기', '발주완료', '완료'].map(s => '<option' + (s === x.status ? ' selected' : '') + '>' + s + '</option>').join('') + '</select></td>'
-          + '<td style="font-weight:700;white-space:nowrap">' + escapeHtml(x.code) + '</td><td style="min-width:200px">' + escapeHtml(x.name) + '</td><td style="color:var(--text-3)"><div class="dp-grp" title="' + escapeHtml(x.group || '') + '">' + (x.src === 'monday' ? '<a class="dp-mon" href="' + escapeHtml(x.murl || '#') + '" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Monday에서 보기 — ' + escapeHtml(x.memo || '') + '">M</a>' : '') + escapeHtml(x.group || '') + '</div></td>'
-          + '<td style="text-align:right;white-space:nowrap">' + fmtInt(Math.round(x.stock)) + (x.long > 0 ? '<div style="font-size:10px;color:#94a3b8">폐기·장기 ' + fmtInt(Math.round(x.long)) + '</div>' : '') + '</td>'
-          + '<td style="text-align:right;white-space:nowrap">' + (x.m > 0 ? fmtInt(Math.round(x.m)) : '-') + '</td><td style="text-align:right;white-space:nowrap">' + run + '</td>'
-          + '<td style="text-align:right;white-space:nowrap;font-weight:700;color:' + (x.lv === 'now' ? '#b91c1c' : x.lv === 'soon' ? '#c2410c' : 'inherit') + '" title="리드타임 ' + x.lead + '일' + (x.lead_real ? '(실측)' : '(기본)') + '">' + md(x.order_by) + '</td>'
+          + '<td style="font-weight:800;white-space:nowrap">' + escapeHtml(x.code) + '</td>'
+          + '<td style="min-width:230px"><div class="sm-name">' + mon + escapeHtml(x.name) + '</div>' + (!grouped && x.group ? '<div class="sm-sub">' + escapeHtml(x.group) + '</div>' : '') + '</td>'
+          + '<td style="text-align:right;white-space:nowrap">' + fmtInt(Math.round(x.stock)) + (x.long > 0 ? '<div style="font-size:11px;color:#94a3b8">폐기·장기 ' + fmtInt(Math.round(x.long)) + '</div>' : '') + '</td>'
+          + '<td style="text-align:right;white-space:nowrap">' + (x.m > 0 ? fmtInt(Math.round(x.m)) : '<span style="color:#cbd5e1">-</span>') + '</td><td style="text-align:right;white-space:nowrap">' + run + '</td>'
           + '<td><input type="date" class="dp-ctl" value="' + escapeHtml(x.target) + '" ' + stop + ' onchange="dpSet(this, &quot;target&quot;)"' + dis + '></td>'
-          + '<td style="text-align:right;white-space:nowrap">' + left + '</td>'
+          + '<td class="sm-amt">' + left + '</td>'
           + '<td>' + (ed ? '<button type="button" class="dp-ctl" style="cursor:pointer;color:#94a3b8" title="목록에서 지우기" ' + stop.slice(0, -1) + ';dpDel(this)">✕</button>' : '') + '</td></tr>';
-      }).join('') + '</tbody></table>';
+    };
+    // 기본 순서일 땐 묶음(변경 건)별로 — 제목 줄에 그 건의 품번 수·급한 건·목표일·남는 재고. 머리글을 눌러 정렬하면 한 줄로(묶음 이름은 품명 아래)
+    let body;
+    if (!grouped) body = rows.map(row).join('');
+    else {
+      const gs = [], by = {};
+      rows.forEach(x => { const k = x.group || ''; if (!by[k]) { by[k] = []; gs.push(k); } by[k].push(x); });   // rows가 급한 순이라 묶음도 가장 급한 건이 있는 순
+      const mds = s => Number(s.slice(5, 7)) + '/' + Number(s.slice(8, 10));
+      body = gs.map(k => {
+        const xs = by[k], cnt = lv => xs.filter(x => x.lv === lv).length, tg = [...new Set(xs.map(x => x.target).filter(Boolean))].sort();
+        const lv = xs.filter(x => x.left > 0 && x.status !== '완료').reduce((s, x) => s + (x.left_value || 0), 0);
+        const hint = [cnt('now') ? '<b style="color:#b91c1c">지금 발주 ' + cnt('now') + '</b>' : '', cnt('soon') ? '<b style="color:#c2410c">곧 발주 ' + cnt('soon') + '</b>' : '',
+                      tg.length ? '전환 목표 ' + (tg.length === 1 ? mds(tg[0]) : mds(tg[0]) + ' ~ ' + mds(tg[tg.length - 1])) : '전환 목표일 미입력', lv ? '남는 재고 <b style="color:#9d174d">' + won(lv) + '원</b>' : ''].filter(Boolean).join(' · ');
+        return _smGrp(10, k ? '#be185d' : '#64748b', k ? '📁 ' + escapeHtml(k) : '묶음 없음', xs.length, hint) + xs.map(row).join('');
+      }).join('');
+    }
+    list.innerHTML = '<table class="ex-tbl">' + _smCols([10, 7, 5, 28, 8, 7, 8, 9, 16, 2]) + '<thead><tr>' + sth('order', '발주 권장', '신규 시안 발주 권장일', 'left') + th('진행', 'left') + th('품번', 'left') + th('품명', 'left')
+      + sth('stock', '잔량', '잔량(외주처+자사)') + sth('m', '월 사용', '월 사용량') + sth('run', '소진 예상', '소진 예상일')
+      + th('전환 목표일', 'left') + sth('left', '목표일에 남는 재고', '전환 목표일에 남는 구 시안 재고 금액') + th('', 'left') + '</tr></thead><tbody>' + body + '</tbody></table>';
+    _smStick('dp-list');
   }
 
   // ───── 거래처 재고 입력 링크·현황 (2026-09-11) ─────
