@@ -99,9 +99,8 @@ def _oauth_redirect_uri():
         pass
     return OAUTH_REDIRECT_URI
 
-# 방문이력 등 관리자 페이지 열람 허용 이메일 (쉼표구분 env로 추가 가능)
-_ADMIN_EMAILS = set(filter(None, ['kjgkjg1216@gmail.com'] + [
-    e.strip() for e in os.environ.get('ADMIN_EMAILS', '').split(',') if e.strip()]))
+# 방문이력 등 관리자 페이지 열람 허용 이메일 — .env(또는 서버 환경변수) ADMIN_EMAILS에 쉼표로 (2026-11-17: 코드에 적힌 주소를 뺌, 개인정보 보호)
+_ADMIN_EMAILS = set(e.strip() for e in os.environ.get('ADMIN_EMAILS', '').split(',') if e.strip())
 
 # 로그인 불필요 경로 (Monday 웹훅은 외부에서 호출하므로 공개)
 _PUBLIC_PREFIXES = ('/auth/', '/shared/', '/api/shared/', '/static/', '/favicon', '/api/monday_webhook', '/api/data_version', '/api/external/',
@@ -15597,10 +15596,16 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .sb-metric, .sb-lh-avg, .sb-lh-m1 { width: 78px !important; }
   .sb-list-head { font-size: 11px !important; }
   .sb-cls { font-size: 11px !important; }
-  .sb-share { height: 4px; margin-top: 3px; border-radius: 2px; background: #eef2f6; overflow: hidden; }
-  .sb-share i { display: block; height: 100%; background: #3f9e8f; border-radius: 2px; }
-  .sb-forecast { font-size: 11.5px; color: #1f5f55; background: #eef8f6; border: 1px solid #cfe9e3; border-radius: 8px; padding: 6px 10px; margin: -2px 0 8px; line-height: 1.5; }
-  .sb-forecast b { color: #0f766e; }
+  .sb-share { height: 4px; margin-top: 4px; border-radius: 2px; background: #f0efea; overflow: hidden; }
+  .sb-share i { display: block; height: 100%; background: #2a78d6; border-radius: 2px; }
+  /* 차트와 같은 색 (2026-11-17): 첫 타일 분류 비중 얇은 막대·색 점, 분류 꼬리표, 예상 안내는 중립 회색 바탕 */
+  .sb-seg { display: flex; gap: 2px; height: 8px; margin: 7px 0 6px; }
+  .sb-seg i { display: block; height: 100%; border-radius: 4px; }
+  .sb-dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; vertical-align: 0; }
+  #sb-kpis .ex-kpi { background: #ffffff; border-color: #ebeae4; }
+  #sb-kpis .ex-kpi span { color: #6b7280; }
+  .sb-forecast { font-size: 11.5px; color: #52514e; background: #fafaf8; border: 1px solid #ebeae4; border-radius: 8px; padding: 6px 10px; margin: -2px 0 8px; line-height: 1.5; }
+  .sb-forecast b { color: #111827; }
   @media (max-width: 900px) { .lens-strip { grid-template-columns: 1fr; padding: 0 12px; } .chart-panel.lens-dormant { grid-column: auto; } }
   /* 901~1199px(작은 노트북)에선 3칸이면 매출 집중도가 240px로 찌그러져 숫자가 칸 밖으로 → 2칸 (2026-11-06 전수 점검) */
   @media (min-width: 901px) and (max-width: 1199px) { .lens-strip { grid-template-columns: 1fr 1fr; } }
@@ -15648,9 +15653,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .sb-lh-avg { color: var(--text-2); }
   .sb-lh-m1 { color: #2f8576; }
   .sb-cls { font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 4px; flex: none; }
-  .sb-cls.jasa  { background:#ebeef9; color:#45589f; }
-  .sb-cls.sagup { background:#f7efda; color:#927029; }
-  .sb-cls.saip  { background:#e4f1ed; color:#2f8576; }
+  .sb-cls.jasa  { background:#e8f1fc; color:#1c5cab; }
+  .sb-cls.sagup { background:#fdeee7; color:#b4461a; }
+  .sb-cls.saip  { background:#e3f6ee; color:#0f7a52; }
   /* 모바일은 도표 위·TOP10 아래 한 줄씩 — '.sales-npd-strip .salesbase-body'(두 칸)가 우선순위가 높아 폰에서 TOP10 품번이 세로 글자로 눌리던 것 (2026-11-06) */
   @media (max-width: 900px) { .salesbase-body, .sales-npd-strip .salesbase-body { grid-template-columns: 1fr; } }
   .chart-nav { display: inline-flex; gap: 3px; }
@@ -23893,7 +23898,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   let _sbHasAmt = false;     // 공급가(매출액) 있으면 true
   let _sbMonthly = [];       // 월별 원본 (차트 세그먼트 클릭 시 ym 조회용)
   const SB_CLS_KEY = { '자사': 'jasa', '유상사급': 'sagup', '상품매입': 'saip' };
-  const SB_CLS_COLOR = { '자사': '#6276c5', '유상사급': '#dcb058', '상품매입': '#49aa9c' };
+  // 매출 차트 색 (2026-11-17 사용자 "도표 색을 고급지게 — 대기업 자료 같은 퀄리티"): 검증된 범주 팔레트 순서 그대로
+  // (dataviz validate_palette.js 흰 바탕 통과 — 인접 CVD ΔE 9.2·정상 시각 27.6). 청록은 대비 2.8:1이라 범례·표·툴팁이 값을 함께 전함
+  const SB_CLS_COLOR = { '자사': '#2a78d6', '유상사급': '#eb6834', '상품매입': '#1baf7a' };
   function fmtWonC(v) {   // 매출액 압축 표기: 억/만/원
     v = +v || 0;
     if (v >= 1e8) return (v / 1e8).toFixed(1) + '억';
@@ -23930,7 +23937,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       + '<span class="sb-cls ' + (SB_CLS_KEY[t.cls] || '') + '">' + t.cls + '</span>'
       + '<span class="sb-top-name" title="' + escapeHtml(t.code + ' ' + t.name) + '">'
       + '<b class="sb-top-code">' + escapeHtml(t.code) + '</b> ' + escapeHtml(t.name || '')
-      + (_sbHasAmt && mx ? '<div class="sb-share"><i style="width:' + Math.max(2, Math.round((t.m1_amt || 0) / mx * 100)) + '%"></i></div>' : '') + '</span>'
+      + (_sbHasAmt && mx ? '<div class="sb-share"><i style="width:' + Math.max(2, Math.round((t.m1_amt || 0) / mx * 100)) + '%;background:' + (SB_CLS_COLOR[t.cls] || '#2a78d6') + '"></i></div>' : '') + '</span>'
       + cell(t.avg3_amt, t.avg3, 'avg')
       + cell(t.m1_amt, t.m1, 'm1')
       + '</div>'
@@ -23968,16 +23975,21 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       }
       document.getElementById('sb-kpi').textContent = kpi;
       // 요약 타일 (2026-11-17)
-      const tl = (label, big, c, sub) => '<div class="ex-kpi" style="--c:' + c + '">' + label + '<b>' + big + '</b><span>' + sub + '</span></div>';
+      // 숫자는 본문 잉크, 오르내림만 색(▲ 초록·▼ 빨강), 첫 타일엔 분류 비중을 얇은 막대(차트와 같은 색)로 (2026-11-17)
+      const tl = (label, big, c, sub, extra) => '<div class="ex-kpi" style="--c:' + c + '">' + label + '<b>' + big + '</b>' + (extra || '') + '<span>' + sub + '</span></div>';
       const cls3 = complete.slice(-3), avg3 = cls3.length ? cls3.reduce((s, m) => s + kval(m), 0) / cls3.length : 0;
       const g = last && prev && kval(prev) ? (kval(last) - kval(prev)) / kval(prev) * 100 : null;
-      const share = last && _sbHasAmt ? ['자사', '유상사급', '상품매입'].map(k => { const v = last[k + '_amt'] || 0; return k + ' ' + (last.total_amt ? Math.round(v / last.total_amt * 100) : 0) + '%'; }).join(' · ') : '';
+      const parts = last && _sbHasAmt && last.total_amt ? ['자사', '유상사급', '상품매입'].map(k => [k, Math.round((last[k + '_amt'] || 0) / last.total_amt * 100)]) : [];
+      const seg = parts.length ? '<div class="sb-seg">' + parts.map(p => p[1] > 0 ? '<i style="flex:' + p[1] + ';background:' + SB_CLS_COLOR[p[0]] + '"></i>' : '').join('') + '</div>' : '';
+      const share = parts.map(p => '<span class="sb-dot" style="background:' + SB_CLS_COLOR[p[0]] + '"></span>' + p[0] + ' ' + p[1] + '%').join('&nbsp;&nbsp;');
       const fmtK = v => _sbHasAmt ? fmtEok(v) : fmtInt(v) + '개';
-      window._sbTiles = (fc) => document.getElementById('sb-kpis').innerHTML = (last ? tl(Number(last.ym.slice(5)) + '월 매출', fmtK(kval(last)), '#0f766e', share || '지난 완결월') : '')
-        + (g != null ? tl('전월 대비', (g >= 0 ? '▲' : '▼') + Math.abs(g).toFixed(0) + '%', g >= 0 ? '#15803d' : '#dc2626', prev ? Number(prev.ym.slice(5)) + '월 ' + fmtK(kval(prev)) : '') : '')
-        + tl('최근 3개월 평균', fmtK(avg3), '#334155', cls3.length + '개월 완결월')
-        + (fc ? tl(Number(fc.ym.slice(5)) + '월 예상', (fc.runrate / 1e8).toFixed(1) + '억', '#7c3aed', fc.day + '일까지 ' + (fc.mtd / 1e8).toFixed(2) + '억' + (fc.vs_prev_same_pct == null ? '' : ' · 같은 날 대비 ' + (fc.vs_prev_same_pct >= 0 ? '▲' : '▼') + Math.abs(fc.vs_prev_same_pct).toFixed(0) + '%')) : '')
-        + tl('자료 범위', '판매 API', '#64748b', '쿠팡·마트 등 11개 채널');
+      const UP = '#15803d', DN = '#d03b3b', INKT = '#111827';
+      window._sbTiles = (fc) => document.getElementById('sb-kpis').innerHTML = (last ? tl(Number(last.ym.slice(5)) + '월 매출', fmtK(kval(last)), INKT, share || '지난 완결월', seg) : '')
+        + (g != null ? tl('전월 대비', (g >= 0 ? '▲ ' : '▼ ') + Math.abs(g).toFixed(0) + '%', g >= 0 ? UP : DN, prev ? Number(prev.ym.slice(5)) + '월 ' + fmtK(kval(prev)) : '') : '')
+        + tl('최근 3개월 평균', fmtK(avg3), INKT, cls3.length + '개월 완결월')
+        + (fc ? tl(Number(fc.ym.slice(5)) + '월 예상', (fc.runrate / 1e8).toFixed(1) + '억', INKT, fc.day + '일까지 ' + (fc.mtd / 1e8).toFixed(2) + '억'
+            + (fc.vs_prev_same_pct == null ? '' : ' · 같은 날 대비 <b style="display:inline;font-size:inherit;color:' + (fc.vs_prev_same_pct >= 0 ? UP : DN) + '">' + (fc.vs_prev_same_pct >= 0 ? '▲' : '▼') + Math.abs(fc.vs_prev_same_pct).toFixed(0) + '%</b>')) : '')
+        + tl('자료 범위', '판매 API', '#6b7280', '쿠팡·마트 등 11개 채널');
       window._sbTiles(null);
       _sbMonthly = monthly;
       _sbProducts = d.products || [];
@@ -24014,7 +24026,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
 
   // [분류별 / 채널별] 전환 (2026-09-23 매출 현황 패널 통합)
   let _sbMode = 'cls', _sbChData = {};
-  const SB_CH_COLORS = ['#2563eb', '#f59e0b', '#10b981', '#ef4444', '#8b5cf6', '#0ea5e9', '#94a3b8'];
+  // 채널별: 같은 팔레트 1~6번(파랑·주황·청록·노랑·분홍·초록, 인접 검증 통과) + 기타 = 중립 회색
+  const SB_CH_COLORS = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#c3c2b7'];
   function setSbMode(m, el) {
     _sbMode = m;
     document.querySelectorAll('#sb-mode .vk-chip').forEach(b => b.classList.toggle('on', b === el));
@@ -24042,64 +24055,50 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   // 월 매출 누적막대 차트 생성 (패널 5~12개월 / 크게 보기 전체 기간 공용). big = 글자 조금 크게
   function _sbMakeChart(canvas, monthly, chMode, big) {
       // 차트: 분류별 (매출액 억 / 없으면 판매수량) 누적막대 · 채널별 모드는 상위 6채널 + 기타
-      const CLS = [['자사', '#6276c5'], ['유상사급', '#dcb058'], ['상품매입', '#49aa9c']];
-      const labels = monthly.map(m => m.ym.slice(2).replace('-', '/') + (m.is_current ? '*' : ''));
+      // 2026-11-17 보기 개편(사용자 "대기업 자료 같은 퀄리티"): 가는 막대(24px)·칸 사이 2px 흰 틈·맨 위만 둥근 모서리·
+      // 칸마다 숫자 대신 막대 위 합계만·흐린 격자·범례 위 왼쪽·진행 중인 달은 같은 색을 옅게·흰 툴팁에 분류별 값과 비중
+      const CLS = ['자사', '유상사급', '상품매입'].map(k => [k, SB_CLS_COLOR[k]]);
+      const INK = '#111827', INK2 = '#52514e', MUTED = '#8a8880', GRID = '#eeede8', AXIS = '#d6d4cc';
+      const FONT = getComputedStyle(document.body).fontFamily || 'system-ui, sans-serif';
+      const cur = monthly.map(m => !!m.is_current);
+      const labels = monthly.map(m => m.is_current ? [m.ym.slice(2).replace('-', '/'), '진행 중'] : m.ym.slice(2).replace('-', '/'));
+      const fade = c => c + '73';   // 진행 중인 달: 같은 색 45%
+      // 칸 모양: 맨 위 칸만 위쪽 4px 둥글게(바닥은 각지게), 아래 칸과 사이에 2px 흰 틈(아래 테두리를 바탕색으로)
+      const isTop = ctx => { const dss = ctx.chart.data.datasets;
+        for (let k = dss.length - 1; k > ctx.datasetIndex; k--) if ((+dss[k].data[ctx.dataIndex] || 0) > 0 && ctx.chart.isDatasetVisible(k)) return false;
+        return true; };
+      const bar = c => ({ backgroundColor: ctx => cur[ctx.dataIndex] ? fade(c) : c, hoverBackgroundColor: c, borderColor: '#ffffff',
+        borderWidth: ctx => ({ top: 0, left: 0, right: 0, bottom: ctx.datasetIndex > 0 ? 2 : 0 }),
+        borderRadius: ctx => isTop(ctx) ? { topLeft: 4, topRight: 4, bottomLeft: 0, bottomRight: 0 } : 0,
+        borderSkipped: false, maxBarThickness: 24, stack: 'sb' });
       let datasets;
       if (chMode) {
         const tot = {};
         Object.values(_sbChData).forEach(arr => arr.forEach(x => { tot[x.div] = (tot[x.div] || 0) + x.amount; }));
         const top = Object.keys(tot).sort((a, b) => tot[b] - tot[a]).slice(0, 6);
         const amtOf = (ym, ch) => ((_sbChData[ym] || []).find(x => x.div === ch) || {}).amount || 0;
-        datasets = top.map((ch, i) => ({ label: ch, data: monthly.map(m => +(amtOf(m.ym, ch) / 1e8).toFixed(2)),
-          backgroundColor: SB_CH_COLORS[i], stack: 'sb', borderRadius: 3, borderSkipped: false }));
-        datasets.push({ label: '기타', backgroundColor: SB_CH_COLORS[6], stack: 'sb', borderRadius: 3, borderSkipped: false,
-          data: monthly.map(m => +(((_sbChData[m.ym] || []).filter(x => !top.includes(x.div)).reduce((s, x) => s + x.amount, 0)) / 1e8).toFixed(2)) });
+        datasets = top.map((ch, i) => Object.assign({ label: ch, data: monthly.map(m => +(amtOf(m.ym, ch) / 1e8).toFixed(2)) }, bar(SB_CH_COLORS[i])));
+        datasets.push(Object.assign({ label: '기타',
+          data: monthly.map(m => +(((_sbChData[m.ym] || []).filter(x => !top.includes(x.div)).reduce((s, x) => s + x.amount, 0)) / 1e8).toFixed(2)) }, bar(SB_CH_COLORS[6])));
       } else {
-        datasets = CLS.map(([k, c]) => ({
-          label: k,
-          data: monthly.map(m => _sbHasAmt ? +(((m[k + '_amt']) || 0) / 1e8).toFixed(2) : (m[k] || 0)),
-          backgroundColor: c, stack: 'sb', borderRadius: 3, borderSkipped: false
-        }));
+        datasets = CLS.map(([k, c]) => Object.assign({ label: k,
+          data: monthly.map(m => _sbHasAmt ? +(((m[k + '_amt']) || 0) / 1e8).toFixed(2) : (m[k] || 0)) }, bar(c)));
       }
-      // 막대 세그먼트에 분류별 금액 + 상단 합계 표기 (매출액 모드일 때)
-      const sbSegLabels = {
-        id: 'sbSegLabels',
+      const sumAt = (chart, i) => chart.data.datasets.reduce((s, ds, di) => s + (chart.isDatasetVisible(di) ? (+ds.data[i] || 0) : 0), 0);
+      const fmtV = v => _sbHasAmt ? v.toFixed(1) + '억' : fmtInt(Math.round(v)) + '개';
+      // 막대 위 합계만 (칸마다 숫자는 툴팁·[크게 보기] 표로) — 글자는 본문 잉크, 외곽선 없이
+      const sbCapLabels = {
+        id: 'sbCapLabels',
         afterDatasetsDraw(chart) {
-          if (!_sbHasAmt) return;
-          const cx = chart.ctx;
+          const cx = chart.ctx, meta0 = chart.getDatasetMeta(0);
           cx.save();
-          cx.textAlign = 'center';
-          cx.textBaseline = 'middle';
-          // 분류별 세그먼트 값 (흰 글씨 + 어두운 외곽선)
-          cx.font = '700 ' + (big ? 11.5 : 9.5) + 'px -apple-system, "Malgun Gothic", sans-serif';
-          chart.data.datasets.forEach((ds, di) => {
-            const meta = chart.getDatasetMeta(di);
-            meta.data.forEach((bar, i) => {
-              const v = +ds.data[i] || 0;
-              if (v <= 0) return;
-              const yTop = bar.y, yBase = bar.base;
-              if (Math.abs(yBase - yTop) < 7) return;   // 극단적으로 얇을 때만 생략
-              const t = v.toFixed(1);
-              const midY = (yTop + yBase) / 2;
-              cx.lineWidth = 2.8; cx.strokeStyle = 'rgba(255,255,255,0.9)';
-              cx.strokeText(t, bar.x, midY);
-              cx.fillStyle = '#1f2d3d';
-              cx.fillText(t, bar.x, midY);
-            });
-          });
-          // 막대 상단 합계(억)
-          cx.font = '800 ' + (big ? 13 : 10.5) + 'px -apple-system, "Malgun Gothic", sans-serif';
-          const meta0 = chart.getDatasetMeta(0);
-          meta0.data.forEach((bar, i) => {
-            let tot = 0;
-            chart.data.datasets.forEach(ds => tot += +ds.data[i] || 0);
-            if (tot <= 0) return;
-            const topY = chart.scales.y.getPixelForValue(tot) - 7;
-            const t = tot.toFixed(1) + '억';
-            cx.lineWidth = 3; cx.strokeStyle = 'rgba(255,255,255,0.85)';
-            cx.strokeText(t, bar.x, topY);
-            cx.fillStyle = '#0f172a';
-            cx.fillText(t, bar.x, topY);
+          cx.textAlign = 'center'; cx.textBaseline = 'bottom';
+          meta0.data.forEach((b, i) => {
+            const tot = sumAt(chart, i); if (tot <= 0) return;
+            const y = chart.scales.y.getPixelForValue(tot) - 6;
+            cx.font = '700 ' + (big ? 13 : 11.5) + 'px ' + FONT;
+            cx.fillStyle = cur[i] ? MUTED : INK;
+            cx.fillText(fmtV(tot), b.x, y);
           });
           cx.restore();
         }
@@ -24107,9 +24106,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       return new Chart(canvas, {
         type: 'bar',
         data: { labels, datasets },
-        plugins: [sbSegLabels],
+        plugins: [sbCapLabels],
         options: {
           responsive: true, maintainAspectRatio: false, animation: { duration: 300 },
+          layout: { padding: { top: 4, right: 4 } },
           onHover: (evt, els, chart) => {
             const pts = chart.getElementsAtEventForMode(evt, 'nearest', { intersect: true }, false);
             if (evt.native && evt.native.target) evt.native.target.style.cursor = pts.length ? 'pointer' : 'default';
@@ -24125,17 +24125,31 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
             else openClassDetail(mo.ym, cls);
           },
           plugins: {
-            legend: { display: true, labels: { boxWidth: big ? 14 : 11, font: { size: big ? 13 : 10 } } },
-            tooltip: { mode: chMode ? 'index' : 'nearest', callbacks: {
-              label: c => c.dataset.label + ': ' + (_sbHasAmt ? c.parsed.y + '억' : fmtInt(c.parsed.y) + '개'),
-              footer: items => '합계 ' + (_sbHasAmt
-                ? items.reduce((s, i) => s + i.parsed.y, 0).toFixed(2) + '억'
-                : fmtInt(items.reduce((s, i) => s + i.parsed.y, 0)) + '개') + '  ·  클릭 시 ' + (chMode ? '상품 TOP 10' : '분류별 상세')
-            } }
+            legend: { display: true, position: 'top', align: 'start',
+              labels: { usePointStyle: true, pointStyle: 'rectRounded', boxWidth: 10, boxHeight: 10, padding: big ? 18 : 14,
+                        color: INK2, font: { family: FONT, size: big ? 13 : 11.5, weight: '600' } } },
+            tooltip: { mode: 'index', intersect: false, position: 'nearest',
+              backgroundColor: '#ffffff', borderColor: 'rgba(17,24,39,0.12)', borderWidth: 1, cornerRadius: 10, padding: 12, caretSize: 6,
+              titleColor: INK, bodyColor: INK2, footerColor: INK, usePointStyle: true, boxPadding: 5,
+              titleFont: { family: FONT, size: 13, weight: '700' }, bodyFont: { family: FONT, size: 12 }, footerFont: { family: FONT, size: 12, weight: '700' },
+              itemSort: (a, b) => b.datasetIndex - a.datasetIndex,   // 막대에 쌓인 순서대로(위 → 아래)
+              filter: it => (+it.raw || 0) > 0,
+              callbacks: {
+                title: items => { const m = monthly[items[0].dataIndex]; return m.ym.slice(0, 4) + '년 ' + Number(m.ym.slice(5)) + '월' + (m.is_current ? ' (진행 중)' : ''); },
+                label: c => { const t = sumAt(c.chart, c.dataIndex), v = +c.raw || 0;
+                  return ' ' + c.dataset.label + '   ' + (_sbHasAmt ? v.toFixed(2) + '억' : fmtInt(v) + '개') + (t > 0 ? '  ·  ' + Math.round(v / t * 100) + '%' : ''); },
+                labelPointStyle: () => ({ pointStyle: 'rectRounded', rotation: 0 }),
+                labelColor: c => ({ borderColor: c.dataset.hoverBackgroundColor, backgroundColor: c.dataset.hoverBackgroundColor, borderRadius: 2 }),
+                footer: items => ['합계 ' + (_sbHasAmt ? sumAt(items[0].chart, items[0].dataIndex).toFixed(2) + '억' : fmtInt(sumAt(items[0].chart, items[0].dataIndex)) + '개'),
+                                  '클릭 = ' + (chMode ? '그 달 상품 TOP 10' : '그 분류 상세')]
+              } }
           },
           scales: {
-            x: { stacked: true, ticks: { font: { size: big ? 12.5 : 10 } }, grid: { display: false } },
-            y: { stacked: true, beginAtZero: true, grace: '12%', ticks: { font: { size: big ? 12 : 10 }, callback: v => _sbHasAmt ? v + '억' : fmtInt(v) }, grid: { color: '#eef2f7' } }
+            x: { stacked: true, grid: { display: false }, border: { color: AXIS },
+                 ticks: { color: ctx => (Array.isArray(labels[ctx.index]) ? MUTED : INK2), font: { family: FONT, size: big ? 12.5 : 11 }, padding: 6 } },
+            y: { stacked: true, beginAtZero: true, grace: '14%', border: { display: false },
+                 grid: { color: GRID, lineWidth: 1, drawTicks: false },
+                 ticks: { color: MUTED, padding: 8, maxTicksLimit: 6, font: { family: FONT, size: big ? 12 : 10.5 }, callback: v => _sbHasAmt ? v + '억' : fmtInt(v) } }
           }
         }
       });
