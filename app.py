@@ -15528,21 +15528,27 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   /* 줄 높이 맞춤: 목록이 패널 남은 높이를 채움(한쪽 헤더가 길어져도 옆 패널에 빈 공간 안 생김) */
   .lens-strip > .chart-panel { display: flex; flex-direction: column; }
   .lens-strip > .chart-panel > .alert-list { flex: 1 1 0; min-height: 310px; max-height: none; }
-  .wd-row { display: grid; grid-template-columns: 22px 1fr 58px 44px; align-items: center; column-gap: 6px; row-gap: 3px; font-size: 11.5px; padding: 7px 0; }
-  .wd-row + .wd-row { border-top: 1px dashed rgba(15,23,42,0.06); }
-  .wd-split { grid-column: 2 / 5; display: flex; gap: 12px; font-size: 10.5px; font-variant-numeric: tabular-nums; }
-  .wd-split b { font-weight: 800; }
-  .wd-row.wd-total { border-top: 1px solid var(--border); margin-top: 2px; }
-  .wd-bar { height: 14px; border-radius: 4px; background: #f1f5f9; overflow: hidden; display: flex; }
+  /* 납품 요일 패턴 (2026-11-17 사용자 "전문적인 자료처럼"): 검증 팔레트 온라인 #2a78d6·오프라인 #eb6834(흰 바탕 모든 검사 통과),
+     막대 = 왼쪽(기준선) 각지게·오른쪽 끝만 4px 둥글게·두 칸 사이 2px 흰 틈, 글자는 본문색 + 색 점, 구분선은 실선 가는 선 */
+  .wd-row { display: grid; grid-template-columns: 24px 1fr 62px 50px; align-items: center; column-gap: 8px; row-gap: 4px; font-size: 12px; padding: 8px 0; }
+  .wd-row + .wd-row { border-top: 1px solid #f0efea; }
+  .wd-split { grid-column: 2 / 5; display: flex; gap: 14px; font-size: 11px; color: #6b7280; font-variant-numeric: tabular-nums; }
+  .wd-split b { font-weight: 700; color: #111827; }
+  .wd-split .k { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: 0; }
+  .wd-row.wd-total { border-top: 1px solid #d6d4cc; margin-top: 2px; }
+  .wd-bar { height: 12px; display: flex; gap: 2px; }
   .wd-bar i { display: block; height: 100%; }
-  .wd-row .n { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-2); }
-  .wd-row .p { text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .wd-bar i:last-child { border-radius: 0 4px 4px 0; }
+  .wd-row .n { text-align: right; font-variant-numeric: tabular-nums; color: #52514e; }
+  .wd-row .p { text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; color: #111827; }
+  .wd-legend { display: flex; gap: 14px; font-size: 11.5px; font-weight: 600; color: #52514e; margin: 2px 0 6px; }
+  .wd-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
   /* 요일 줄 클릭 = 상세 창 (2026-11-02) */
   .wd-row.wd-click { cursor: pointer; border-radius: 6px; margin: 0 -6px; padding-left: 6px; padding-right: 6px; transition: background 0.12s; }
   .wd-row.wd-click:hover { background: #f1f5f9; }
   .wdd-tbl td.h { text-align: center; font-weight: 600; }
   .wdd-tbl th.h { text-align: center; }
-  .wdd-tbl th.sel, .wdd-tbl td.sel { outline: 2px solid #2563eb; outline-offset: -2px; }
+  .wdd-tbl th.sel, .wdd-tbl td.sel { outline: 2px solid #2a78d6; outline-offset: -2px; }
   .wdd-tbl td .s { display: block; font-size: 9.5px; font-weight: 500; color: var(--text-3); }
   .wdd-chips { display: flex; gap: 4px; flex-wrap: wrap; margin: 0 0 8px; }
   .wdd-chips .vk-chip { border: 1px solid #e2e8f0; }
@@ -20781,10 +20787,12 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     }
   }
 
+  // 온라인·오프라인 색 (2026-11-17): 검증 팔레트 1·2번 — 글자는 본문색, 색은 옆의 점·막대만
+  const WD_ON = '#2a78d6', WD_OFF = '#eb6834';
   function wdSplit(on, off) {   // 요일별 온라인/오프라인 비중 줄
     const t = on + off, po = t ? Math.round(on / t * 100) : 0;
-    return '<div class="wd-split"><span style="color:#2563eb">온라인 ' + fmtInt(on) + ' <b>' + po + '%</b></span>'
-      + '<span style="color:#d97706">오프라인 ' + fmtInt(off) + ' <b>' + (t ? 100 - po : 0) + '%</b></span></div>';
+    return '<div class="wd-split"><span><i class="k" style="background:' + WD_ON + '"></i>온라인 ' + fmtInt(on) + ' <b>' + po + '%</b></span>'
+      + '<span><i class="k" style="background:' + WD_OFF + '"></i>오프라인 ' + fmtInt(off) + ' <b>' + (t ? 100 - po : 0) + '%</b></span></div>';
   }
   async function loadWeekday() {
     const body = document.getElementById('wd-body');
@@ -20794,12 +20802,12 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       if (!days.length) { body.innerHTML = '<div class="alert-empty">자료 없음</div>'; return; }
       if (d.from) document.getElementById('wd-sub').textContent = '최근 12주 (' + d.from.slice(5).replace('-', '/') + '~' + d.to.slice(5).replace('-', '/') + ') · 납품수량 · 클릭=상세';
       const mx = Math.max(...days.map(x => x.qty), 1);
-      body.innerHTML = '<div style="display:flex;gap:10px;font-size:10.5px;color:var(--text-3);margin-bottom:6px">'
-        + '<span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#2563eb;margin-right:3px"></i>온라인</span>'
-        + '<span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#f59e0b;margin-right:3px"></i>오프라인</span></div>'
+      // 막대: 0인 칸은 그리지 않음(틈만 남지 않게), 마지막 칸만 오른쪽 끝 둥글게(CSS :last-child)
+      const seg = (v, c) => v > 0 ? '<i style="width:calc(' + (v / mx * 100).toFixed(2) + '% - 1px);background:' + c + '"></i>' : '';
+      body.innerHTML = '<div class="wd-legend"><span><i style="background:' + WD_ON + '"></i>온라인</span><span><i style="background:' + WD_OFF + '"></i>오프라인</span></div>'
         + days.map((x, i) => '<div class="wd-row wd-click" onclick="openWeekdayDetail(' + i + ')" title="' + escapeHtml(Object.entries(x.by_ch).map(([k, v]) => k + ' ' + v.toLocaleString()).join(' / ')) + ' · 클릭=상세">'
-          + '<span style="font-weight:700;color:' + (x.wd === '일' ? '#dc2626' : (x.wd === '토' ? '#2563eb' : 'var(--text)')) + '">' + x.wd + '</span>'
-          + '<div class="wd-bar"><i style="width:' + (x.online / mx * 100) + '%;background:#2563eb"></i><i style="width:' + (x.offline / mx * 100) + '%;background:#f59e0b"></i></div>'
+          + '<span style="font-weight:700;color:' + (x.wd === '토' || x.wd === '일' ? '#8a8880' : '#111827') + '">' + x.wd + '</span>'
+          + '<div class="wd-bar">' + seg(x.online, WD_ON) + seg(x.offline, WD_OFF) + '</div>'
           + '<span class="n">' + fmtInt(x.qty) + '</span><span class="p">' + x.share + '%</span>'
           + wdSplit(x.online, x.offline) + '</div>').join('')
         + (() => { const on = days.reduce((a, x) => a + x.online, 0), off = days.reduce((a, x) => a + x.offline, 0);
@@ -20810,7 +20818,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   }
   // 납품 요일 패턴 상세 (2026-11-02) — 요일 줄 클릭: 그 요일 선택, 계 줄 클릭: 가장 많은 요일
   let _wdSel = -1;
-  function openWeekdayDetail(w) { _wdSel = w; _openLens('wd', '/api/delivery_weekday_detail', '📅 납품 요일 패턴', '#2563eb', '요일별 납품 상세'); }
+  function openWeekdayDetail(w) { _wdSel = w; _openLens('wd', '/api/delivery_weekday_detail', '📅 납품 요일 패턴', '#2a78d6', '요일별 납품 상세'); }
   function wdPick(w) { _wdSel = w; renderWdDetail(); }
   function renderWdDetail() {
     const d = _lensd, L = ['월', '화', '수', '목', '금', '토', '일'], md = _ld.md;
@@ -20818,7 +20826,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const maxI = days.reduce((a, x, i) => x.qty > days[a].qty ? i : a, 0), minI = days.reduce((a, x, i) => x.qty < days[a].qty ? i : a, 0);
     const onI = days.reduce((a, x, i) => x.online > days[a].online ? i : a, 0), offI = days.reduce((a, x, i) => x.offline > days[a].offline ? i : a, 0);
     if (_wdSel < 0 || _wdSel > 6) _wdSel = maxI;
-    const sel = _wdSel, wdc = i => i === 6 ? '#dc2626' : (i === 5 ? '#2563eb' : 'inherit');
+    const sel = _wdSel, wdc = i => i >= 5 ? '#8a8880' : 'inherit';   // 주말은 중립 회색(토요일 파랑이 온라인 색과 헷갈림)
     document.getElementById('lensd-title').textContent = '요일별 납품 상세 · 최근 12주 (' + md(d.from) + '~' + md(d.to) + ')';
     const top3 = days.map((x, i) => [i, x.share]).sort((a, b) => b[1] - a[1]).slice(0, 3);
     let why = '<b>' + L[maxI] + '요일</b>에 가장 많이 나갑니다(' + days[maxI].share + '%). 많은 순서는 ' + top3.map(t => L[t[0]] + ' ' + t[1] + '%').join(' · ')
@@ -20832,11 +20840,11 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       + _ld.kpi('주 평균 납품', fmtInt(Math.round(tot / 12)) + '개', '12주 합계 ' + fmtInt(tot) + '개') + '</div>';
     // 채널 × 요일 — 칸 색 = 그 채널 안에서 많은 요일일수록 진하게 (온라인 파랑, 오프라인 주황)
     const head = '<tr><th>' + '__FIRST__' + '</th>' + L.map((x, i) => '<th class="h' + (i === sel ? ' sel' : '') + '" style="color:' + wdc(i) + '">' + x + '</th>').join('') + '<th>합계</th></tr>';
-    const cellBg = (v, mx, on) => v ? 'background:rgba(' + (on ? '37,99,235' : '245,158,11') + ',' + (0.08 + 0.5 * v / (mx || 1)).toFixed(2) + ')' : '';
+    const cellBg = (v, mx, on) => v ? 'background:rgba(' + (on ? '42,120,214' : '235,104,52') + ',' + (0.08 + 0.5 * v / (mx || 1)).toFixed(2) + ')' : '';
     h += '<div class="npd-sec">채널별 납품 요일 <span style="font-weight:500;color:var(--text-3);font-size:11px">칸 아래 % = 그 채널 납품 중 비중</span></div>'
       + '<table class="npd-tbl wdd-tbl"><thead>' + head.replace('__FIRST__', '채널') + '</thead><tbody>'
       + d.channels.map(c => { const mx = Math.max(...c.by_wd), on = c.type === 'online';
-          return '<tr><td><b>' + escapeHtml(c.name) + '</b> <span style="font-size:10px;color:' + (on ? '#2563eb' : '#d97706') + '">' + (on ? '온라인' : '오프라인') + '</span></td>'
+          return '<tr><td><b>' + escapeHtml(c.name) + '</b> <span style="font-size:10.5px;color:#6b7280;white-space:nowrap"><i style="display:inline-block;width:7px;height:7px;border-radius:2px;margin:0 3px 0 2px;background:' + (on ? WD_ON : WD_OFF) + '"></i>' + (on ? '온라인' : '오프라인') + '</span></td>'
             + c.by_wd.map((v, i) => '<td class="h' + (i === sel ? ' sel' : '') + '" style="' + cellBg(v, mx, on) + '">' + (v ? fmtInt(v) + '<span class="s">' + Math.round(v / (c.total || 1) * 100) + '%</span>' : '<span style="color:#cbd5e1">-</span>') + '</td>').join('')
             + '<td><b>' + fmtInt(c.total) + '</b></td></tr>'; }).join('')
       + '<tr style="font-weight:800"><td>합계</td>' + days.map((x, i) => '<td class="h' + (i === sel ? ' sel' : '') + '">' + fmtInt(x.qty) + '<span class="s">' + x.share + '%</span></td>').join('') + '<td>' + fmtInt(tot) + '</td></tr>'
@@ -20846,7 +20854,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     h += '<div class="npd-sec">주별 납품 <span style="font-weight:500;color:var(--text-3);font-size:11px">매주 같은 요일에 나가는지 확인 · 최신 주가 위</span></div>'
       + '<table class="npd-tbl wdd-tbl"><thead>' + head.replace('__FIRST__', '주') + '</thead><tbody>'
       + d.weeks.slice().reverse().map(w => '<tr' + (w.days < 7 ? ' class="part"' : '') + '><td>' + md(w.w) + ' ~ ' + md(w.to) + (w.days < 7 ? ' <span style="font-size:10px">(' + w.days + '일치)</span>' : '') + '</td>'
-          + w.by_wd.map((v, i) => '<td class="h' + (i === sel ? ' sel' : '') + '" style="' + (v ? 'background:rgba(37,99,235,' + (0.06 + 0.5 * v / wmx).toFixed(2) + ')' : '') + '">' + (v ? fmtInt(v) : '<span style="color:#cbd5e1">-</span>') + '</td>').join('')
+          + w.by_wd.map((v, i) => '<td class="h' + (i === sel ? ' sel' : '') + '" style="' + (v ? 'background:rgba(42,120,214,' + (0.06 + 0.5 * v / wmx).toFixed(2) + ')' : '') + '">' + (v ? fmtInt(v) : '<span style="color:#cbd5e1">-</span>') + '</td>').join('')
           + '<td><b>' + fmtInt(w.total) + '</b></td></tr>').join('')
       + '</tbody></table>';
     // 요일별 많이 나간 품목
