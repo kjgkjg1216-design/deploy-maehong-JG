@@ -15589,6 +15589,16 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .abc-grades div { cursor: pointer; transition: box-shadow .12s; }
   .abc-grades div:hover { box-shadow: 0 0 0 2px #c4b5fd; }
   .abc-grades div.sel { box-shadow: 0 0 0 2px #7c3aed; }
+  /* 매출 패널 보기 개선 (2026-11-17): 요약 타일·TOP10 글자 키움·비중 막대 */
+  #sb-kpis .ex-kpi { cursor: default; }
+  .sb-top-row { font-size: 13px !important; padding: 8px 6px !important; }
+  .sb-metric b { font-size: 13px !important; }
+  .sb-metric i { font-size: 11px !important; }
+  .sb-metric, .sb-lh-avg, .sb-lh-m1 { width: 78px !important; }
+  .sb-list-head { font-size: 11px !important; }
+  .sb-cls { font-size: 11px !important; }
+  .sb-share { height: 4px; margin-top: 3px; border-radius: 2px; background: #eef2f6; overflow: hidden; }
+  .sb-share i { display: block; height: 100%; background: #3f9e8f; border-radius: 2px; }
   .sb-forecast { font-size: 11.5px; color: #1f5f55; background: #eef8f6; border: 1px solid #cfe9e3; border-radius: 8px; padding: 6px 10px; margin: -2px 0 8px; line-height: 1.5; }
   .sb-forecast b { color: #0f766e; }
   @media (max-width: 900px) { .lens-strip { grid-template-columns: 1fr; padding: 0 12px; } .chart-panel.lens-dormant { grid-column: auto; } }
@@ -17573,6 +17583,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         <div id="sb-kpi" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
       </div>
     </div>
+    <div id="sb-kpis" class="ex-kpis" style="margin-bottom:6px"></div>
     <div id="sb-forecast" class="sb-forecast" style="display:none"></div>
     <div class="salesbase-body">
       <div class="salesbase-chart-wrap"><button class="sb-zoom-btn" onclick="openSbBig()" title="전체 기간 차트와 월별 표를 크게 보기">⤢ 크게 보기</button><canvas id="salesBaseChart"></canvas></div>
@@ -23912,12 +23923,14 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const cell = _sbHasAmt
       ? (amt, qty, v) => '<span class="sb-metric ' + v + '"><b>' + fmtWonC(amt) + '</b><i>' + fmtInt(qty) + '개</i></span>'
       : (amt, qty, v) => '<span class="sb-top-qty ' + v + '">' + fmtInt(qty) + '</span>';
+    const mx = Math.max(0, ...rows.map(t => t.m1_amt || 0));
     list.innerHTML = rows.map((t, i) =>
       '<div class="sb-top-row" data-code="' + escapeHtml(t.code) + '" title="클릭 시 판매 추이">'
       + '<span class="sb-top-rank">' + (q ? '·' : (i + 1)) + '</span>'
       + '<span class="sb-cls ' + (SB_CLS_KEY[t.cls] || '') + '">' + t.cls + '</span>'
       + '<span class="sb-top-name" title="' + escapeHtml(t.code + ' ' + t.name) + '">'
-      + '<b class="sb-top-code">' + escapeHtml(t.code) + '</b> ' + escapeHtml(t.name || '') + '</span>'
+      + '<b class="sb-top-code">' + escapeHtml(t.code) + '</b> ' + escapeHtml(t.name || '')
+      + (_sbHasAmt && mx ? '<div class="sb-share"><i style="width:' + Math.max(2, Math.round((t.m1_amt || 0) / mx * 100)) + '%"></i></div>' : '') + '</span>'
       + cell(t.avg3_amt, t.avg3, 'avg')
       + cell(t.m1_amt, t.m1, 'm1')
       + '</div>'
@@ -23954,6 +23967,18 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         kpi += '  ' + (g >= 0 ? '▲' : '▼') + Math.abs(g).toFixed(0) + '%';
       }
       document.getElementById('sb-kpi').textContent = kpi;
+      // 요약 타일 (2026-11-17)
+      const tl = (label, big, c, sub) => '<div class="ex-kpi" style="--c:' + c + '">' + label + '<b>' + big + '</b><span>' + sub + '</span></div>';
+      const cls3 = complete.slice(-3), avg3 = cls3.length ? cls3.reduce((s, m) => s + kval(m), 0) / cls3.length : 0;
+      const g = last && prev && kval(prev) ? (kval(last) - kval(prev)) / kval(prev) * 100 : null;
+      const share = last && _sbHasAmt ? ['자사', '유상사급', '상품매입'].map(k => { const v = last[k + '_amt'] || 0; return k + ' ' + (last.total_amt ? Math.round(v / last.total_amt * 100) : 0) + '%'; }).join(' · ') : '';
+      const fmtK = v => _sbHasAmt ? fmtEok(v) : fmtInt(v) + '개';
+      window._sbTiles = (fc) => document.getElementById('sb-kpis').innerHTML = (last ? tl(Number(last.ym.slice(5)) + '월 매출', fmtK(kval(last)), '#0f766e', share || '지난 완결월') : '')
+        + (g != null ? tl('전월 대비', (g >= 0 ? '▲' : '▼') + Math.abs(g).toFixed(0) + '%', g >= 0 ? '#15803d' : '#dc2626', prev ? Number(prev.ym.slice(5)) + '월 ' + fmtK(kval(prev)) : '') : '')
+        + tl('최근 3개월 평균', fmtK(avg3), '#334155', cls3.length + '개월 완결월')
+        + (fc ? tl(Number(fc.ym.slice(5)) + '월 예상', (fc.runrate / 1e8).toFixed(1) + '억', '#7c3aed', fc.day + '일까지 ' + (fc.mtd / 1e8).toFixed(2) + '억' + (fc.vs_prev_same_pct == null ? '' : ' · 같은 날 대비 ' + (fc.vs_prev_same_pct >= 0 ? '▲' : '▼') + Math.abs(fc.vs_prev_same_pct).toFixed(0) + '%')) : '')
+        + tl('자료 범위', '판매 API', '#64748b', '쿠팡·마트 등 11개 채널');
+      window._sbTiles(null);
       _sbMonthly = monthly;
       _sbProducts = d.products || [];
       _sbLatestMonth = d.latest_month || '';
@@ -23970,6 +23995,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
           if (nc.length) notes.push('이번 달 새로 잡힌 채널 ' + escapeHtml(nc.map(x => x.name).join('·')) + ' ' + eok(ncSum) + '은 전월 비교에서 뺌');
           if (f.lagging && f.lagging.length) notes.push('자료 늦게 오는 채널은 그날까지만: ' + escapeHtml(f.lagging.join(', ')));
           if (f.hp_fix && f.hp_fix.amt) notes.push('홈플러스 납품 중복·배수 보정 −' + eok(f.hp_fix.amt) + ' 반영');
+          if (window._sbTiles) window._sbTiles(f);
           box.innerHTML = '📈 <b>' + mo(f.ym) + ' 예상 약 ' + (f.runrate / 1e8).toFixed(1) + '억</b>'
             + ' <span style="color:var(--text-3)">(' + f.day + '일까지 ' + eok(f.mtd) + ', 채널별 하루 평균 × ' + f.dim + '일)</span>'
             + (f.prev_total ? ' · 같은 채널끼리 ' + mo(f.prev_ym) + ' ' + f.cmp_day + '일까지 ' + eok(f.prev_same) + ' → ' + eok(f.cur_same)
