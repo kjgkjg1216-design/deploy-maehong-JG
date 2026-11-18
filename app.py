@@ -15995,8 +15995,35 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     align-items: center;
   }
   .pcalc-selected-bar:empty::before {
-    content: '선택한 재질이 여기에 표시됩니다';
-    font-size: 10.5px; color: var(--text-3); font-style: italic;
+    content: '① 아래 목록에서 재질을 고르고  ② 사이즈(mm)를 넣으면 오른쪽 위에 예상 단가가 나옵니다';
+    font-size: 10.5px; color: var(--text-3);
+  }
+  /* 계산기 보기 개편 (2026-11-18 사용자 "보기 어려움"): 안내는 회색 한 줄, 재질 목록은 열 머리(재질·쓰인 제품·대략 단가) + 많이 쓰는 순 */
+  .pcalc-note { margin-left: auto; font-size: 10.5px; color: #8a8880; font-weight: 500; white-space: nowrap; }
+  .pcalc-est-empty { font-size: 11px; font-weight: 600; color: #9aa3ae; }
+  .pcalc-lhead { position: sticky; top: -4px; z-index: 1; display: grid; grid-template-columns: 18px minmax(0, 1fr) 52px 62px; gap: 8px;
+                 padding: 6px 10px 5px; margin: -4px -4px 2px; background: var(--surface); border-bottom: 1px solid #e7e6e0;
+                 font-size: 10.5px; font-weight: 600; color: var(--text-3); }
+  .pcalc-lhead span:nth-child(n+3) { text-align: right; }
+  .pcalc-use { text-align: right; font-size: 11px; color: #8a8880; font-variant-numeric: tabular-nums; }
+  .pcalc-name .ct { margin-left: 6px; font-size: 10px; font-weight: 500; color: #9aa3ae; }
+  .pcalc-item.on { background: #f0f9ff; }
+  .pcalc-item.on .pcalc-name { font-weight: 700; color: #0c4a6e; }
+  .pcalc-sim-title { position: sticky; top: -4px; z-index: 1; margin: -4px -4px 2px; padding: 6px 10px 5px; background: var(--surface);
+                     border-bottom: 1px solid #e7e6e0; font-size: 10.5px; font-weight: 600; color: var(--text-3); }
+  /* 단가 변동 (2026-11-18): 재고 경고와 같은 목록 모양 — 열 머리 한 번 + 숫자 열(단가 전→후·변동·월 영향 막대) + 왼쪽 색 띠(오름 빨강·내림 초록) */
+  .price-span .chart-head { flex-wrap: wrap; row-gap: 6px; }
+  .stk-head.pc, .stk-row.pc { grid-template-columns: minmax(0, 1fr) 118px 54px 74px; }
+  .pc-price { text-align: right; font-size: 11.5px; color: #6b7280; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .pc-price b { color: #111827; font-weight: 700; font-size: 12px; }
+  .pc-price .ar { color: #b4b3ac; margin: 0 3px; }
+  .pc-pct { text-align: right; font-size: 12px; font-weight: 800; color: var(--lv); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .pc-imp { text-align: right; font-variant-numeric: tabular-nums; }
+  .pc-imp b { display: block; font-size: 12.5px; font-weight: 800; color: var(--lv); white-space: nowrap; }
+  .pc-imp i { display: block; height: 3px; margin: 3px 0 0 auto; border-radius: 2px; background: var(--lv); opacity: .5; }
+  @media (max-width: 640px) {
+    .stk-head.pc, .stk-row.pc { grid-template-columns: minmax(0, 1fr) 54px 70px; }
+    .stk-head.pc .c2, .stk-row.pc .c2 { display: none; }
   }
   .pcalc-sel-chip {
     display: inline-flex; align-items: center; gap: 4px;
@@ -16016,7 +16043,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .pcalc-sel-x:hover { background: rgba(255,255,255,0.5); }
 
   .pcalc-item {
-    display: grid; grid-template-columns: 18px 1fr auto;
+    display: grid; grid-template-columns: 18px minmax(0, 1fr) 52px 62px;
     align-items: center; gap: 10px;
     padding: 6px 10px; border-radius: 6px;
     cursor: pointer; font-size: 12px;
@@ -16025,7 +16052,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .pcalc-item:hover { background: var(--surface-2); }
   .pcalc-item input[type="checkbox"] { width: 14px; height: 14px; accent-color: #0ea5e9; cursor: pointer; }
   .pcalc-name { font-weight: 500; color: var(--text); }
-  .pcalc-price { font-size: 11.5px; font-weight: 700; color: #0c4a6e; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .pcalc-price { text-align: right; font-size: 11.5px; font-weight: 700; color: #0c4a6e; font-variant-numeric: tabular-nums; white-space: nowrap; }
 
   .pcalc-sim {
     padding: 6px 8px; border-radius: 6px;
@@ -16044,7 +16071,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .pcalc-src.diff { background: #fff7ed; color: #c2410c; }
   .pcalc-sim-src { margin-top: 2px; line-height: 1.2; }
   .pcalc-sim-src .pcalc-src { margin-right: 0; }
-  .pcalc-sim-name { font-size: 11px; color: var(--text); margin-top: 2px; line-height: 1.3; }
+  .pcalc-sim-name { font-size: 12px; font-weight: 600; color: #111827; line-height: 1.35; min-width: 0; word-break: keep-all; overflow-wrap: anywhere; }
+  .pcalc-sim .stk-meta .pcalc-src { margin-right: 0; }
+  .pcalc-sim .stk-meta .pcalc-sim-size { color: #0369a1; font-weight: 600; }
   .pcalc-sim-meta { font-size: 10.5px; color: #0369a1; font-weight: 600; margin-top: 3px; letter-spacing: -0.01em; }
   .pcalc-sim-size.clickable { cursor: pointer; text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 2px; }
   .pcalc-sim-size.clickable:hover { color: #0c4a6e; background: rgba(14,165,233,0.08); border-radius: 3px; padding: 0 2px; }
@@ -17224,6 +17253,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         <div id="reorder-count" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
       </div>
     </div>
+    <div id="reorder-sum" class="stk-sum"></div>
     <div id="reorder-list" class="alert-list"><div class="loading" style="padding:20px">로딩 중...</div></div>
   </div>
   <!-- 줄 순서(2026-09-04): 수급·거래처 → 단가변동·계산기 → (아래 규격 스트립). 규격의 ↑가 계산기에 적용되므로 계산기가 규격 바로 위에 와야 함 -->
@@ -17235,7 +17265,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         <div id="plan-count" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
       </div>
     </div>
-    <div id="plan-summary" style="font-size:11px;color:var(--text-2);margin-bottom:6px"></div>
+    <div id="plan-summary" class="stk-sum"></div>
     <div id="plan-list" class="alert-list"><div class="loading" style="padding:20px">로딩 중...</div></div>
   </div>
   <div class="chart-panel chstock-panel">
@@ -17316,14 +17346,22 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   <div class="chart-panel price-span">
     <div class="chart-head">
       <div><span class="chart-title">📈 단가 변동</span><span class="chart-sub">최근 6개월 발주단가 변경 · 영향액순 · 클릭=상세</span></div>
-      <div id="price-chg-count" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <div class="vk-chips">
+          <button class="vk-chip on" onclick="setPcDir('all',this)">전체</button>
+          <button class="vk-chip" onclick="setPcDir('up',this)">오름</button>
+          <button class="vk-chip" onclick="setPcDir('down',this)">내림</button>
+        </div>
+        <div id="price-chg-count" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
+      </div>
     </div>
+    <div id="price-chg-sum" class="stk-sum"></div>
     <div id="price-chg-list" class="alert-list"><div class="loading" style="padding:20px">로딩 중...</div></div>
   </div>
   <div class="chart-panel pcalc-panel">
     <div class="chart-head">
       <div><span class="chart-title">🧮 예상 단가 계산기</span><span class="chart-sub">재질 선택 · <span id="pcalc-samples">-</span>건 샘플 기반 추정</span></div>
-      <div id="pcalc-est-inline" style="font-size:14px;font-weight:800;color:#0c4a6e;font-variant-numeric:tabular-nums">0<span style="font-size:10.5px;font-weight:600;margin-left:2px;color:#0369a1">원</span></div>
+      <div id="pcalc-est-inline" style="font-size:14px;font-weight:800;color:#0c4a6e;font-variant-numeric:tabular-nums"><span class="pcalc-est-empty">재질을 고르면 예상 단가</span></div>
     </div>
     <div id="pcalc-compare-bar" style="display:none;margin-bottom:6px"></div>
     <div id="pcalc-cat-tabs" class="pcalc-cat-tabs" style="align-items:center">
@@ -17331,7 +17369,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       <button class="pcalc-cat-tab" data-cat="파우치">파우치</button>
       <button class="pcalc-cat-tab" data-cat="단상자">단상자</button>
       <button class="pcalc-cat-tab" data-cat="박스">박스</button>
-      <span style="margin-left:auto;font-size:10.5px;color:#b45309;background:#fef3c7;padding:2px 8px;border-radius:6px;font-weight:600;letter-spacing:-0.01em;white-space:nowrap">※ 동일 규격이라도 인쇄 도수·디자인에 따라 단가 편차 발생</span>
+      <span class="pcalc-note" title="같은 재질·사이즈라도 인쇄 도수·디자인에 따라 실제 단가가 달라질 수 있습니다">ⓘ 인쇄 도수·디자인에 따라 실제 단가는 달라질 수 있음</span>
     </div>
     <div style="display:flex;gap:4px;margin-bottom:6px;align-items:center;flex-wrap:wrap">
       <input id="pcalc-search" type="text" placeholder="재질 검색…" style="flex:1;min-width:120px;padding:6px 10px;font-size:11.5px;border:1px solid var(--border-2);border-radius:6px;outline:none" oninput="pcalcSearchInput()">
@@ -19696,7 +19734,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   // 맨 위 요약: (기준) + 등급별 개수 — 0건은 흐리게
   function stkSum(groups, lead) {
     return (lead ? '<span>' + lead + '</span>' : '') + groups.map(g => {
-      const L = STK_LV[g.lv], n = g.rows.length;
+      const L = { c: g.c || (STK_LV[g.lv] || {}).c, t: g.t || (STK_LV[g.lv] || {}).t }, n = g.rows.length;
       return '<span' + (n ? '' : ' class="zero"') + '><i class="d" style="background:' + (n ? L.c : '#d6d4cc') + '"></i>' + L.t + ' <b>' + n + '</b></span>';
     }).join('');
   }
@@ -19705,10 +19743,11 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     let h = '<div class="stk-head"><span>' + cols[0] + '</span><span>' + cols[1] + '</span><span class="c3">' + cols[2] + '</span><span>' + cols[3] + '</span></div>';
     groups.forEach(g => {
       if (!g.rows.length) return;
-      const L = STK_LV[g.lv];
-      h += '<div class="stk-grp"><i class="d" style="background:' + L.c + '"></i>' + L.t + '<span class="n">' + g.rows.length + '</span>'
-        + (g.sub ? '<span class="s">' + g.sub + '</span>' : '') + '</div>'
-        + g.rows.map(r => '<div class="stk-row"' + r.attrs + ' style="--lv:' + L.c + '">'
+      // g.c·g.t = 등급 색·이름 직접 지정(발주 타이밍·수급 플래너), g.noHead = 묶음 머리 없음(거래처), r.c = 줄마다 색
+      const L = { c: g.c || (STK_LV[g.lv] || {}).c, t: g.t || (STK_LV[g.lv] || {}).t };
+      if (!g.noHead) h += '<div class="stk-grp"><i class="d" style="background:' + L.c + '"></i>' + L.t + '<span class="n">' + g.rows.length + '</span>'
+        + (g.sub ? '<span class="s">' + g.sub + '</span>' : '') + '</div>';
+      h += g.rows.map(r => '<div class="stk-row"' + r.attrs + ' style="--lv:' + (r.c || L.c) + '">'
           + '<div style="min-width:0"><div class="stk-nm"' + (r.full ? ' title="' + escapeHtml(r.full) + '"' : '') + '>' + escapeHtml(r.name) + '</div>'
           + '<div class="stk-meta">' + r.meta + '</div></div>'
           + '<div class="stk-num' + (r.n1z ? ' z' : '') + '">' + r.n1 + '</div>'
@@ -19762,25 +19801,35 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       const d = await (await fetch('/api/reorder_advice')).json();
       const items = d.items || [];
       document.getElementById('reorder-count').textContent = (d.total || items.length) + '건';
-      if (!items.length) { list.innerHTML = '<div class="alert-empty">지금 발주할 품목이 없습니다 👍</div>'; return; }
-      list.innerHTML = items.map(a => {
-        const now = a.urgency === 'now';
-        const leadTxt = a.lead_days != null
-          ? (a.lead_src === '업체표' ? '리드 ' + a.lead_days + '일(업체 L/T 상한)' : '리드 ' + a.lead_days + '일(' + a.lead_n + '회 ' + (a.lead_src === '납기' ? '납기계획' : '실측') + ')')
-          : (a.src === 'spec' ? '시방서 출고 · 기준 ' + (d.default_lead || 14) + '일' : '리드 미상(기본 ' + (d.default_lead || 14) + '일' + (a.lead_note ? ' · 동일자등록' : '') + ')');
-        const vendorTxt = (a.vendors && a.vendors.length)
-          ? ' <span class="alert-vendor">· ' + escapeHtml(a.vendors.slice(0, 2).join(', ')) + (a.vendor_note ? ' (' + escapeHtml(a.vendor_note) + ')' : '') + '</span>' : '';
-        return '<div class="alert-row" onclick="openItemModal(\\'' + a.code + '\\')">'
-          + '<span class="alert-badge ' + (now ? 'out' : 'warning') + '">' + (a.src === 'spec' ? (now ? '시방서 발행' : '시방서 준비') : (now ? '지금 발주' : '이번주')) + '</span>'
-          + '<div><div class="alert-name">' + escapeHtml(a.name) + vendorTxt + '</div>'
-          + '<div class="alert-code">' + escapeHtml(a.code) + ' · ' + ({ jasa: '자사', outsource: '외주', goods: '상품매입' }[a.scope] || a.scope)
-          + (a.scope === 'goods' ? ({ po: '(구매발주)', wp: '(외주발주)', spec: '(시방서)' }[a.src] || '(발주이력 없음)') : '') + ' · ' + leadTxt
-          + (a.scope === 'goods' && a.incoming ? ' · <span style="color:#0891b2">미입고 ' + fmtInt(a.incoming) + '</span>' : '')
-          + (a.trend >= 1.15 ? ' · <span style="color:#dc2626">▲추세 ' + Math.round((a.trend - 1) * 100) + '%</span>' : (a.trend <= 0.85 ? ' · <span style="color:#2563eb">▼추세 ' + Math.round((1 - a.trend) * 100) + '%</span>' : '')) + '</div></div>'
-          + '<div class="alert-qty">재고 ' + fmtInt(a.qty) + '</div>'
-          + '<div class="alert-days ' + (now ? 'out' : 'warning') + '">' + a.days_left.toFixed(1) + '일</div>'
-          + '</div>';
-      }).join('');
+      const sum = document.getElementById('reorder-sum');
+      if (!items.length) { if (sum) sum.innerHTML = ''; list.innerHTML = '<div class="alert-empty">지금 발주할 품목이 없습니다 👍</div>'; return; }
+      // 2026-11-18 보기 개편: 재고 경고와 같은 목록 — 묶음(지금 발주·이번 주) + 열(재고·리드·남은 일수) + 둘째 줄 품번·구분·업체·리드 근거·추세
+      const row = a => {
+        const nm = stkSplitName(a.name), dl = d.default_lead || 14;
+        const leadWhy = a.lead_days != null
+          ? (a.lead_src === '업체표' ? '업체 L/T 상한' : a.lead_n + '회 ' + (a.lead_src === '납기' ? '납기계획' : '실측'))
+          : (a.src === 'spec' ? '시방서 출고 기준' : '미상(기본 ' + dl + '일' + (a.lead_note ? '·동일자등록' : '') + ')');
+        const parts = ['<span class="cd">' + escapeHtml(a.code) + '</span>',
+          '<span class="tg">' + ({ jasa: '자사', outsource: '외주', goods: '상품매입' }[a.scope] || escapeHtml(a.scope))
+            + (a.scope === 'goods' ? ({ po: '·구매발주', wp: '·외주발주', spec: '·시방서' }[a.src] || '·발주이력 없음') : '') + '</span>'];
+        if (a.src === 'spec') parts.push('<span class="tg" style="color:#b45309">시방서 ' + (a.urgency === 'now' ? '발행' : '준비') + '</span>');
+        if (a.vendors && a.vendors.length) parts.push('<span>' + escapeHtml(a.vendors.slice(0, 2).join(', ')) + (a.vendor_note ? ' (' + escapeHtml(a.vendor_note) + ')' : '') + '</span>');
+        parts.push('<span>리드 근거 ' + leadWhy + '</span>');
+        if (a.scope === 'goods' && a.incoming) parts.push('<span style="color:#0891b2">미입고 ' + fmtInt(a.incoming) + '</span>');
+        if (a.trend >= 1.15) parts.push('<span style="color:#dc2626">▲추세 ' + Math.round((a.trend - 1) * 100) + '%</span>');
+        else if (a.trend <= 0.85) parts.push('<span style="color:#2563eb">▼추세 ' + Math.round((1 - a.trend) * 100) + '%</span>');
+        if (nm.links) parts.push('<span>' + escapeHtml(nm.links) + '</span>');
+        return { attrs: ' onclick="openItemModal(&quot;' + escapeHtml(a.code) + '&quot;)" title="클릭 = 품목 상세"',
+          name: nm.t, full: nm.links ? a.name : '', meta: parts.join(stkSep),
+          n1: fmtInt(a.qty), n1z: a.qty <= 0, n2: (a.lead_days != null ? a.lead_days : dl) + '<small style="font-size:10px">일</small>',
+          days: (+a.days_left).toFixed(1) + '<small>일</small>' };
+      };
+      const byNeed = (a, b) => (a.days_left - b.days_left) || ((b.forecast || 0) - (a.forecast || 0));
+      const groups = [
+        { lv: 'out', t: '지금 발주', sub: '남은 일수가 리드타임보다 짧음', rows: items.filter(a => a.urgency === 'now').sort(byNeed).map(row) },
+        { lv: 'warning', t: '이번 주', sub: '곧 발주 시점', rows: items.filter(a => a.urgency !== 'now').sort(byNeed).map(row) }];
+      if (sum) sum.innerHTML = stkSum(groups) + '<span style="color:#8a8880">시방서 ' + items.filter(a => a.src === 'spec').length + '건 포함</span>';
+      list.innerHTML = stkRender(['품목', '재고', '리드타임', '남은 일수'], groups);
     } catch (e) {
       list.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>';
     }
@@ -19804,32 +19853,33 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const q = (document.getElementById('plan-search').value || '').toLowerCase().trim();
     const matched = q ? _planItems.filter(x => (x.code + ' ' + x.name).toLowerCase().includes(q)) : _planItems;
     // 상단 집계는 검색 결과(필터 적용분) 기준으로 갱신
-    const s = { out: 0, critical: 0, warning: 0, low: 0, ok: 0 };
-    matched.forEach(x => { if (x.level in s) s[x.level]++; });
     document.getElementById('plan-count').textContent = (q ? matched.length + '/' + _planItems.length : _planItems.length) + '품목';
+    // 2026-11-18 보기 개편: 재고 경고와 같은 목록 — 등급 묶음(품절·2주·4주·8주·여유) + 열(창고·월 판매·남은 주) + 둘째 줄 채널·계획
+    const PG = [['out', '#dc2626', '품절', '창고 재고 없음'], ['critical', '#ea580c', '위험', '2주 안에 바닥'], ['warning', '#ca8a04', '주의', '4주 안에'],
+                ['low', '#16a34a', '관찰', '8주 안에'], ['ok', '#9ca3af', '여유', '8주 넘게']];
+    const shown = matched.slice(0, 40);
+    const groups = PG.map(p => ({ lv: p[0], c: p[1], t: p[2], sub: p[3],
+      rows: shown.filter(x => x.level === p[0]).map(x => {
+        const parts = [];
+        if (x.abc === 'A' || x.abc === 'B') parts.push('<span class="abc-chip ' + x.abc + '" title="최근 90일 매출 ' + x.abc + '등급">' + x.abc + '</span>');
+        parts.push('<span class="cd">' + escapeHtml(x.code) + '</span>', '<span class="tg">' + escapeHtml(x.cls || '') + '</span>');
+        if (x.trend >= 1.15) parts.push('<span style="color:#dc2626">▲추세</span>'); else if (x.trend <= 0.85) parts.push('<span style="color:#2563eb">▼추세</span>');
+        if (x.ch_stock != null) parts.push('<span>채널 ' + fmtInt(x.ch_stock) + ' → 포함 <b>' + x.cov_ch_weeks + '주</b></span>'
+          + (x.ch_note ? ' <span class="ch-tag' + (x.ch_note === '채널 여유' ? ' on' : '') + '">' + x.ch_note + '</span>' : ''));
+        if (x.plan || x.incoming) parts.push('<span style="color:#0891b2">+계획 ' + fmtInt(x.plan + x.incoming) + ' → ' + x.cov_plan_weeks + '주</span>');
+        return { attrs: ' onclick="openPlanDetail(&quot;' + escapeHtml(x.code) + '&quot;)" title="클릭 = 판매 속도 근거·앞으로 12주 재고 예상·생산지시·창고별 재고"',
+          name: x.name || x.code, full: '', meta: parts.join(stkSep),
+          n1: fmtInt(x.stock), n1z: x.stock <= 0, n2: fmtInt(x.monthly), days: x.cov_weeks + '<small>주</small>' };
+      }) }));
+    const lead = (_planMeta.basis ? '기준 ' + escapeHtml(_planMeta.basis)
+                  : '기준 ' + _planMeta.months.slice().reverse().map(m => m.slice(2, 4) + '/' + m.slice(4)).join('·') + ' 판매')
+      + (q ? ' · <b style="color:#0891b2">검색 ' + matched.length + '건</b>' : '');
+    // 요약 개수는 검색 결과 전체 기준(목록은 40개까지)
+    const all = PG.map(p => ({ lv: p[0], c: p[1], t: p[2], rows: matched.filter(x => x.level === p[0]) }));
     document.getElementById('plan-summary').innerHTML = (_planMeta.months.length || _planMeta.basis)
-      ? (_planMeta.basis ? '기준 ' + escapeHtml(_planMeta.basis) + ' · '
-                         : '기준 ' + _planMeta.months.slice().reverse().map(m => m.slice(2, 4) + '/' + m.slice(4)).join('·') + ' 판매 · ')
-        + (q ? '<span style="color:#0891b2;font-weight:700">검색 ' + matched.length + '건</span> · ' : '')
-        + '<b style="color:#dc2626">품절 ' + s.out + '</b> · <b style="color:#ea580c">2주↓ ' + s.critical + '</b> · '
-        + '<b style="color:#ca8a04">4주↓ ' + s.warning + '</b> · 8주↓ ' + s.low + ' · 여유 ' + s.ok
-      : _planMeta.reason;
-    const items = matched.slice(0, 40);
-    if (!items.length) { list.innerHTML = '<div class="alert-empty">' + (q ? '검색 결과 없음' : '판매 데이터가 없습니다') + '</div>'; return; }
-    list.innerHTML = items.map(x => {
-      const [lb, cls] = PLAN_LV[x.level];
-      const plus = (x.plan || x.incoming) ? ' <span style="color:#0891b2">+계획 ' + fmtInt(x.plan + x.incoming) + ' → ' + x.cov_plan_weeks + '주</span>' : '';
-      const tr = x.trend >= 1.15 ? ' <span style="color:#dc2626">▲추세</span>' : (x.trend <= 0.85 ? ' <span style="color:#2563eb">▼추세</span>' : '');
-      return '<div class="alert-row" onclick="openPlanDetail(&quot;' + x.code + '&quot;)" title="클릭 = 판매 속도 근거·앞으로 12주 재고 예상·생산지시·창고별 재고">'
-        + '<span class="alert-badge ' + cls + '">' + lb + '</span>'
-        + '<div><div class="alert-name">' + escapeHtml(x.name || x.code) + '</div>'
-        + '<div class="alert-code">' + (x.abc === 'A' || x.abc === 'B' ? '<span class="abc-chip ' + x.abc + '" title="최근 90일 매출 ' + x.abc + '등급">' + x.abc + '</span> ' : '') + escapeHtml(x.code) + ' · ' + x.cls + ' · 월판매 ' + fmtInt(x.monthly) + tr + plus + '</div>'
-        + (x.ch_stock != null ? '<div class="alert-code" style="margin-top:1px">채널재고 ' + fmtInt(x.ch_stock) + ' → 채널 포함 <b>' + x.cov_ch_weeks + '주</b>'
-            + (x.ch_note ? ' <span class="ch-tag' + (x.ch_note === '채널 여유' ? ' on' : '') + '">' + x.ch_note + '</span>' : '') + '</div>' : '')
-        + '</div>'
-        + '<div class="alert-qty">창고 ' + fmtInt(x.stock) + '</div>'
-        + '<div class="alert-days ' + cls + '">' + x.cov_weeks + '주</div></div>';
-    }).join('');
+      ? stkSum(all, lead) + (matched.length > 40 ? '<span style="color:#8a8880">목록은 급한 순 40개</span>' : '') : _planMeta.reason;
+    if (!shown.length) { list.innerHTML = '<div class="alert-empty">' + (q ? '검색 결과 없음' : '판매 데이터가 없습니다') + '</div>'; return; }
+    list.innerHTML = stkRender(['품목', '창고', '월 판매', '남은 주'], groups);
   }
 
   // ───── 판매 분석 3종 (2026-09-23) ─────
@@ -21041,20 +21091,26 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const cnt = document.getElementById('vendor-count');
     cnt.textContent = (_vendorKind === 'all' ? (_vendorMeta.total || 0) + '개 거래처' : _vendorItems.length + '개 ' + _vkLabel[_vendorKind] + '처') + ' · ' + (_vendorMeta.since || '') + '~';
     if (!_vendorItems.length) { list.innerHTML = '<div class="alert-empty">발주 데이터가 없습니다</div>'; return; }
-    list.innerHTML = _vendorItems.slice(0, 25).map((v, i) => {
-      const f = (x, suf) => x == null ? '-' : x + suf;
+    // 2026-11-18 보기 개편: 재고 경고와 같은 목록 — 점수 구간 묶음(우수·보통·주의·평가 전, 안에선 금액 큰 순) + 열(점수·건수·금액) + 짧은 상호
+    const f = (x, suf) => x == null ? '-' : x + suf;
+    const row = (v, i) => {
       const amtShown = _vendorKind === 'all' ? v.amt : (v[_vendorKind + '_amt'] || 0);
-      const cntTxt = v.kind === 'both'
-        ? '구매 ' + v.po_n + '건 · 외주 ' + v.wp_n + '건'
-        : v.n_po + '건 · ' + v.n_items + '품목';
-      return '<div class="alert-row" onclick="openVendorDetail(' + i + ')">'
-        + scPill(v.score)
-        + '<div><div class="alert-name">' + escapeHtml(v.vendor) + '<span class="vk-tag ' + v.kind + '">' + _vkLabel[v.kind] + '</span></div>'
-        + '<div class="alert-code">납기 ' + f(v.ontime, '%') + (v.ontime_n ? '(' + v.ontime_n + '건)' : '') + ' · 충족 ' + f(v.fill, '%')
-        + ' · 리드 ' + f(v.lead, '일') + ' · 단가변동 ' + v.price_changes + '건</div></div>'
-        + '<div class="alert-qty">' + cntTxt + '</div>'
-        + '<div class="alert-days" style="color:' + (v.kind === 'wp' ? '#c2410c' : '#7c3aed') + '">' + _fmtEok(amtShown) + '</div></div>';
-    }).join('');
+      const short = _coShort(v.vendor);
+      const meta = ['<span class="vk-tag ' + v.kind + '" style="margin-left:0">' + _vkLabel[v.kind] + '</span>',
+        '<span>납기 ' + f(v.ontime, '%') + (v.ontime_n ? '(' + v.ontime_n + '건)' : '') + '</span>', '<span>충족 ' + f(v.fill, '%') + '</span>',
+        '<span>리드 ' + f(v.lead, '일') + '</span>', '<span' + (v.price_changes ? ' style="color:#b45309"' : '') + '>단가변동 ' + v.price_changes + '건</span>'].join(stkSep);
+      const cntTxt = v.kind === 'both' ? (v.po_n + v.wp_n) + '건' : v.n_po + '건';
+      return { attrs: ' onclick="openVendorDetail(' + i + ')" title="' + escapeHtml(v.vendor + ' · 클릭 = 상세') + '"',
+        name: short, full: short !== v.vendor ? v.vendor : '', meta: meta,
+        n1: v.score == null ? '<span style="color:#b4b3ac">-</span>' : '<b style="font-size:13px;color:' + (v.score >= 80 ? '#15803d' : (v.score >= 60 ? '#b45309' : '#dc2626')) + '">' + v.score + '</b>',
+        n2: cntTxt + (v.kind === 'both' ? '' : '<div style="font-size:10px;color:#8a8880">' + v.n_items + '품목</div>'),
+        days: '<span style="color:' + (v.kind === 'wp' ? '#c2410c' : '#7c3aed') + '">' + _fmtEok(amtShown) + '</span>' };
+    };
+    const top = _vendorItems.slice(0, 25).map((v, i) => ({ v, i }));
+    const VG = [['#16a34a', '우수', '80점 이상', v => v.score != null && v.score >= 80], ['#ca8a04', '보통', '60~79점', v => v.score != null && v.score >= 60 && v.score < 80],
+                ['#dc2626', '주의', '60점 미만', v => v.score != null && v.score < 60], ['#9ca3af', '평가 전', '납기 자료 부족', v => v.score == null]];
+    const groups = VG.map(g => ({ lv: 'x', c: g[0], t: g[1], sub: g[2] + ' · 금액 큰 순', rows: top.filter(o => g[3](o.v)).map(o => row(o.v, o.i)) }));
+    list.innerHTML = stkRender(['거래처', '점수', '발주 건수', '금액'], groups);
   }
   async function loadVendors() {
     const list = document.getElementById('vendor-list');
@@ -22309,28 +22365,60 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   });
 
   // ───── 단가 변동 감지 ─────
+  // 2026-11-18 보기 개편(사용자 "보기 어려움"): 오름·내림 고르기 + 맨 위 요약(건수·월 영향 합) + 열 머리 한 번
+  // + 숫자 열(단가 전→후·변동·월 영향과 크기 막대) + 왼쪽 색 띠(오름 빨강 = 원가 상승, 내림 초록). 거래처는 짧은 상호
+  let _pcItems = [], _pcDir = 'all', _pcTotal = 0;
+  function pcWon(v) {   // 단가: 100원 이상은 정수, 그보다 작으면 소수 1자리
+    v = +v || 0;
+    return Math.abs(v) >= 100 ? fmtInt(Math.round(v)) : v.toFixed(1).replace(/[.]0$/, '');
+  }
+  function pcMan(v) {   // 금액 요약: 억·만 단위(+/− 붙임)
+    const a = Math.abs(v || 0), s = v > 0 ? '+' : (v < 0 ? '−' : '');
+    if (a >= 1e8) return s + (a / 1e8).toFixed(1).replace(/[.]0$/, '') + '억';
+    if (a >= 1e4) return s + fmtInt(Math.round(a / 1e4)) + '만';
+    return s + fmtInt(Math.round(a)) + '원';
+  }
   async function loadPriceChanges() {
     const list = document.getElementById('price-chg-list');
     try {
       const d = await (await fetch('/api/price_changes')).json();
-      const items = d.items || [];
-      document.getElementById('price-chg-count').textContent = (d.total || items.length) + '건';
-      if (!items.length) { list.innerHTML = '<div class="alert-empty">최근 단가 변동이 없습니다</div>'; return; }
-      list.innerHTML = items.map(a => {
-        const up = a.pct > 0;
-        const impTxt = a.impact ? ' · 월영향 ' + (a.impact > 0 ? '+' : '') + fmtInt(a.impact) + '원' : '';
-        return '<div class="alert-row" onclick="openPriceDetail(&quot;' + a.code + '&quot;)" title="클릭 = 발주단가 이력·단가 구간·거래처 비교">'
-          + '<span class="alert-badge ' + (up ? 'out' : 'low') + '">' + (up ? '▲' : '▼') + Math.abs(a.pct) + '%</span>'
-          + '<div><div class="alert-name">' + escapeHtml(a.name) + '</div>'
-          + '<div class="alert-code">' + escapeHtml(a.code) + ' · ' + escapeHtml(a.vendor)
-          + ' · ' + a.changed + '부터' + impTxt + '</div></div>'
-          + '<div class="alert-days" style="color:' + (up ? '#dc2626' : '#16a34a') + ';white-space:nowrap">'
-          + fmtNum(a.prev) + '→' + fmtNum(a.cur) + '원</div>'
-          + '</div>';
-      }).join('');
+      _pcItems = d.items || []; _pcTotal = d.total || _pcItems.length;
+      renderPriceChanges();
     } catch (e) {
       list.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>';
     }
+  }
+  function setPcDir(k, el) {
+    _pcDir = k;
+    document.querySelectorAll('.price-span .vk-chip').forEach(b => b.classList.toggle('on', b === el));
+    renderPriceChanges();
+  }
+  function renderPriceChanges() {
+    const list = document.getElementById('price-chg-list');
+    const all = _pcItems, up = all.filter(a => a.pct > 0), dn = all.filter(a => a.pct < 0);
+    const sumImp = arr => arr.reduce((s, a) => s + (a.impact || 0), 0), net = sumImp(all);
+    document.getElementById('price-chg-count').textContent = (all.length && all.length < _pcTotal ? '상위 ' + all.length + ' / ' : '') + _pcTotal + '건';
+    document.getElementById('price-chg-sum').innerHTML = all.length
+      ? '<span><i class="d" style="background:#dc2626"></i>오름 <b>' + up.length + '</b>건 · 월 <b>' + pcMan(sumImp(up)) + '</b></span>'
+        + '<span><i class="d" style="background:#16a34a"></i>내림 <b>' + dn.length + '</b>건 · 월 <b>' + pcMan(sumImp(dn)) + '</b></span>'
+        + '<span title="월 영향 = 단가 차이 × 최근 3개월 발주량 ÷ 3">합계 월 <b style="color:' + (net > 0 ? '#dc2626' : (net < 0 ? '#16a34a' : '#111827')) + '">' + pcMan(net) + '</b></span>'
+      : '';
+    const items = _pcDir === 'up' ? up : (_pcDir === 'down' ? dn : all);
+    if (!items.length) { list.innerHTML = '<div class="alert-empty">' + (all.length ? '해당하는 단가 변동이 없습니다' : '최근 단가 변동이 없습니다') + '</div>'; return; }
+    const mx = Math.max(1, ...items.map(a => Math.abs(a.impact || 0)));
+    list.innerHTML = '<div class="stk-head pc"><span>품목 · 거래처</span><span class="c2">단가 (전 → 후, 원)</span><span>변동</span><span>월 영향</span></div>'
+      + items.map(a => {
+        const isUp = a.pct > 0, imp = a.impact || 0;
+        const meta = ['<span class="cd">' + escapeHtml(a.code) + '</span>', '<span>' + escapeHtml(_coShort(a.vendor)) + '</span>',
+          '<span>' + escapeHtml(String(a.changed || '').slice(5).replace('-', '/')) + '부터</span>'].join(stkSep);
+        return '<div class="stk-row pc" style="--lv:' + (isUp ? '#dc2626' : '#16a34a') + '" onclick="openPriceDetail(&quot;' + escapeHtml(a.code) + '&quot;)" title="클릭 = 발주단가 이력·단가 구간·거래처 비교">'
+          + '<div style="min-width:0"><div class="stk-nm">' + escapeHtml(a.name) + '</div><div class="stk-meta">' + meta + '</div></div>'
+          + '<div class="pc-price c2">' + pcWon(a.prev) + '<span class="ar">→</span><b>' + pcWon(a.cur) + '</b></div>'
+          + '<div class="pc-pct">' + (isUp ? '▲' : '▼') + Math.abs(a.pct) + '%</div>'
+          + '<div class="pc-imp" title="월 영향 ' + (imp > 0 ? '+' : '') + fmtInt(imp) + '원 = 단가 차이 × 최근 3개월 발주량 ÷ 3"><b>' + pcMan(imp) + '</b>'
+          + '<i style="width:' + Math.max(4, Math.round(Math.abs(imp) / mx * 100)) + '%"></i></div>'
+          + '</div>';
+      }).join('');
   }
 
   // ───── 재질 단가 계산기 (인라인) ─────
@@ -22439,13 +22527,18 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       list.innerHTML = '<div class="search-empty" style="padding:20px">검색 결과 없음</div>';
       return;
     }
-    list.innerHTML = filtered.map(m => {
-      const checked = _pcalcSelected.has(m.name) ? 'checked' : '';
+    // 2026-11-18 보기 개편: 열 머리(재질·쓰인 제품·대략 단가) + 많이 쓰는 재질부터 + 고른 재질은 줄 색으로, 전체 탭에선 분류 꼬리표
+    const rows = filtered.slice().sort((a, b) => (b.usage || 0) - (a.usage || 0) || a.name.localeCompare(b.name));
+    list.innerHTML = '<div class="pcalc-lhead"><span></span><span>재질' + (_pcalcCat ? ' · ' + escapeHtml(_pcalcCat) : '') + ' (' + rows.length + ')</span>'
+      + '<span title="이 재질이 들어간 샘플 제품 수">쓰인 제품</span><span title="이 재질 1개가 들어갈 때의 대략적인 단가 기여분">대략 단가</span></div>'
+      + rows.map(m => {
+      const on = _pcalcSelected.has(m.name);
       const safeName = m.name.replace(/"/g,'&quot;');
-      return '<label class="pcalc-item">'
-           + '<input type="checkbox" ' + checked + ' data-name="' + escapeHtml(safeName) + '" onchange="togglePriceCalc(this)">'
-           + '<span class="pcalc-name">' + escapeHtml(m.name) + '</span>'
-           + '<span class="pcalc-price">' + fmtInt(m.price) + '원</span>'
+      return '<label class="pcalc-item' + (on ? ' on' : '') + '">'
+           + '<input type="checkbox" ' + (on ? 'checked' : '') + ' data-name="' + escapeHtml(safeName) + '" onchange="togglePriceCalc(this)">'
+           + '<span class="pcalc-name">' + escapeHtml(m.name) + (!_pcalcCat && (m.categories || []).length ? '<span class="ct">' + escapeHtml(m.categories.join('·')) + '</span>' : '') + '</span>'
+           + '<span class="pcalc-use">' + fmtInt(m.usage || 0) + '</span>'
+           + '<span class="pcalc-price">' + pcWon(m.price) + '원</span>'
            + '</label>';
     }).join('');
   }
@@ -22454,6 +22547,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const name = cb.dataset.name;
     if (cb.checked) _pcalcSelected.add(name);
     else _pcalcSelected.delete(name);
+    const row = cb.closest('.pcalc-item'); if (row) row.classList.toggle('on', cb.checked);   // 고른 재질 줄 색 (목록 다시 안 그려 스크롤 유지)
     renderSelectedBar();
     updatePriceCalc();
   }
@@ -22484,8 +22578,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const simEl = document.getElementById('pcalc-similar');
     if (_pcalcSelected.size === 0) {
       _pcalcDropLink(false);   // 재질을 다 빼면 비교할 기준도 없음 → 차이 막대 숨김
-      estEl.innerHTML = '0<span style="font-size:10.5px;font-weight:600;margin-left:2px;color:#0369a1">원</span>';
-      simEl.innerHTML = '<div class="pcalc-sim-empty">재질 선택 시 유사 제품 표시</div>';
+      estEl.innerHTML = '<span class="pcalc-est-empty">재질을 고르면 예상 단가</span>';   // '0원'이 결과처럼 보이던 것 (2026-11-18)
+      simEl.innerHTML = '<div class="pcalc-sim-empty">재질을 고르면 같은 재질을 쓴 제품과<br>실제 단가가 여기에 나옵니다</div>';
       return;
     }
     const selected = Array.from(_pcalcSelected);
@@ -22601,7 +22695,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         simEl.innerHTML = '<div class="pcalc-sim-empty">일치하는 샘플 없음</div>';
         return;
       }
-      simEl.innerHTML = sim.map((s, i) => {
+      simEl.innerHTML = '<div class="pcalc-sim-title">비슷한 제품 ' + sim.length + '개 · 겹치는 재질 많은 순 · 사이즈 누르면 적용</div>' + sim.map((s, i) => {
         const mats = (s.materials || []).map(m => {
           const safeAttr = m.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
           return '<span class="pcalc-mat-chip clickable' + (selSet.has(m) ? ' match' : '') + '"'
@@ -22609,27 +22703,21 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
                + ' onclick="event.stopPropagation();togglePcalcMatChip(this.dataset.mat)"'
                + ' title="클릭하여 재질 추가/제거">' + escapeHtml(m) + '</span>';
         }).join('');
-        let metaHtml = '';
-        if (s.vendor || s.size) {
-          const vendorPart = escapeHtml(s.vendor || '');
-          const sizePart = s.size
-            ? '<span class="pcalc-sim-size clickable" data-size="' + escapeHtml(s.size).replace(/"/g,'&quot;')
-              + '" onclick="event.stopPropagation();applyPcalcSize(this.dataset.size)"'
-              + ' title="클릭하여 사이즈 적용"> · ' + escapeHtml(s.size) + '</span>'
-            : '';
-          metaHtml = '<div class="pcalc-sim-meta">' + vendorPart + sizePart + '</div>';
-        }
+        // 2026-11-18 보기 개편: 4줄(품번·출처·이름·업체) → 2줄 — 첫 줄 이름 + 실제 단가, 둘째 줄 품번·겹친 재질·업체·사이즈(누르면 적용)·단가 출처
+        const meta = ['<span class="cd">' + escapeHtml(s.code || '-') + '</span>', '<span>재질 ' + s.overlap + '/' + s.total + ' 겹침</span>'];
+        if (s.vendor) meta.push('<span>' + escapeHtml(_coShort(s.vendor)) + '</span>');
+        if (s.size) meta.push('<span class="pcalc-sim-size clickable" data-size="' + escapeHtml(s.size).replace(/"/g,'&quot;')
+          + '" onclick="event.stopPropagation();applyPcalcSize(this.dataset.size)" title="클릭하여 사이즈 적용">' + escapeHtml(s.size) + '</span>');
         const codeKey = (s.code || ('idx' + i));
         const codeAttr = codeKey.replace(/&/g,'&amp;').replace(/"/g,'&quot;');
         const isOpen = _pcalcExpandedCodes.has(codeKey);
-        return '<div class="pcalc-sim" data-codekey="' + codeAttr + '" onclick="togglePcalcSim(this.dataset.codekey, ' + i + ')">'
+        return '<div class="pcalc-sim" data-codekey="' + codeAttr + '" onclick="togglePcalcSim(this.dataset.codekey, ' + i + ')" title="클릭 = 이 제품에 든 재질 보기(재질을 누르면 추가·제거)">'
              + '<div class="pcalc-sim-head">'
-             + '<span class="pcalc-sim-code">' + escapeHtml(s.code || '-') + ' · ' + s.overlap + '/' + s.total + '재질</span>'
+             + '<span class="pcalc-sim-name">' + escapeHtml(s.name) + '</span>'
              + '<span class="pcalc-sim-price">' + fmtInt(s.price) + '원</span>'
              + '</div>'
-             + (s.price_src ? '<div class="pcalc-sim-src">' + _pcalcSrcTag(s.price_src, s.price, s.board_price) + '</div>' : '')
-             + '<div class="pcalc-sim-name">' + escapeHtml(s.name) + '</div>'
-             + metaHtml
+             + '<div class="stk-meta">' + meta.join(stkSep)
+             + (s.price_src ? _pcalcSrcTag(s.price_src, s.price, s.board_price) : '') + '</div>'
              + '<div class="pcalc-sim-mats" id="pcalc-mats-' + i + '" style="display:' + (isOpen ? 'flex' : 'none') + '">' + mats + '</div>'
              + '</div>';
       }).join('');
