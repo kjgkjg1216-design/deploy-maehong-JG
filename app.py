@@ -15071,21 +15071,37 @@ def api_order_receipt_detail():
         except Exception:
             return 0.0
 
-    def _top(df, date_col):
+    # 거래처 아래 품목 TOP 3(금액 큰 순)·수량 (2026-11-18 사용자 "업체 하위아이템으로 품목 3건 정도, 금액 큰 순, 수량까지")
+    def _top(df, date_col, qty_col):
         if df is None or df.empty or date_col not in df.columns or '거래처명' not in df.columns or '합계금액' not in df.columns:
             return [], 0
-        agg = {}
+        agg, per = {}, {}
         for _, r in df.iterrows():
             if str(r.get(date_col, ''))[:6] != ym:
                 continue
             v = str(r.get('거래처명', '')).strip() or '미지정'
-            agg[v] = agg.get(v, 0) + _num(r.get('합계금액', ''))
-        items = [{'name': k, 'amount': int(v)} for k, v in
-                 sorted(agg.items(), key=lambda x: -x[1]) if v > 0]
+            amt = _num(r.get('합계금액', ''))
+            agg[v] = agg.get(v, 0) + amt
+            code = str(r.get('품번', '') or '').strip()
+            name = str(r.get('품명', '') or '').strip()
+            key = code or name or '-'
+            it = per.setdefault(v, {}).setdefault(key, {'code': code, 'name': name, 'amount': 0.0, 'qty': 0.0,
+                                                       'unit': str(r.get('단위', '') or '').strip()})
+            it['amount'] += amt
+            it['qty'] += _num(r.get(qty_col, ''))
+        items = []
+        for k, v in sorted(agg.items(), key=lambda x: -x[1]):
+            if v <= 0:
+                continue
+            prods = sorted(per.get(k, {}).values(), key=lambda x: -x['amount'])
+            items.append({'name': k, 'amount': int(v), 'n_items': len(prods),
+                          'items': [{'code': p['code'], 'name': p['name'], 'amount': int(p['amount']),
+                                     'qty': round(p['qty'], 2), 'unit': '' if p['unit'].lower() == 'nan' else p['unit']}
+                                    for p in prods[:3] if p['amount'] > 0]})
         return items[:10], int(sum(agg.values()))
 
-    order_top, order_total = _top(ORDER_DF, '발주일자')
-    recv_top, recv_total = _top(RCV_DF, '입고일자')
+    order_top, order_total = _top(ORDER_DF, '발주일자', '발주수량')
+    recv_top, recv_total = _top(RCV_DF, '입고일자', '입고수량')
     ym_disp = f'{ym[:4]}-{ym[4:6]}'
     return jsonify({'ym': ym_disp, 'order': order_top, 'order_total': order_total,
                     'receipt': recv_top, 'receipt_total': recv_total})
@@ -16570,6 +16586,17 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .pocal-drow.done { opacity: .72; }
   .pocal-drow.done .dcode { color: #6b7280; background: #f1f1ef; }
   .pocal-drow .donetag { color: #15803d; font-weight: 700; margin-right: 2px; }
+  /* 발주·입고 TOP 10 — 거래처 아래 품목 TOP 3 (2026-11-18): 품번 / 품명 / 수량(단위) / 금액, 왼쪽 가는 선으로 거래처에 묶음 */
+  .cd-subwrap { border-bottom: 1px solid var(--border); padding: 0 0 7px; }
+  .cd-sub { margin: 0 0 0 26px; padding: 2px 0 1px 10px; border-left: 2px solid #e7e6e0; }
+  .cd-sub-row { display: grid; grid-template-columns: 50px minmax(0, 1fr) auto 62px; column-gap: 10px; align-items: baseline;
+                padding: 2px 0; font-size: 11px; color: #52514e; }
+  .cd-sub-code { font-weight: 700; color: #8a8880; font-variant-numeric: tabular-nums; }
+  .cd-sub-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cd-sub-qty { text-align: right; color: #6b7280; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .cd-sub-qty small { font-size: 9.5px; color: #9ca3af; }
+  .cd-sub-amt { text-align: right; font-weight: 700; color: #374151; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .cd-sub-more { padding: 1px 0 0 60px; font-size: 10.5px; color: #9ca3af; }
   /* 검색 결과 구역 머리 (2026-11-18): 입고 예정 / 지난 입고 내역 */
   .pocal-sec { margin: 2px 2px 8px; font-size: 12px; font-weight: 800; color: #4f46e5; letter-spacing: .01em; }
   .pocal-sec.past { margin-top: 22px; padding-top: 12px; border-top: 1px dashed #d6d4cc; color: #6b7280; }
@@ -24135,7 +24162,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       const pct = total > 0 ? (it.amount / total * 100) : 0;
       const barW = (it.amount / max * 100);
       const sub = it.div ? ' <span style="font-size:10px;color:var(--text-3)">' + escapeHtml(it.div) + '</span>' : '';
-      return '<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border)">'
+      // 품목 TOP 3가 있으면 구분선은 품목 목록 아래로 (거래처와 그 품목이 한 묶음으로 보이게)
+      return '<div style="display:flex;align-items:center;gap:8px;padding:6px 0;' + (it.items && it.items.length ? '' : 'border-bottom:1px solid var(--border)') + '">'
         + '<span style="width:18px;font-size:11px;font-weight:700;color:' + color + '">' + (i+1) + '</span>'
         + '<div style="flex:1;min-width:0">'
         +   '<div style="font-size:11.5px;font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escapeHtml(it.name || '-') + sub + '</div>'
@@ -24144,8 +24172,20 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         + '<div style="text-align:right;flex-shrink:0">'
         +   '<div style="font-size:12px;font-weight:800;color:' + color + '">' + fmtEok(it.amount) + '</div>'
         +   '<div style="font-size:10px;color:var(--text-3)">' + pct.toFixed(1) + '%</div>'
-        + '</div></div>';
+        + '</div></div>'
+        + _cdSubItems(it);
     }).join('');
+  }
+  // 거래처 아래 품목 TOP 3 — 품번·품명 / 수량(단위) / 금액, 나머지는 '외 N품목' (2026-11-18 사용자 요청: 발주·입고 TOP 10)
+  function _cdSubItems(it) {
+    if (!it.items || !it.items.length) return '';
+    const more = (it.n_items || 0) - it.items.length;
+    return '<div class="cd-subwrap"><div class="cd-sub">' + it.items.map(p => '<div class="cd-sub-row">'
+        + '<span class="cd-sub-code">' + escapeHtml(p.code || '') + '</span>'
+        + '<span class="cd-sub-name" title="' + escapeHtml((p.code ? p.code + ' ' : '') + (p.name || '')) + '">' + escapeHtml(p.name || '-') + '</span>'
+        + '<span class="cd-sub-qty">' + fmtNum(p.qty) + (p.unit ? ' <small>' + escapeHtml(p.unit) + '</small>' : '') + '</span>'
+        + '<span class="cd-sub-amt">' + fmtEok(p.amount) + '</span></div>').join('')
+      + (more > 0 ? '<div class="cd-sub-more">외 ' + more + '품목</div>' : '') + '</div></div>';
   }
   async function openSalesDetail(ym) {
     const modal = document.getElementById('chart-detail-modal');
