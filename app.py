@@ -16496,6 +16496,16 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .pmd-cell { font-size: 11px; text-align: center; color: var(--text-2); padding: 2.5px 0; font-variant-numeric: tabular-nums; }
   .pmd-cell.empty { color: transparent; }
   .pmd-cell.sun { color: #ef4444; } .pmd-cell.sat { color: #3b82f6; }
+  /* 미니 캘린더 클릭 = 그 날짜로 이동 (2026-11-18) — 입고 일정 있는 날은 굵게 + 아래 점, 달 이름 클릭 = 그 달로 */
+  .pmd-cell:not(.empty) { cursor: pointer; border-radius: 6px; transition: background .12s; }
+  .pmd-cell:not(.empty):hover { background: #e0e7ff; }
+  /* 점은 숫자 아래 따로(::after) — 배경 점이 숫자에 겹쳐 '12'가 지저분해 보이던 것 수정 */
+  .pmd-cell:not(.empty) { position: relative; padding-bottom: 6px; }
+  .pmd-cell.has { font-weight: 800; color: #1e293b; }
+  .pmd-cell.has::after { content: ''; position: absolute; left: 50%; bottom: 1px; width: 4px; height: 4px; margin-left: -2px;
+                         border-radius: 50%; background: #4f46e5; }
+  .pmd-cell.has.sun { color: #dc2626; } .pmd-cell.has.sat { color: #2563eb; }
+  .pmini-ym { cursor: pointer; } .pmini-ym:hover { color: #4f46e5; }
   @media (max-width: 760px) { .pocal-mini { gap: 10px; } }
 
   .pocal-detail { max-height: 604px; overflow-y: auto; padding: 2px 6px 2px 2px; }
@@ -19446,7 +19456,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     while (m > 12) { m -= 12; y++; } while (m < 1) { m += 12; y--; }
     return y + String(m).padStart(2,'0');
   }
-  function _miniCalHtml(ym, label) {
+  // kind = 'po'(원/부자재) | 'os'(외주) — 날짜 누르면 그 날짜로 이동·선택, 달 이름 누르면 그 달로 (2026-11-18 사용자 요청)
+  function _miniCalHtml(ym, label, kind, has) {
     const days = daysInMonth(ym), first = firstWeekday(ym);
     const dows = ['일','월','화','수','목','금','토'];
     let g = '';
@@ -19454,14 +19465,25 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     for (let i=0; i<first; i++) g += '<span class="pmd-cell empty"></span>';
     for (let day=1; day<=days; day++) {
       const wd = (first + day - 1) % 7;
-      g += '<span class="pmd-cell' + (wd===0?' sun':wd===6?' sat':'') + '">' + day + '</span>';
+      const ymd = ym.slice(0,4) + '-' + ym.slice(4,6) + '-' + String(day).padStart(2,'0');
+      const n = has[ymd] || 0;
+      g += '<span class="pmd-cell' + (wd===0?' sun':wd===6?' sat':'') + (n ? ' has' : '') + '" onclick="_miniGo(&quot;' + kind + '&quot;,&quot;' + ymd + '&quot;)"'
+         + ' title="' + ymd + (n ? ' · 입고 ' + n + '건' : '') + ' — 누르면 이 날짜로">' + day + '</span>';
     }
-    return '<div class="pmini"><div class="pmini-ym">' + label + ' · ' + (+ym.slice(4,6)) + '월'
+    return '<div class="pmini"><div class="pmini-ym" onclick="_miniGo(&quot;' + kind + '&quot;,&quot;' + ym + '&quot;)" title="누르면 이 달로">' + label + ' · ' + (+ym.slice(4,6)) + '월'
          + '</div><div class="pmini-grid">' + g + '</div></div>';
   }
   function _renderMini(id, ym) {
-    const el = document.getElementById(id);
-    if (el) el.innerHTML = _miniCalHtml(_adjYm(ym,-1), '전월') + _miniCalHtml(_adjYm(ym,1), '다음월');
+    const el = document.getElementById(id); if (!el) return;
+    const kind = id.indexOf('oscal') === 0 ? 'os' : 'po', has = {};
+    (kind === 'os' ? _osCalScheduled() : _poCalScheduled()).forEach(x => { const d = (x.eta_sort || '').slice(0, 10); if (d) has[d] = (has[d] || 0) + 1; });
+    el.innerHTML = _miniCalHtml(_adjYm(ym,-1), '전월', kind, has) + _miniCalHtml(_adjYm(ym,1), '다음월', kind, has);
+  }
+  // v = 'YYYY-MM-DD'(날짜 → 그 달로 이동 + 그 날 선택) | 'YYYYMM'(달 → 그 달로, 선택 해제)
+  function _miniGo(kind, v) {
+    const ym = v.length === 6 ? v : v.slice(0,4) + v.slice(5,7), sel = v.length === 6 ? '' : v;
+    if (kind === 'os') { _osCalYm = ym; _osCalSel = sel; renderOsCal(); osCalRenderDetail(); }
+    else { _poCalYm = ym; _poCalSel = sel; renderPoCal(); poCalRenderDetail(); }
   }
   function renderPoCal() {
     const ym = _poCalYm;
@@ -19518,7 +19540,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
          + '<span class="tag ' + it.type + '"></span>'
          + '<span class="dcode">' + code + '</span>'
          // 부제(업체 → 입고처)도 누르면 상세 창 — 예전엔 부제만 펼치기/접기라 '눌러도 안 열림'으로 보였음 (2026-11-04)
-         + '<div class="dname">' + name + '<span class="dsub">' + (_poTypeLabel[it.type]||'') + dest + '</span>' + sub + '</div>'
+         // 입고지가 매홍(자사)인 건은 부제를 빨간 글씨로 — 나머지는 외주 입고 (2026-11-18 사용자 요청)
+         + '<div class="dname">' + name + '<span class="dsub"' + (/매홍/.test(it.destination || '') ? ' style="color:#dc2626;font-weight:700"' : '') + '>' + (_poTypeLabel[it.type]||'') + dest + '</span>' + sub + '</div>'
          + '<span class="dqty">' + escapeHtml(qtyText) + '</span></div>';
   }
   const _DOW = ['일','월','화','수','목','금','토'];
