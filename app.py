@@ -15477,9 +15477,33 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .ipsu-stages { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
   /* 3D 캔버스(예전 폭 그대로)가 칸 최소폭이 되어 폰에서 화면 밖으로 233px 밀던 것 → 칸은 캔버스와 무관하게 줄고, 캔버스가 칸을 따라감 (2026-11-06) */
   .ipsu-stages > * { min-width: 0; }
-  .ipsu-cv { width: 100%; height: 260px; background: #0f172a; border-radius: 9px;
+  /* 3D 캔버스 (2026-11-17 사용자 "대기업 자료처럼 체계적인 입체"): 밝은 스튜디오 바탕(캔버스는 투명, 뒤 CSS 그라데이션),
+     위 왼쪽 범례·위 오른쪽 시점 버튼(등각·정면·측면·평면)·아래 왼쪽 조작 안내 */
+  .ipsu-cv { width: 100%; height: 260px; border-radius: 10px; border: 1px solid #e3e2dc;
+             background: radial-gradient(130% 105% at 50% 18%, #ffffff 0%, #f6f6f3 50%, #e8e7e1 100%);
              overflow: hidden; position: relative; cursor: grab; }
+  .ipsu-cv canvas { display: block; }
   .ipsu-cv:active { cursor: grabbing; }
+  .ipsu-cv .cv-views { position: absolute; top: 7px; right: 7px; display: flex; gap: 1px; padding: 2px;
+                       background: rgba(255,255,255,0.9); border: 1px solid #dedcd5; border-radius: 7px; cursor: default; }
+  .ipsu-cv .cv-views button { border: 0; background: none; padding: 3px 7px; border-radius: 5px; font-size: 10.5px;
+                              font-weight: 600; color: #52514e; cursor: pointer; line-height: 1.3; }
+  .ipsu-cv .cv-views button:hover { background: #f0efea; }
+  .ipsu-cv .cv-views button.on { background: #111827; color: #fff; }
+  .ipsu-cv .cv-legend { position: absolute; top: 9px; left: 10px; max-width: calc(100% - 175px); display: flex; flex-wrap: wrap;
+                        gap: 3px 10px; font-size: 10.5px; font-weight: 600; color: #3f3e3a; pointer-events: none; }
+  .ipsu-cv .cv-legend span { white-space: nowrap; }
+  .ipsu-cv .cv-legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+  .ipsu-cv .cv-legend i.film { background: rgba(79,91,112,0.10); border: 1.5px solid #4f5b70; width: 7px; height: 7px; border-radius: 3px; }
+  .ipsu-cv .cv-legend i.board { background: #eeede8; border: 1.5px solid #5c5a53; width: 7px; height: 7px; }
+  .ipsu-cv .cv-legend i.limit { width: 13px; height: 0; border-top: 2px dashed #d03b3b; border-radius: 0; vertical-align: 3px; }
+  .ipsu-cv .cv-legend .u { color: #8a8880; font-weight: 500; }
+  /* 단계 설명 줄 → 칩 (첫 칩 = 배열, ⚠ 칩 = 빨강) */
+  .ipsu-badge { display: flex; flex-wrap: wrap; gap: 4px; }
+  .ipsu-badge .bc { padding: 2px 7px; border-radius: 5px; background: #f5f5f2; border: 1px solid #e6e5df; color: #52514e;
+                    font-variant-numeric: tabular-nums; white-space: nowrap; line-height: 1.45; }
+  .ipsu-badge .bc.k { background: #fff; border-color: #cfcdc5; color: #111827; font-weight: 700; }
+  .ipsu-badge .bc.w { background: #fdf1f0; border-color: #f0c4c0; color: #b42318; font-weight: 600; white-space: normal; }
   /* 3D 확대 보기 모달 — 캔버스를 통째로 옮겨와 크게 표시 */
   .ipsu-zoom-overlay { display: none; position: fixed; inset: 0; z-index: 130;
     background: rgba(10, 10, 16, 0.72); backdrop-filter: blur(3px);
@@ -15493,14 +15517,14 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     cursor: pointer; color: var(--text-3, #94a3b8); padding: 0 4px; }
   .ipsu-zoom-body .ipsu-cv { height: min(78vh, 900px); }
   .ipsu-zoom-sub { margin-top: 8px; font-size: 12px; color: var(--text-2, #475569); }
-  .ipsu-cv .cv-hint { position: absolute; bottom: 5px; left: 7px; font-size: 10px;
-                      color: #94a3b8; pointer-events: none; }
+  .ipsu-cv .cv-hint { position: absolute; bottom: 6px; left: 10px; font-size: 10px;
+                      color: #8a8880; pointer-events: none; }
   .ipsu-sh { margin: 0 0 5px; font-size: 12px; display: flex; justify-content: space-between; align-items: baseline; }
   .ipsu-sh .sc { font-size: 16px; font-weight: 800; color: #7c3aed; font-variant-numeric: tabular-nums; }
   .ipsu-sh .sc-wrap { display: flex; align-items: baseline; gap: 3px; white-space: nowrap; }
   .ipsu-sh .sc-lbl { font-size: 11px; font-weight: 700; color: var(--text-3); }
   .ipsu-sh .sc-unit { font-size: 11px; font-weight: 700; color: var(--text-3); }
-  .ipsu-badge { font-size: 10.5px; color: var(--text-2); margin-top: 5px; }
+  .ipsu-badge { font-size: 10.5px; color: var(--text-2); margin-top: 7px; }
   .ipsu-total { background: #7c3aed; color: #fff; border-radius: 9px; padding: 10px 14px;
                 margin-top: 10px; display: flex; justify-content: space-between; align-items: center; }
   .ipsu-total .bg { font-size: 26px; font-weight: 800; font-variant-numeric: tabular-nums; }
@@ -15913,6 +15937,41 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .alert-days.low      { color: #16a34a; }
   .alert-qty { font-size: 11px; color: var(--text-2); font-variant-numeric: tabular-nums; text-align: right; }
   .alert-empty { padding: 24px; text-align: center; color: var(--text-3); font-size: 12px; }
+  /* 재고 경고 3종(자사·외주·채널) 보기 (2026-11-18 사용자 "보기 어려움 → 보기 쉽게 정리"):
+     줄마다 붙던 큰 등급 칩 대신 등급별 묶음(머리에 개수) + 왼쪽 등급 색 띠, 숫자는 열 머리 한 번 + 오른쪽 정렬 열,
+     품명 끝 연결 품번 괄호는 둘째 줄로 */
+  .stk-sum { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 12px; font-size: 11px; color: var(--text-2); margin: 0 0 6px; }
+  .stk-sum .d { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; vertical-align: 1px; }
+  .stk-sum b { font-weight: 700; color: #111827; font-variant-numeric: tabular-nums; }
+  .stk-sum .zero, .stk-sum .zero b { color: #a3a29b; }
+  .stk-head, .stk-row { display: grid; grid-template-columns: minmax(0, 1fr) 56px 58px 52px; column-gap: 8px; align-items: center; }
+  .stk-head { position: sticky; top: 0; z-index: 2; background: var(--surface); padding: 3px 10px 5px 16px;
+              font-size: 10.5px; font-weight: 600; color: var(--text-3); border-bottom: 1px solid #e7e6e0; }
+  .stk-head span + span { text-align: right; }
+  .stk-grp { display: flex; align-items: baseline; gap: 6px; padding: 10px 10px 3px 16px; font-size: 11.5px; font-weight: 700; color: #111827; }
+  .stk-grp .d { width: 7px; height: 7px; border-radius: 50%; align-self: center; }
+  .stk-grp .n { font-weight: 700; color: var(--text-3); font-variant-numeric: tabular-nums; }
+  .stk-grp .s { font-size: 10.5px; font-weight: 500; color: var(--text-3); }
+  .stk-row { position: relative; padding: 7px 10px 7px 16px; border-radius: 8px; cursor: pointer; transition: background .12s; }
+  .stk-row::before { content: ''; position: absolute; left: 6px; top: 9px; bottom: 9px; width: 3px; border-radius: 2px; background: var(--lv); }
+  .stk-row + .stk-row { box-shadow: inset 0 1px 0 #f1f0eb; }
+  .stk-row:hover { background: #f6f7f9; }
+  /* keep-all = 낱말 중간('1차파우|치')에서 줄이 안 갈리게 */
+  .stk-nm { font-size: 12.5px; font-weight: 600; color: #111827; line-height: 1.38; word-break: keep-all; overflow-wrap: anywhere;
+            display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .stk-meta { margin-top: 2px; display: flex; flex-wrap: wrap; align-items: center; gap: 2px 5px; font-size: 10.5px; color: var(--text-3); line-height: 1.5; }
+  .stk-meta .cd { font-weight: 700; color: #6b7280; font-variant-numeric: tabular-nums; }
+  .stk-meta .sep { color: #c9c8c1; }
+  .stk-meta .tg { padding: 0 5px; border-radius: 4px; background: #f4f3ef; border: 1px solid #e6e5df; color: #52514e; font-weight: 600; }
+  .stk-meta .ch-tag { margin-left: 0; }
+  .stk-num { text-align: right; font-size: 12px; color: #374151; font-variant-numeric: tabular-nums; }
+  .stk-num.z { color: #b4b3ac; }
+  .stk-day { text-align: right; font-size: 13.5px; font-weight: 800; color: var(--lv); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .stk-day small { font-size: 10px; font-weight: 700; margin-left: 1px; }
+  @media (max-width: 640px) {
+    .stk-head, .stk-row { grid-template-columns: minmax(0, 1fr) 56px 48px; }
+    .stk-head .c3, .stk-row .c3 { display: none; }
+  }
 
   /* ───── Price Calculator ───── */
   .chart-panel.pcalc-panel { border-top: 3px solid #0ea5e9; }
@@ -17140,6 +17199,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       <div><span class="chart-title">🏠 자사 재고 경고</span><span class="chart-sub">자사창고 기준 · 45일 이하 · 클릭=상세</span></div>
       <div id="alert-count-jasa" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
     </div>
+    <div id="alert-sum-jasa" class="stk-sum"></div>
     <div id="alert-list-jasa" class="alert-list"><div class="loading" style="padding:20px">로딩 중...</div></div>
   </div>
   <div class="chart-panel scope-outsource alert-span">
@@ -17151,6 +17211,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         <div id="alert-count-outsource" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
       </div>
     </div>
+    <div id="alert-sum-outsource" class="stk-sum"></div>
     <div id="alert-list-outsource" class="alert-list"><div class="loading" style="padding:20px">로딩 중...</div></div>
   </div>
   <div class="chart-panel alert-span reorder-panel">
@@ -17189,7 +17250,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         <div id="chstock-count" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
       </div>
     </div>
-    <div id="chstock-summary" style="font-size:11px;color:var(--text-2);margin-bottom:6px"></div>
+    <div id="chstock-summary" class="stk-sum"></div>
     <div id="chstock-list" class="alert-list"><div class="loading" style="padding:20px">로딩 중...</div></div>
   </div>
   <div class="chart-panel vendor-panel">
@@ -19618,32 +19679,77 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     if (e.target.id === 'os-cal-modal') closeOsCalModal();
   });
 
+  // ───── 재고 경고 3종(자사·외주·채널) 공통 목록 (2026-11-18 사용자 "보기 쉽게 정리") ─────
+  // 등급별 묶음(머리에 개수·뜻) + 열 머리(숫자 열 이름은 한 번만) + 숫자 열 오른쪽 정렬 + 왼쪽 등급 색 띠.
+  const STK_LV = { out: { c: '#dc2626', t: '품절' }, critical: { c: '#ea580c', t: '위험' },
+                   warning: { c: '#ca8a04', t: '주의' }, low: { c: '#16a34a', t: '관찰' } };
+  // 품명 끝의 연결 품번 괄호 "(E0065)(E0033-해들녘(황토))"는 제목에서 빼 둘째 줄로 (원래 이름은 마우스를 올리면)
+  function stkSplitName(n) {
+    const s = String(n || '');
+    const m = s.match(/(?:[(][A-Z][0-9]{4}[^()]*(?:[(][^()]*[)])?[^()]*[)])+$/);
+    if (!m || m.index < 4) return { t: s, links: '' };
+    const g = m[0].match(/[(][A-Z][0-9]{4}[^()]*(?:[(][^()]*[)])?[^()]*[)]/g) || [];
+    return { t: s.slice(0, m.index).trim(), links: g.map(x => x.slice(1, -1)).join(' · ') };
+  }
+  const stkSep = '<span class="sep">·</span>';
+  function stkDays(v, lv) { return (lv === 'out' ? '0' : (+v).toFixed(1)) + '<small>일</small>'; }
+  // 맨 위 요약: (기준) + 등급별 개수 — 0건은 흐리게
+  function stkSum(groups, lead) {
+    return (lead ? '<span>' + lead + '</span>' : '') + groups.map(g => {
+      const L = STK_LV[g.lv], n = g.rows.length;
+      return '<span' + (n ? '' : ' class="zero"') + '><i class="d" style="background:' + (n ? L.c : '#d6d4cc') + '"></i>' + L.t + ' <b>' + n + '</b></span>';
+    }).join('');
+  }
+  // cols = [품목, 숫자1, 숫자2(좁은 화면에선 숨김), 남은 일수] / groups = [{ lv, sub, rows: [{ attrs, name, full, meta, n1, n1z, n2, days }] }]
+  function stkRender(cols, groups) {
+    let h = '<div class="stk-head"><span>' + cols[0] + '</span><span>' + cols[1] + '</span><span class="c3">' + cols[2] + '</span><span>' + cols[3] + '</span></div>';
+    groups.forEach(g => {
+      if (!g.rows.length) return;
+      const L = STK_LV[g.lv];
+      h += '<div class="stk-grp"><i class="d" style="background:' + L.c + '"></i>' + L.t + '<span class="n">' + g.rows.length + '</span>'
+        + (g.sub ? '<span class="s">' + g.sub + '</span>' : '') + '</div>'
+        + g.rows.map(r => '<div class="stk-row"' + r.attrs + ' style="--lv:' + L.c + '">'
+          + '<div style="min-width:0"><div class="stk-nm"' + (r.full ? ' title="' + escapeHtml(r.full) + '"' : '') + '>' + escapeHtml(r.name) + '</div>'
+          + '<div class="stk-meta">' + r.meta + '</div></div>'
+          + '<div class="stk-num' + (r.n1z ? ' z' : '') + '">' + r.n1 + '</div>'
+          + '<div class="stk-num c3">' + r.n2 + '</div>'
+          + '<div class="stk-day">' + r.days + '</div></div>').join('');
+    });
+    return h;
+  }
+
   async function loadAlerts(scope) {
     const list = document.getElementById('alert-list-' + scope);
     const count = document.getElementById('alert-count-' + scope);
+    const sum = document.getElementById('alert-sum-' + scope);
     try {
       const res = await fetch('/api/stock_alerts?scope=' + scope);
       const d = await res.json();
       const items = d.items || [];
       count.textContent = (d.total || items.length) + '건';
       if (!items.length) {
+        if (sum) sum.innerHTML = '';
         list.innerHTML = '<div class="alert-empty">경고 항목이 없습니다</div>';
         return;
       }
-      const labelMap = { out:'품절', critical:'위험', warning:'주의', low:'관찰' };
-      list.innerHTML = items.map(a => {
-        const daysTxt = a.level === 'out' ? '0일' : (a.days_left.toFixed(1) + '일');
-        const vendorTxt = (a.vendors && a.vendors.length)
-          ? ' <span class="alert-vendor">· ' + escapeHtml(a.vendors.slice(0,2).join(', ')) + (a.vendors.length > 2 ? ' 외 ' + (a.vendors.length - 2) : '') + '</span>'
-          : '';
-        return '<div class="alert-row" onclick="openItemModal(\\'' + a.code + '\\')">'
-             + '<span class="alert-badge ' + a.level + '">' + labelMap[a.level] + '</span>'
-             + '<div><div class="alert-name">' + escapeHtml(a.name) + vendorTxt + '</div>'
-             + '<div class="alert-code">' + escapeHtml(a.code) + ' · ' + (a.basis === 'sales' ? '판매속도 월환산 ' : '월평균 ') + fmtInt(a.monthly_avg) + '</div></div>'
-             + '<div class="alert-qty">재고 ' + fmtInt(a.qty) + '</div>'
-             + '<div class="alert-days ' + a.level + '">' + daysTxt + '</div>'
-             + '</div>';
-      }).join('');
+      // 품절은 월 사용이 많은 것부터(급한 순), 나머지는 남은 일수 짧은 순
+      const SUB = { out: '재고 없음', critical: '15일 안에 바닥', warning: '30일 안에 바닥', low: '45일 안에 바닥' };
+      const groups = ['out', 'critical', 'warning', 'low'].map(lv => ({ lv: lv, sub: SUB[lv],
+        rows: items.filter(a => a.level === lv)
+          .sort((a, b) => lv === 'out' ? (b.monthly_avg - a.monthly_avg) : (a.days_left - b.days_left))
+          .map(a => {
+            const nm = stkSplitName(a.name), parts = ['<span class="cd">' + escapeHtml(a.code) + '</span>'];
+            if (a.vendors && a.vendors.length)
+              parts.push(a.vendors.slice(0, 2).map(v => '<span class="tg">' + escapeHtml(v) + '</span>').join('')
+                + (a.vendors.length > 2 ? '<span>외 ' + (a.vendors.length - 2) + '</span>' : ''));
+            if (nm.links) parts.push('<span>' + escapeHtml(nm.links) + '</span>');
+            if (a.basis !== 'sales') parts.push('<span class="tg" title="판매 자료가 없어 발주·출고 월평균으로 계산">발주 기준</span>');
+            return { attrs: ' onclick="openItemModal(&quot;' + escapeHtml(a.code) + '&quot;)" title="클릭 = 품목 상세"',
+              name: nm.t, full: nm.links ? a.name : '', meta: parts.join(stkSep),
+              n1: fmtInt(a.qty), n1z: a.qty <= 0, n2: fmtInt(a.monthly_avg), days: stkDays(a.days_left, a.level) };
+          }) }));
+      if (sum) sum.innerHTML = stkSum(groups);
+      list.innerHTML = stkRender(['품목', '재고', '월 사용', '남은 일수'], groups);
     } catch (e) {
       list.innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>';
     }
@@ -20888,28 +20994,28 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   function renderChStock() {
     const list = document.getElementById('chstock-list');
     const items = _chItems.filter(x => _chType === 'all' || x.channel_type === _chType);
-    const s = { out: 0, critical: 0, warning: 0 };
-    items.forEach(x => { if (x.level in s) s[x.level]++; });
     document.getElementById('chstock-count').textContent = items.length + '건';
+    // 등급별 묶음 (2026-11-18 보기 개편 — 자사·외주 재고 경고와 같은 모양). 모르는 등급은 '주의'로
+    const known = ['out', 'critical', 'warning'];
+    const SUB = { out: '채널 재고 없음', critical: '3일 안에 바닥', warning: '7일 안에 바닥' };
+    const groups = known.map(lv => ({ lv: lv, sub: SUB[lv],
+      rows: items.filter(x => x.level === lv || (lv === 'warning' && known.indexOf(x.level) < 0))
+        .sort((a, b) => (a.cover - b.cover) || (b.pos_d - a.pos_d)).slice(0, 40).map(x => {
+          const parts = ['<span class="cd">' + escapeHtml(x.code || ('SKU ' + x.sku)) + '</span>'
+            + ' <span class="ch-tag' + (x.channel_type === 'online' ? ' on' : '') + '">' + escapeHtml(x.channel_name) + '</span>'];
+          if (x.last_delivery) parts.push('<span>최근 납품 ' + x.last_delivery.slice(5).replace('-', '/') + ' · ' + fmtInt(x.last_delivery_qty) + '개</span>');
+          if (x.ours != null) parts.push('<span' + (x.ours < 0 ? ' style="color:#dc2626"' : '') + ' title="우리 창고 재고">창고 ' + fmtInt(x.ours) + '</span>');
+          if (x.stale) parts.push('<span style="color:#94a3b8" title="최근 7일 재고값이 변하지 않음 — 채널 재고 스냅샷이 갱신되지 않았을 수 있음">재고값 정체</span>');
+          // 클릭 = 이 채널·SKU 재고 상세 (2026-10-06: 품번 정보 대신)
+          return { attrs: ' data-ch="' + escapeHtml(x.channel) + '" data-sku="' + escapeHtml(String(x.sku)) + '" onclick="openChsDetail(this.dataset.ch, this.dataset.sku)" title="클릭 = 채널 재고 흐름·납품 주기·다음 납품 예상"',
+            name: x.name, full: '', meta: parts.join(stkSep),
+            n1: fmtInt(x.stock), n1z: x.stock <= 0, n2: x.pos_d >= 10 ? fmtInt(Math.round(x.pos_d)) : x.pos_d,
+            days: (+x.cover).toFixed(1) + '<small>일</small>' };
+        }) }));
     document.getElementById('chstock-summary').innerHTML = _chMeta.reason ? escapeHtml(_chMeta.reason)
-      : ('재고 기준 ~' + escapeHtml((_chMeta.as_of || '').slice(5).replace('-', '/')) + ' · '
-        + '<b style="color:#dc2626">품절 ' + s.out + '</b> · <b style="color:#ea580c">3일↓ ' + s.critical + '</b> · '
-        + '<b style="color:#ca8a04">7일↓ ' + s.warning + '</b>');
+      : stkSum(groups, '재고 기준 ~' + escapeHtml((_chMeta.as_of || '').slice(5).replace('-', '/')));
     if (!items.length) { list.innerHTML = '<div class="alert-empty">7일 안에 비는 채널 재고가 없습니다 👍</div>'; return; }
-    list.innerHTML = items.slice(0, 40).map(x => {
-      const [lb, cls] = CH_LV[x.level] || CH_LV.warning;
-      const dl = x.last_delivery ? ' · 최근납품 ' + x.last_delivery.slice(5).replace('-', '/') + ' ' + fmtInt(x.last_delivery_qty) : '';
-      const ours = (x.ours != null) ? ' · 우리재고 ' + fmtInt(x.ours) : '';
-      const stale = x.stale ? ' <span style="color:#94a3b8" title="최근 7일 재고값이 변하지 않음 — 채널 재고 스냅샷이 갱신되지 않았을 수 있음">(재고값 정체)</span>' : '';
-      // 클릭 = 이 채널·SKU 재고 상세 (2026-10-06: 품번 정보 대신)
-      const click = ' data-ch="' + escapeHtml(x.channel) + '" data-sku="' + escapeHtml(String(x.sku)) + '" onclick="openChsDetail(this.dataset.ch, this.dataset.sku)" title="클릭 = 채널 재고 흐름·납품 주기·다음 납품 예상"';
-      return '<div class="alert-row"' + click + '>'
-        + '<span class="alert-badge ' + cls + '">' + lb + '</span>'
-        + '<div><div class="alert-name">' + escapeHtml(x.name) + '<span class="ch-tag' + (x.channel_type === 'online' ? ' on' : '') + '">' + escapeHtml(x.channel_name) + '</span></div>'
-        + '<div class="alert-code">' + escapeHtml(x.code || ('SKU ' + x.sku)) + ' · POS 일 ' + x.pos_d + dl + ours + stale + '</div></div>'
-        + '<div class="alert-qty">채널재고 ' + fmtInt(x.stock) + '</div>'
-        + '<div class="alert-days ' + cls + '">' + x.cover + '일</div></div>';
-    }).join('');
+    list.innerHTML = stkRender(['품목 · 채널', '채널 재고', '하루 판매', '남은 일수'], groups);
   }
 
   // ───── 거래처 스코어카드 ─────
@@ -24237,6 +24343,13 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
           mH = Math.round(cont.H - lay.used.H);
     return ` · 적재율 ${pct}% · 여백 W${mW}·D${mD}·H${mH}`;
   }
+  // 단계 설명 줄 → 칩 (' · '로 나눔, 첫 칩 = 배열, ⚠ 든 칩 = 빨강) — 크게보기 창은 원래 문장(data-raw)을 씀 (2026-11-17)
+  function ipsuBadge(id, text) {
+    const el = document.getElementById(id); if (!el) return;
+    el.dataset.raw = text;
+    el.innerHTML = String(text).split(' · ').map(s => s.trim()).filter(Boolean)
+      .map((s, i) => '<span class="bc' + (s.indexOf('⚠') >= 0 ? ' w' : (i === 0 ? ' k' : '')) + '">' + escapeHtml(s) + '</span>').join('');
+  }
 
   async function loadIpsuSpecs() {
     try {
@@ -24898,8 +25011,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   // 좌표계: 컨테이너와 동일(x 0~W, z 0~D), 팔레트는 y 0 ~ -deckH 를 차지.
   function ipsuPalletMesh(W, D, deckH) {
     const g = new THREE.Group();
-    const matTop = new THREE.MeshStandardMaterial({ color: 0xa9b45e, roughness: 0.52, metalness: 0.0 });
-    const matLeg = new THREE.MeshStandardMaterial({ color: 0x8a9448, roughness: 0.58, metalness: 0.0 });
+    // 색은 화면에 실제 올리브가 나오게 변환(2026-11-17, 밝은 스튜디오에서 옅은 노랑으로 바래 보이던 것)
+    const matTop = new THREE.MeshStandardMaterial({ color: ipsuLin(IPSU_C.olive), roughness: 0.52, metalness: 0.0 });
+    const matLeg = new THREE.MeshStandardMaterial({ color: ipsuLin(IPSU_C.oliveLeg), roughness: 0.58, metalness: 0.0 });
     const add = (w, h, d, x, y, z, mat) => {
       const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat || matTop);
       m.position.set(x, y, z); g.add(m);
@@ -24927,75 +25041,309 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     return g;
   }
 
+  // ── 3D 뷰어 개편 (2026-11-17 사용자 "대기업에서 만든 것 같은 체계적인 입체") ──
+  // 밝은 스튜디오(투명 캔버스 + CSS 그라데이션)·옅은 바닥 격자·부드러운 그림자, 상자는 윤곽선, 외박스·단상자는 잘라 본 모습(안쪽 벽만),
+  // 2차파우치는 투명 필름(가장자리만 진하게), 치수선(mm)·팔레트 최대 적재높이, 시점 버튼(등각·정면·측면·평면).
+  // 색 체계: 제품 포장(파우치·단상자) = 앰버, 외박스 = 크래프트, 팔레트 = 올리브, 한도 = 빨강 점선, 치수·윤곽 = 회색.
+  // amber는 예전 그대로(파우치 로고 텍스처와 같은 금빛), 나머지는 화면에 실제 색(크래프트 골판지·올리브 팔레트)이 나오게 ipsuLin으로 변환해 씀
+  const IPSU_C = { amber: 0xdc6a10, kraft: 0xcbb084, kraftEdge: 0x7f6a45, kraftIn: 0xe3d3b1, boardIn: 0xeeede8, olive: 0xa3ad5a, oliveLeg: 0x858f49 };
+  const IPSU_SW = { amber: '#e3a04a', kraft: '#cbb084', olive: '#a3ad5a' };   // 범례 색 점(화면에 보이는 색)
+  const IPSU_VIEWS = [['iso', '등각', 0.74, 0.5], ['front', '정면', 0, 0.02], ['side', '측면', Math.PI / 2, 0.02], ['top', '평면', 0, 1.54]];
+  // 선·글자색은 화면에 보이는 그대로 나오게(출력 감마를 거꾸로 적용)
+  function ipsuLin(hex) { return new THREE.Color(hex).convertSRGBToLinear(); }
+  function ipsuNiceStep(v) {
+    const p = Math.pow(10, Math.floor(Math.log10(Math.max(v, 1e-6)))), m = v / p;
+    return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * p;
+  }
+  // 바닥 격자 텍스처 — 가장자리로 갈수록 투명, 5칸마다 조금 진한 선(세계 원점 기준이라 물체 모서리와 맞음)
+  function ipsuGridTex(cells, ix0, iz0) {
+    const N = 1024, c = document.createElement('canvas'); c.width = c.height = N;
+    const x = c.getContext('2d'), st = N / cells, mod5 = n => ((n % 5) + 5) % 5;
+    const minor = 'rgba(50,48,44,0.07)', major = 'rgba(50,48,44,0.15)';
+    x.lineWidth = 1;
+    for (let i = 0; i <= cells; i++) {
+      const p = Math.min(N - 0.5, Math.round(i * st) + 0.5);
+      x.strokeStyle = mod5(ix0 + i) === 0 ? major : minor;
+      x.beginPath(); x.moveTo(p, 0); x.lineTo(p, N); x.stroke();
+      x.strokeStyle = mod5(iz0 + i) === 0 ? major : minor;
+      x.beginPath(); x.moveTo(0, p); x.lineTo(N, p); x.stroke();
+    }
+    x.globalCompositeOperation = 'destination-in';
+    const g = x.createRadialGradient(N / 2, N / 2, N * 0.16, N / 2, N / 2, N * 0.5);
+    g.addColorStop(0, 'rgba(0,0,0,1)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+    x.fillStyle = g; x.fillRect(0, 0, N, N);
+    const t = new THREE.CanvasTexture(c); t.encoding = THREE.sRGBEncoding; t.anisotropy = 8;
+    return t;
+  }
+  // 치수·한도 글자 — 흰 알약 + 진회색 숫자, 화면에서 늘 같은 크기(sizeAttenuation 끔)
+  function ipsuLabelSprite(text, warn) {
+    const fs = 28, pad = 13, h = 46;
+    const font = '600 ' + fs + 'px system-ui, -apple-system, "Segoe UI", "Malgun Gothic", sans-serif';
+    const c = document.createElement('canvas'), x = c.getContext('2d');
+    x.font = font;
+    const w = Math.ceil(x.measureText(text).width) + pad * 2;
+    c.width = w * 2; c.height = h * 2; x.scale(2, 2); x.font = font;   // 2배 해상도(고해상도 화면에서 선명)
+    const r = 10;
+    x.beginPath(); x.moveTo(r + 1, 1); x.arcTo(w - 1, 1, w - 1, h - 1, r); x.arcTo(w - 1, h - 1, 1, h - 1, r);
+    x.arcTo(1, h - 1, 1, 1, r); x.arcTo(1, 1, w - 1, 1, r); x.closePath();
+    x.fillStyle = warn ? '#fdf1f0' : 'rgba(255,255,255,0.96)'; x.fill();
+    x.lineWidth = 2; x.strokeStyle = warn ? '#eba7a2' : '#d2d0c8'; x.stroke();
+    x.fillStyle = warn ? '#b42318' : '#2b2a27'; x.textAlign = 'center'; x.textBaseline = 'middle';
+    x.fillText(text, w / 2, h / 2 + 1);
+    const t = new THREE.CanvasTexture(c); t.encoding = THREE.sRGBEncoding; t.generateMipmaps = false; t.minFilter = THREE.LinearFilter;
+    // depthTest 끔 = 도면 주석처럼 늘 맨 위(물체 모서리에 글자가 잘려 보이던 것 방지)
+    const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: t, transparent: true, depthTest: false, depthWrite: false, sizeAttenuation: false, toneMapped: false }));
+    s.renderOrder = 30; s.userData.ar = w / h;
+    return s;
+  }
+  // 치수선: 물체의 두 점 p→q, 바깥 방향 e — 보조선 2개 + 치수선 + 양끝 화살 + 가운데 숫자
+  function ipsuDim(grp, p, q, e, R, text, dims) {
+    const off = R * 0.11, gap = R * 0.025, over = R * 0.03, ah = R * 0.04, sp = ah * 0.36;
+    const d = q.clone().sub(p).normalize();
+    const P = p.clone().addScaledVector(e, off), Q = q.clone().addScaledVector(e, off), v = [];
+    const seg = (a, b) => v.push(a.x, a.y, a.z, b.x, b.y, b.z);
+    seg(p.clone().addScaledVector(e, gap), p.clone().addScaledVector(e, off + over));
+    seg(q.clone().addScaledVector(e, gap), q.clone().addScaledVector(e, off + over));
+    seg(P, Q);
+    seg(P, P.clone().addScaledVector(d, ah).addScaledVector(e, sp)); seg(P, P.clone().addScaledVector(d, ah).addScaledVector(e, -sp));
+    seg(Q, Q.clone().addScaledVector(d, -ah).addScaledVector(e, sp)); seg(Q, Q.clone().addScaledVector(d, -ah).addScaledVector(e, -sp));
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(v, 3));
+    const ln = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: ipsuLin(0x6b6a64), transparent: true, depthWrite: false, toneMapped: false }));
+    ln.renderOrder = 6; grp.add(ln);
+    const s = ipsuLabelSprite(text); s.position.copy(P).add(Q).multiplyScalar(0.5); grp.add(s);
+    dims.push({ a: P, b: Q, ln, s });
+  }
+  // 점선 묶음(팔레트 적재 한도)
+  function ipsuDashed(v, hex, R, opacity) {
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(v, 3));
+    const l = new THREE.LineSegments(g, new THREE.LineDashedMaterial({ color: ipsuLin(hex), dashSize: R * 0.03, gapSize: R * 0.022,
+      transparent: true, opacity: opacity || 1, depthWrite: false, toneMapped: false }));
+    l.computeLineDistances(); l.renderOrder = 5; return l;
+  }
+  // 2차파우치 = 투명 필름: 정면은 거의 투명, 가장자리(윤곽)로 갈수록 진하게 — 예전 삼각형 철망 대신
+  function ipsuFilmMat() {
+    return new THREE.ShaderMaterial({
+      uniforms: { uCol: { value: new THREE.Color(0x4f5b70) }, uBase: { value: 0.04 }, uRim: { value: 0.62 } },
+      vertexShader: 'varying vec3 vN; varying vec3 vV; void main() { vec4 mv = modelViewMatrix * vec4(position, 1.0); vN = normalize(normalMatrix * normal); vV = -mv.xyz; gl_Position = projectionMatrix * mv; }',
+      fragmentShader: 'uniform vec3 uCol; uniform float uBase; uniform float uRim; varying vec3 vN; varying vec3 vV; void main() { float f = 1.0 - abs(dot(normalize(vN), normalize(vV))); gl_FragColor = vec4(uCol, uBase + uRim * pow(f, 2.4)); }',
+      transparent: true, depthWrite: false, side: THREE.DoubleSide });
+  }
+  // 다시 그릴 때 이전 것의 GPU 메모리 정리 (공용 파우치 로고 텍스처는 남김)
+  function ipsuDispose(o) {
+    o.traverse(n => {
+      if (n.geometry) n.geometry.dispose();
+      if (n.material) [].concat(n.material).forEach(m => { if (m.map && m.map !== _ipsuTex) m.map.dispose(); m.dispose(); });
+    });
+  }
+
   function ipsuMakeViewer(el) {
-    const scene = new THREE.Scene();
-    const cam = new THREE.PerspectiveCamera(45, el.clientWidth / el.clientHeight, 1, 200000);
-    // preserveDrawingBuffer: 온디맨드 렌더라 버퍼를 유지해야 캡처/이미지 저장 가능
-    const rd = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
-    rd.setPixelRatio(window.devicePixelRatio);
+    const scene = new THREE.Scene(), FOV = 30;   // 좁은 화각 = 왜곡 적은 제품 사진·도면 느낌
+    const cam = new THREE.PerspectiveCamera(FOV, el.clientWidth / Math.max(1, el.clientHeight), 1, 200000);
+    // preserveDrawingBuffer: 캡처·이미지 저장용 / alpha: 뒤의 CSS 스튜디오 바탕이 보이게
+    const rd = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
+    rd.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
     rd.setSize(el.clientWidth, el.clientHeight);
     rd.outputEncoding = THREE.sRGBEncoding;
     rd.toneMapping = THREE.ACESFilmicToneMapping;
-    rd.toneMappingExposure = 0.92;
+    rd.toneMappingExposure = 1.0;
+    rd.setClearColor(0xffffff, 0);
+    rd.shadowMap.enabled = true;
+    rd.shadowMap.type = THREE.PCFSoftShadowMap;
+    rd.shadowMap.autoUpdate = false;   // 빛은 고정·카메라만 돎 → 내용이 바뀔 때만 그림자 계산
     el.insertBefore(rd.domElement, el.firstChild);
-    rd.setClearColor(0x17171d);   // 딥 차콜 스튜디오 배경(비네트는 CSS로)
-    // 3점 조명 + 반구광 (무광 필름 질감)
-    scene.add(new THREE.HemisphereLight(0xf3ede2, 0x24242c, 0.30));
-    scene.add(new THREE.AmbientLight(0xffffff, 0.08));
-    const l1 = new THREE.DirectionalLight(0xfff2dc, 0.58); l1.position.set(1.1, 2.0, 1.4); scene.add(l1);   // key(웜)
-    const l2 = new THREE.DirectionalLight(0xc8dcff, 0.18); l2.position.set(-1.4, 0.6, -0.9); scene.add(l2); // fill(쿨)
-    const l3 = new THREE.DirectionalLight(0xffffff, 0.22); l3.position.set(-0.6, 1.1, -1.9); scene.add(l3); // rim
+    // 조명: 반구광 + 왼쪽 앞 위 주광(그림자) + 오른쪽 보조광 + 뒤 윤곽광 → 윗면 > 앞면 > 옆면 밝기 차로 입체감
+    scene.add(new THREE.HemisphereLight(0xffffff, 0xd6d2c8, 0.7));
+    const key = new THREE.DirectionalLight(0xfff8ee, 0.66);
+    key.castShadow = true; key.shadow.mapSize.set(2048, 2048); key.shadow.bias = -0.0004;
+    scene.add(key); scene.add(key.target);
+    const fill = new THREE.DirectionalLight(0xeef2fb, 0.24); scene.add(fill);
+    const rim = new THREE.DirectionalLight(0xffffff, 0.14); scene.add(rim);
     const root = new THREE.Group(); scene.add(root);
-    let yaw = 0.7, pitch = 0.5, dist = 800, target = new THREE.Vector3();
-    function draw() { rd.render(scene, cam); }
-    function upd() { cam.position.set(
-      target.x + dist * Math.cos(pitch) * Math.sin(yaw), target.y + dist * Math.sin(pitch),
-      target.z + dist * Math.cos(pitch) * Math.cos(yaw)); cam.lookAt(target); draw(); }
+    let yaw = IPSU_VIEWS[0][2], pitch = IPSU_VIEWS[0][3], dist = 800, R = 400, anim = null;
+    let labelPx = Math.max(17, Math.min(24, (el.clientHeight || 260) * 0.066)), dims = [], labels = [];
+    const target = new THREE.Vector3();
+    // 시점 버튼·범례 (캔버스 위 HTML) — 버튼 누름이 회전·크게보기로 번지지 않게 막음
+    const vbar = document.createElement('div'); vbar.className = 'cv-views';
+    vbar.innerHTML = IPSU_VIEWS.map(v => '<button type="button" data-v="' + v[0] + '">' + v[1] + '</button>').join('');
+    vbar.addEventListener('mousedown', e => e.stopPropagation());
+    vbar.addEventListener('mouseup', e => e.stopPropagation());
+    vbar.addEventListener('click', e => { e.stopPropagation(); const b = e.target.closest('button'); if (b) setView(b.dataset.v); });
+    el.appendChild(vbar);
+    const leg = document.createElement('div'); leg.className = 'cv-legend'; el.appendChild(leg);
+    const mark = v => vbar.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.v === v));
+    mark('iso');
+    function setView(v) {
+      const t = IPSU_VIEWS.find(x => x[0] === v); if (!t) return;
+      const dy = Math.atan2(Math.sin(t[2] - yaw), Math.cos(t[2] - yaw));   // 가까운 쪽으로 돎
+      anim = { y0: yaw, dy: dy, p0: pitch, p1: t[3], t0: performance.now() }; mark(v);
+    }
+    // 위쪽 범례·시점 버튼 줄(BAND px)은 비워 둠: 그 아래 높이에 맞춰 크기를 정하고, 그만큼 아래로 내려 그림
+    const BAND = 30;
+    function fitDist() {   // 치수선까지 넣은 크기가 화면에 꽉 차게
+      const h = el.clientHeight || 260, vf = FOV * Math.PI / 180;
+      const vfe = 2 * Math.atan(Math.tan(vf / 2) * Math.max(0.5, (h - BAND) / h)), hf = 2 * Math.atan(Math.tan(vf / 2) * cam.aspect);
+      return R / Math.sin(Math.min(vfe, hf) / 2) * 0.82;
+    }
+    const _a = new THREE.Vector3(), _b = new THREE.Vector3(), _up = new THREE.Vector3();
+    function fitLabels() {   // 글자 크기 고정(px) + 화면에서 너무 짧아진 치수(정면에서 깊이 등)는 숨김
+      const w = el.clientWidth || 300, h = el.clientHeight || 260, k = 2 * Math.tan(FOV * Math.PI / 360) / h;
+      for (const s of labels) s.scale.set(labelPx * s.userData.ar * k, labelPx * k, 1);
+      for (const d of dims) {
+        _a.copy(d.a).project(cam); _b.copy(d.b).project(cam);
+        const len = Math.hypot((_a.x - _b.x) * w / 2, (_a.y - _b.y) * h / 2);
+        d.s.visible = len > labelPx * d.s.userData.ar + 12; d.ln.visible = len > 16;
+      }
+    }
+    // 그리기 요청만 표시 → 다음 화면 주기에 한 번 그림. 가만히 있을 땐 20프레임마다만 다시 그림(예전엔 3개 창이 초당 60번씩 계속 그림)
+    let dirty = true, idle = 0;
+    function draw() { dirty = true; }
+    function paint() { rd.render(scene, cam); dirty = false; idle = 0; }
+    function upd() {
+      cam.position.set(target.x + dist * Math.cos(pitch) * Math.sin(yaw), target.y + dist * Math.sin(pitch),
+                       target.z + dist * Math.cos(pitch) * Math.cos(yaw));
+      cam.near = Math.max(0.5, dist * 0.01); cam.far = dist * 40; cam.updateProjectionMatrix();
+      cam.lookAt(target);
+      // 카메라를 화면 위쪽으로 BAND/2 px만큼 옮김 = 그림이 그만큼 아래로(위 범례 줄과 안 겹치게)
+      const pan = (BAND / 2) * 2 * dist * Math.tan(FOV * Math.PI / 360) / (el.clientHeight || 260);
+      cam.position.addScaledVector(_up.set(0, 1, 0).applyQuaternion(cam.quaternion), pan);
+      cam.updateMatrixWorld(); fitLabels(); draw();
+    }
     let drag = false, lx = 0, ly = 0;
     el.addEventListener('mousedown', e => { drag = true; lx = e.clientX; ly = e.clientY; });
     window.addEventListener('mouseup', () => drag = false);
     window.addEventListener('mousemove', e => { if (!drag) return;
-      yaw -= (e.clientX - lx) * 0.008; pitch += (e.clientY - ly) * 0.008;
-      pitch = Math.max(-1.4, Math.min(1.4, pitch)); lx = e.clientX; ly = e.clientY; upd(); });
+      const mx = e.clientX - lx, my = e.clientY - ly; if (!mx && !my) return;
+      anim = null; mark('');
+      yaw -= mx * 0.008; pitch += my * 0.008;
+      pitch = Math.max(-0.15, Math.min(1.54, pitch)); lx = e.clientX; ly = e.clientY; upd(); });
     el.addEventListener('wheel', e => { e.preventDefault();
-      dist *= (1 + Math.sign(e.deltaY) * 0.12); dist = Math.max(40, dist); upd(); }, { passive: false });
-    (function loop() { requestAnimationFrame(loop); rd.render(scene, cam); })();
+      dist *= (1 + Math.sign(e.deltaY) * 0.12); dist = Math.max(R * 0.5, Math.min(R * 14, dist)); upd(); }, { passive: false });
+    (function loop() {
+      requestAnimationFrame(loop);
+      if (anim) {   // 시점 버튼 → 0.42초 동안 부드럽게 이동
+        const k = Math.min(1, (performance.now() - anim.t0) / 420), es = k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
+        yaw = anim.y0 + anim.dy * es; pitch = anim.p0 + (anim.p1 - anim.p0) * es;
+        if (k >= 1) anim = null;
+        upd();
+      }
+      if (dirty || ++idle >= 20) paint();
+    })();
     return {
-      render(cont, lay, shell, deck) {
-        while (root.children.length) { const c = root.children[0]; root.remove(c); }
-        if (deck > 0) root.add(ipsuPalletMesh(cont.W, cont.D, deck));   // 실물형 팔레트(격자+다리)
+      // cont = 내부 공간, shell = 2차파우치 셸, deck = 팔레트 높이,
+      // opt = { wall: 벽 두께(외박스 — 치수는 외치수), loadH·limitH: 팔레트 적재 높이·최대 적재높이, legend: [{ c|k, t }] }
+      render(cont, lay, shell, deck, opt) {
+        opt = opt || {};
+        while (root.children.length) { const c = root.children[0]; root.remove(c); ipsuDispose(c); }
+        dims = []; labels = [];
+        const V = (x, y, z) => new THREE.Vector3(x, y, z), fmt = v => Math.round(v).toLocaleString();
+        const W = cont.W, H = cont.H, D = cont.D, wall = opt.wall || 0, pal = deck > 0;
+        // 치수 기준 상자: 2차파우치 = 셸 크기, 팔레트 = 바닥~적재 높이, 그 밖 = 용기 바깥(벽 두께 포함)
+        let b;
         if (shell) {
-          // 2차파우치 셸 — 프로스트 글래스 느낌
-          root.add(new THREE.Mesh(shell, new THREE.MeshStandardMaterial({
-            color: 0xe9e4d9, roughness: 0.62, metalness: 0.10,
-            transparent: true, opacity: 0.10, side: THREE.DoubleSide, depthWrite: false })));
-          root.add(new THREE.LineSegments(new THREE.EdgesGeometry(shell),
-            new THREE.LineBasicMaterial({ color: 0xbcae95, transparent: true, opacity: 0.34 })));
+          shell.computeBoundingBox(); const s = shell.boundingBox;
+          b = { x0: s.min.x, x1: s.max.x, y0: s.min.y, y1: s.max.y, z0: s.min.z, z1: s.max.z };
+        } else if (pal) b = { x0: 0, x1: W, y0: -deck, y1: Math.max(1, opt.loadH || 0), z0: 0, z1: D };
+        else b = { x0: -wall, x1: W + wall, y0: -wall, y1: H + wall, z0: -wall, z1: D + wall };
+        // 화면 맞춤 높이: 용기·최대 적재높이·(용량 초과로 위로 쌓인) 내용물 중 가장 높은 것
+        const floorY = b.y0, topY = Math.max(b.y1, opt.limitH || 0, (lay && lay.used && lay.used.H) || 0);
+        const Ro = Math.max(5, 0.5 * Math.hypot(b.x1 - b.x0, topY - floorY, b.z1 - b.z0));
+        const mg = Ro * 0.16, fx0 = b.x0 - mg, fx1 = b.x1 + mg, fz1 = b.z1 + mg;   // 치수선 자리(왼쪽·앞·오른쪽)
+        target.set((fx0 + fx1) / 2, (floorY + topY) / 2, (b.z0 + fz1) / 2);
+        R = Math.max(5, 0.5 * Math.hypot(fx1 - fx0, topY - floorY, fz1 - b.z0));
+
+        // 바닥: 옅은 격자 + 그림자 받는 면
+        const S0 = Ro * 9, step = ipsuNiceStep(S0 / 34), cells = Math.max(10, 2 * Math.round(S0 / step / 2)), Sg = cells * step;
+        const gx = Math.round((b.x0 + b.x1) / 2 / step) * step, gz = Math.round((b.z0 + b.z1) / 2 / step) * step;
+        const gridM = new THREE.Mesh(new THREE.PlaneGeometry(Sg, Sg), new THREE.MeshBasicMaterial({
+          map: ipsuGridTex(cells, Math.round((gx - Sg / 2) / step), Math.round((gz - Sg / 2) / step)),
+          transparent: true, depthWrite: false, toneMapped: false }));
+        gridM.rotation.x = -Math.PI / 2; gridM.position.set(gx, floorY - 0.8, gz); gridM.renderOrder = -2; root.add(gridM);
+        const shadowM = new THREE.Mesh(new THREE.PlaneGeometry(Sg, Sg), new THREE.ShadowMaterial({ opacity: 0.16, depthWrite: false }));
+        shadowM.rotation.x = -Math.PI / 2; shadowM.position.set(gx, floorY - 0.5, gz);
+        shadowM.receiveShadow = true; shadowM.renderOrder = -1; root.add(shadowM);
+
+        // 용기: 2차파우치 = 투명 필름 / 외박스·단상자 = 잘라 본 모습(안쪽 벽만, 크래프트·흰 판지) + 모서리 선 / 팔레트 = 실물형
+        if (shell) {
+          const sm = new THREE.Mesh(shell, ipsuFilmMat()); sm.renderOrder = 4; root.add(sm);
+        } else if (pal) {
+          const pm = ipsuPalletMesh(W, D, deck);
+          pm.traverse(n => { if (n.isMesh) { n.castShadow = true; n.receiveShadow = true; } });
+          root.add(pm);
         } else {
-          const e = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(cont.W, cont.H, cont.D)),
-            new THREE.LineBasicMaterial({ color: 0x7c7a86, transparent: true, opacity: 0.75 }));
-          e.position.set(cont.W / 2, cont.H / 2, cont.D / 2); root.add(e);
+          const g = new THREE.BoxGeometry(b.x1 - b.x0, b.y1 - b.y0, b.z1 - b.z0);
+          g.translate((b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2, (b.z0 + b.z1) / 2);
+          const inner = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: ipsuLin(wall ? IPSU_C.kraftIn : IPSU_C.boardIn),
+            roughness: 0.95, metalness: 0, side: THREE.BackSide }));
+          inner.receiveShadow = true; root.add(inner);
+          root.add(new THREE.LineSegments(new THREE.EdgesGeometry(g),
+            new THREE.LineBasicMaterial({ color: ipsuLin(wall ? 0x6e5f42 : 0x5c5a53), toneMapped: false })));
         }
-        // 박스: 무광 크래프트 골판지(현행 유지) / 파우치: 군고구마 속살 앰버
-        // 박스: 크래프트 골판지 / 파우치: 군고구마 앰버 + eatus 로고 텍스처
-        const tex = lay.isBox ? null : ipsuPouchTexture();
-        const m1 = lay.isBox
-          ? new THREE.MeshStandardMaterial({ color: 0xbfa877, roughness: 0.82, metalness: 0.03, side: THREE.DoubleSide })
-          : new THREE.MeshStandardMaterial({ map: tex, color: 0xffffff, roughness: 0.72, metalness: 0.04, side: THREE.DoubleSide });
-        const m2 = lay.isBox
-          ? new THREE.MeshStandardMaterial({ color: 0x9c855c, roughness: 0.85, metalness: 0.03, side: THREE.DoubleSide })
-          : new THREE.MeshStandardMaterial({ map: tex, color: 0xbb8a6e, roughness: 0.76, metalness: 0.04, side: THREE.DoubleSide });
+
+        // 내용물: 파우치 = 앰버 + eatus 로고·필름 광택 살짝 / 상자 = 단상자 앰버·외박스 크래프트 + 한 상자씩 윤곽선
+        const isBox = !!lay.isBox, outer = !!lay.outer;
+        let m1, m2, edgeMat = null;
+        if (isBox) {
+          m1 = m2 = new THREE.MeshStandardMaterial({ color: outer ? ipsuLin(IPSU_C.kraft) : IPSU_C.amber, roughness: outer ? 0.88 : 0.62, metalness: 0 });
+          edgeMat = new THREE.LineBasicMaterial({ color: ipsuLin(outer ? IPSU_C.kraftEdge : 0x9a4a12), transparent: true, opacity: 0.9, toneMapped: false });
+        } else {
+          const tex = ipsuPouchTexture();
+          m1 = new THREE.MeshPhysicalMaterial({ map: tex, color: 0xffffff, roughness: 0.62, metalness: 0,
+            clearcoat: 0.3, clearcoatRoughness: 0.42, side: THREE.DoubleSide });
+          m2 = new THREE.MeshPhysicalMaterial({ map: tex, color: 0xbb8a6e, roughness: 0.66, metalness: 0,
+            clearcoat: 0.3, clearcoatRoughness: 0.42, side: THREE.DoubleSide });
+        }
+        const edgeG = {};
         for (const it of lay.items) {
           const gk = it.gk || (it.flip ? 'f' : 'n');
           const gm = (lay.geoms && lay.geoms[gk]) || (it.flip ? lay.geomFlip : lay.geom);
           const mesh = new THREE.Mesh(gm, gk.indexOf('f') >= 0 ? m2 : m1);
-          mesh.position.set(it.x, it.y, it.z); root.add(mesh);
+          mesh.position.set(it.x, it.y, it.z); mesh.castShadow = true; mesh.receiveShadow = true;
+          if (edgeMat) { if (!edgeG[gk]) edgeG[gk] = new THREE.EdgesGeometry(gm); mesh.add(new THREE.LineSegments(edgeG[gk], edgeMat)); }
+          root.add(mesh);
         }
-        target.set(cont.W / 2, cont.H / 2, cont.D / 2);
-        dist = Math.max(cont.W, cont.H, cont.D) * 1.9; upd();
+
+        // 치수선: 폭(앞 아래)·깊이(오른쪽 아래)·높이(왼쪽 앞). 팔레트 높이는 적재 높이(팔레트 위~맨 위 단)
+        ipsuDim(root, V(b.x0, b.y0, b.z1), V(b.x1, b.y0, b.z1), V(0, 0, 1), Ro, fmt(b.x1 - b.x0), dims);
+        ipsuDim(root, V(b.x1, b.y0, b.z0), V(b.x1, b.y0, b.z1), V(1, 0, 0), Ro, fmt(b.z1 - b.z0), dims);
+        const hy0 = pal ? 0 : b.y0;
+        if (b.y1 - hy0 > 1) ipsuDim(root, V(b.x0, hy0, b.z1), V(b.x0, b.y1, b.z1), V(-1, 0, 0), Ro, fmt(b.y1 - hy0), dims);
+        dims.forEach(d => labels.push(d.s));
+        // 팔레트 최대 적재높이: 네 귀퉁이 회색 점선 + 높이 면 빨강 점선·옅은 면 + '최대 N' 글자
+        if (pal && opt.limitH > 0) {
+          const y = opt.limitH, vv = [], rr = [];
+          [[0, 0], [W, 0], [W, D], [0, D]].forEach(q => vv.push(q[0], 0, q[1], q[0], y, q[1]));
+          [[0, 0, W, 0], [W, 0, W, D], [W, D, 0, D], [0, D, 0, 0]].forEach(q => rr.push(q[0], y, q[1], q[2], y, q[3]));
+          rr.push(0, y, D, -Ro * 0.11, y, D);   // 높이 치수선 위로 끌어낸 선 → 그 끝에 '최대 N' 글자
+          root.add(ipsuDashed(vv, 0x9a988f, Ro, 0.8));
+          root.add(ipsuDashed(rr, 0xd03b3b, Ro, 1));
+          const pl = new THREE.Mesh(new THREE.PlaneGeometry(W, D), new THREE.MeshBasicMaterial({ color: ipsuLin(0xd03b3b),
+            transparent: true, opacity: 0.05, side: THREE.DoubleSide, depthWrite: false, toneMapped: false }));
+          pl.rotation.x = -Math.PI / 2; pl.position.set(W / 2, y, D / 2); root.add(pl);
+          const ls = ipsuLabelSprite('최대 ' + fmt(y), true);
+          ls.position.set(-Ro * 0.11, y, D); root.add(ls); labels.push(ls);
+        }
+        // 범례
+        leg.innerHTML = (opt.legend || []).map(x => '<span><i' + (x.k ? ' class="' + x.k + '"' : '')
+          + (x.c ? ' style="background:' + x.c + '"' : '') + '></i>' + escapeHtml(x.t) + '</span>').join('')
+          + '<span class="u">단위 mm</span>';
+        // 조명·그림자 범위를 이번 크기에 맞춤
+        key.position.copy(target).addScaledVector(V(-0.4, 1.5, 0.55).normalize(), R * 3);   // 높은 주광 = 그림자가 짧고 단정
+        key.target.position.copy(target); key.target.updateMatrixWorld();
+        const sc = key.shadow.camera;
+        sc.left = -R * 1.3; sc.right = R * 1.3; sc.top = R * 1.3; sc.bottom = -R * 1.3; sc.near = R * 0.3; sc.far = R * 6;
+        sc.updateProjectionMatrix();
+        key.shadow.normalBias = Ro * 0.004;
+        fill.position.copy(target).addScaledVector(V(1, 0.35, 0.2).normalize(), R * 3);
+        rim.position.copy(target).addScaledVector(V(-0.3, 0.75, -1).normalize(), R * 3);
+        rd.shadowMap.needsUpdate = true;
+        dist = fitDist(); upd();
       },
-      resize() { rd.setSize(el.clientWidth, el.clientHeight);
-        cam.aspect = el.clientWidth / el.clientHeight; cam.updateProjectionMatrix(); draw(); }
+      resize() {
+        const w = el.clientWidth, h = el.clientHeight; if (!w || !h) return;
+        rd.setSize(w, h); cam.aspect = w / h;
+        labelPx = Math.max(17, Math.min(24, h * 0.066));
+        dist = fitDist(); upd();
+      }
     };
   }
   function ipsuInitViewers() {
@@ -25041,7 +25389,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       '🚛 팔레트 적재 (외박스)'];
     document.getElementById('ipsu-zoom-title').textContent = titles[n];
     const badge = document.getElementById(['', 'ipsu-s1badge', 'ipsu-s2badge', 'ipsu-s3badge'][n]);
-    document.getElementById('ipsu-zoom-sub').textContent = badge ? badge.textContent : '';
+    document.getElementById('ipsu-zoom-sub').textContent = badge ? (badge.dataset.raw || badge.textContent) : '';
     document.getElementById('ipsu-zoom-holder').appendChild(cv);
     document.getElementById('ipsu-zoom').classList.add('show');
     viewer.resize();
@@ -25285,20 +25633,21 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
                          gk: b.rot ? 's' : 'n' });
           }
     }
-    _ipsuV3.render({ W: area.W, H: Math.max(area.H, layers * bh), D: area.D },
-      { items, geoms, geom: geoms.n, isBox: true }, null, 150);   // 팔레트 위는 외박스
+    const useH = layers * bh;
+    _ipsuV3.render({ W: area.W, H: Math.max(area.H, useH), D: area.D },
+      { items, geoms, geom: geoms.n, isBox: true, outer: true }, null, 150,   // 팔레트 위는 외박스(크래프트)
+      { loadH: useH, limitH: P.H, legend: [{ c: IPSU_SW.kraft, t: '외박스' }, { c: IPSU_SW.olive, t: '팔레트' }, { k: 'limit', t: '최대 적재높이' }] });
 
     document.getElementById('ipsu-s3cnt').textContent = total;
     const mix = blocks.length > 1
       ? ` · 혼합방향(${blocks.map(b => b.cols + '×' + b.rows + (b.rot ? '↻' : '')).join('+')})` : ' · 한 방향';
-    const useH = layers * bh;
     const fixed = fixedN > 0 && total === fixedN;
-    document.getElementById('ipsu-s3badge').textContent =
+    ipsuBadge('ipsu-s3badge',
       total > 0 ? (fixed ? '지정 적재량 · ' : '') + `${plan.count}박스/단 × ${layers}단` + (topN ? `(맨 위 ${topN})` : '') + ` = ${total}박스${mix}`
                 + ` · 높이 ${useH}/${P.H}mm` + (useH > P.H ? ' ⚠ 최대 적재높이 초과 — 외박스 규격(BOM) 또는 PT적재량 확인' : '')
                 + (fixed ? ` · 원칙(${P.H}mm) 최대 ${maxTotal}박스` : '') + ` · 박스외치수 ${bw}×${bd}×${bh}`
                 + (perBoxTotal ? ` · 파우치 총 ${(total * perBoxTotal).toLocaleString()}개` : '')
-                : '팔레트에 올라가지 않음 (박스 외치수 확인)';
+                : '팔레트에 올라가지 않음 (박스 외치수 확인)');
     // Monday PT적재량(거래처 지정 포함)과 원칙 계산 대조
     const el = document.getElementById('ipsu-pt');
     // ⓪ 완제품 선택이 우선, 없으면 '박스입수 조회'로 고른 것
@@ -25583,10 +25932,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       }
       ipsuShowEst(estInfo);
       const compTagD = compD > 0 ? ` · 눌림 ${Math.round(compD * 100)}%` + (compD > comp ? '(자동)' : '') : '';
-      _ipsuV2.render(C, layD, null);
+      _ipsuV2.render(C, layD, null, 0, { wall: IPSU_WALL,
+        legend: [{ c: IPSU_SW.amber, t: '1차파우치' }, { c: IPSU_SW.kraft, t: '외박스' }] });
       document.getElementById('ipsu-s2cnt').textContent = n2v;
-      document.getElementById('ipsu-s2badge').textContent =
-        layD.label + tag + compTagD + ipsuStats(layD, C, n2v);
+      ipsuBadge('ipsu-s2badge', layD.label + tag + compTagD + ipsuStats(layD, C, n2v));
       document.getElementById('ipsu-eq').textContent = '내부용기 없음 · 직행';
       document.getElementById('ipsu-total').innerHTML =
         n2v.toLocaleString() + ' <span style="font-size:13px;font-weight:600">개</span>';
@@ -25675,18 +26024,20 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       }
     }
 
-    _ipsuV1.render(Binner, lay1, Bshell);
-    _ipsuV2.render(C, lay2, null);
+    _ipsuV1.render(Binner, lay1, Bshell, 0, { legend: Bshell
+      ? [{ c: IPSU_SW.amber, t: '1차파우치' }, { k: 'film', t: '2차파우치(투명)' }]
+      : [{ c: IPSU_SW.amber, t: '1차파우치' }, { k: 'board', t: '단상자 내부' }] });
+    _ipsuV2.render(C, lay2, null, 0, { wall: IPSU_WALL,
+      legend: [{ c: IPSU_SW.amber, t: bForm === '단상자' ? '단상자' : '2차파우치' }, { c: IPSU_SW.kraft, t: '외박스' }] });
     const c1 = n1v, c2 = n2v;
     document.getElementById('ipsu-s1cnt').textContent = c1;
     document.getElementById('ipsu-s2cnt').textContent = c2;
     const compTag1 = comp1 > 0 ? ` · 눌림 ${Math.round(comp1 * 100)}%` + (comp1 > comp ? '(자동)' : '') : '';
-    document.getElementById('ipsu-s1badge').textContent =
-      lay1.label + tag1 + note1 + compTag1 + ipsuStats(lay1, Binner, c1);
+    ipsuBadge('ipsu-s1badge', lay1.label + tag1 + note1 + compTag1 + ipsuStats(lay1, Binner, c1));
     const compTag2 = comp2 > 0 ? ` · 눌림 ${Math.round(comp2 * 100)}%` + (comp2 > comp ? '(자동)' : '') : '';
-    document.getElementById('ipsu-s2badge').textContent =
+    ipsuBadge('ipsu-s2badge',
       lay2.label + (!GRID && n2auto && !n2est ? autoTag + (af2 ? af2.note : '') : note2)
-      + (bForm === '단상자' ? '' : compTag2) + ipsuStats(lay2, C, c2);
+      + (bForm === '단상자' ? '' : compTag2) + ipsuStats(lay2, C, c2));
     ipsuShowEst(estInfo);   // 단상자는 강체라 압축 없음
     document.getElementById('ipsu-eq').textContent = `${c1} × ${c2} =`;
     document.getElementById('ipsu-total').innerHTML =
