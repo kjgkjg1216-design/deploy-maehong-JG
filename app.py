@@ -9460,9 +9460,39 @@ def _report_data(ym):
     with app.test_request_context('/api/data_health'):
         health = api_data_health().get_json()
 
+    # ── 2026-11-18 추가 (사용자 "월간 리포트에 추가로 붙일 자료가 있으면") ──
+    # 그달 기준: 제품 매출 TOP 10·채널별 매출(판매 API) / 발주·입고 거래처 TOP 5 + 주요 품목(대시보드 TOP 10 창과 같은 계산)
+    #           / 입고 일정 준수(Monday 입고 완료 기록)
+    # 생성 시점 기준: 재고·수급·거래처 현황 — 지난 달·이번 달 리포트에만(과거 월엔 그때 값이 남아 있지 않아 오해 소지)
+    extra = {'sales_top': [], 'sales_count': 0, 'ch_sales': [], 'po_vendor_top5': [], 'rcv_vendor_top5': [],
+             'receipts': {}, 'snap': None}
+    try:
+        sd = _call_json(api_sales_detail, f'/api/sales_detail?ym={ymd}')
+        extra['sales_top'], extra['sales_count'] = sd.get('items', []), sd.get('count', 0)
+        if SALES_DAILY_DF is not None and not SALES_DAILY_DF.empty:
+            sdf = SALES_DAILY_DF
+            sm = sdf[(sdf['date'].astype(str).str[:7] == ymd) & (sdf['amt'] > 0)]
+            if len(sm):
+                g = sm.groupby('channel_name')['amt'].sum().sort_values(ascending=False)
+                extra['ch_sales'] = [{'name': str(k), 'amt': int(v)} for k, v in g.items()]
+    except Exception as e:
+        print(f'[월간 리포트] 매출 상세 실패: {e}')
+    try:
+        od = _call_json(api_order_receipt_detail, f'/api/order_receipt_detail?ym={ym}')
+        extra['po_vendor_top5'], extra['rcv_vendor_top5'] = od.get('order', [])[:5], od.get('receipt', [])[:5]
+    except Exception as e:
+        print(f'[월간 리포트] 거래처 TOP 실패: {e}')
+    try:
+        extra['receipts'] = _report_receipts(ym)
+    except Exception as e:
+        print(f'[월간 리포트] 입고 준수 실패: {e}')
+    if ym >= _ym_shift(datetime.now().strftime('%Y%m'), -1):
+        extra['snap'] = _report_snapshot()
+
     def _pct(a, b):
         return round((a - b) / b * 100, 1) if b else None
     return {
+        **extra,
         'ym': ym, 'ymd': ymd, 'prev': prevd,
         'sales_monday': {'cur': mon_cur.get('amount', 0) or 0, 'prev': mon_prev.get('amount', 0) or 0,
                          'pct': _pct(mon_cur.get('amount', 0) or 0, mon_prev.get('amount', 0) or 0)},
@@ -9480,6 +9510,107 @@ def _report_data(ym):
     }
 
 
+def _report_receipts(ym):
+    """그달 Monday 입고 완료 기록 — 구분별 건수·요청 입고일 준수율·지연 목록 (2026-11-18 월간 리포트).
+    부자재 = '원/부자재 발주 요청' 입고 완료(자사/외주) 입고일 vs 입고 요청일
+    외주 생산 = '외주 생산 요청' 출고 완료 외주 출고일 vs 요청 입고일 / 원료·수입 원료 = 건수만(요청일 칸 없음)."""
+    ymd = _ym_dash(ym)
+    out = {'kinds': [], 'late': [], 'total': 0, 'rate': None, 'with_req': 0}
+    if MONDAY_DF is None or MONDAY_DF.empty:
+        return out
+    sv = lambda r, c: '' if str(r.get(c, '') or '').strip().lower() in ('', 'nan', 'none') else str(r.get(c, '')).strip()
+    d10 = lambda s: s[:10] if re.match(r'^\d{4}-\d{2}-\d{2}', s or '') else ''
+    recs = []
+
+    def add(kind, done, req, code, name, who):
+        if done[:7] != ymd:
+            return
+        delay = None
+        if req:
+            try:
+                delay = (datetime.strptime(done, '%Y-%m-%d') - datetime.strptime(req, '%Y-%m-%d')).days
+            except Exception:
+                delay = None
+        recs.append({'kind': kind, 'done': done, 'req': req, 'delay': delay, 'code': code, 'name': name, 'who': who})
+
+    m = (MONDAY_DF['보드명'] == '원/부자재 발주 요청') & MONDAY_DF['그룹'].astype(str).str.startswith('입고 완료')
+    for _, r in MONDAY_DF.loc[m].iterrows():
+        vend, dest = sv(r, '발주업체'), sv(r, '입고처')
+        add('부자재 · 자사 입고' if '자사' in sv(r, '그룹') else '부자재 · 외주처 입고', d10(sv(r, '입고일')), d10(sv(r, '입고 요청일')),
+            sv(r, '아이템명') or sv(r, '품번'), sv(r, '품명'), (vend + ' → ' if vend else '') + dest)
+    m = (MONDAY_DF['보드명'] == '외주 생산 요청') & (MONDAY_DF['그룹'] == '출고 완료')
+    if m.any():
+        makers = _os_maker_map()
+        for _, r in MONDAY_DF.loc[m].iterrows():
+            code = sv(r, '아이템명')
+            mk = makers.get(code.upper(), '')
+            add('외주 생산', d10(sv(r, '외주 출고일')), d10(sv(r, '요청 입고일')), code, sv(r, '품명'),
+                (_co_short(mk) + ' → ' if mk else '') + sv(r, '요청 입고지')[:24])
+    m = (MONDAY_DF['보드명'] == '원료 입고 일정') & (MONDAY_DF['그룹'] == '입고완료')
+    for _, r in MONDAY_DF.loc[m].iterrows():
+        add('원료', d10(sv(r, '실제 입고일')) or d10(sv(r, '입항 일정')), '', '', sv(r, '아이템명'), sv(r, '수입원'))
+    m = (MONDAY_DF['보드명'] == '원재료 수입 현황_하위') & (MONDAY_DF['그룹'] == '입고 완료')
+    for _, r in MONDAY_DF.loc[m].iterrows():
+        add('수입 원료', d10(sv(r, '입항일')), '', sv(r, '계약번호'), sv(r, '아이템명'), sv(r, '수입원'))
+    for k in ('부자재 · 자사 입고', '부자재 · 외주처 입고', '외주 생산', '원료', '수입 원료'):
+        rs = [x for x in recs if x['kind'] == k]
+        if not rs:
+            continue
+        wr = [x for x in rs if x['delay'] is not None]
+        late = [x for x in wr if x['delay'] > 0]
+        out['kinds'].append({'kind': k, 'n': len(rs), 'with_req': len(wr), 'ontime': len(wr) - len(late), 'late': len(late),
+                             'rate': round((len(wr) - len(late)) / len(wr) * 100) if wr else None,
+                             'late_avg': round(sum(x['delay'] for x in late) / len(late), 1) if late else 0})
+    wr_all = [x for x in recs if x['delay'] is not None]
+    out['total'], out['with_req'] = len(recs), len(wr_all)
+    out['rate'] = round(sum(1 for x in wr_all if x['delay'] <= 0) / len(wr_all) * 100) if wr_all else None
+    out['late'] = sorted([x for x in recs if x['delay'] and x['delay'] > 0], key=lambda x: -x['delay'])[:8]
+    return out
+
+
+def _report_snapshot():
+    """리포트 생성 시점의 재고·수급·거래처 현황 (2026-11-18 월간 리포트). 항목마다 따로 실패해도 나머지는 나오게."""
+    from collections import Counter
+    snap = {'at': datetime.now().strftime('%Y-%m-%d %H:%M')}
+    try:
+        for sc in ('jasa', 'outsource'):
+            items = _stock_alert_items(sc)
+            outs = sorted([x for x in items if x.get('level') == 'out'], key=lambda x: -(x.get('monthly_avg') or 0))
+            snap['stock_' + sc] = {'n': len(items), 'c': dict(Counter(x.get('level') for x in items)),
+                                   'top': [x.get('name', '')[:30] for x in outs[:3]]}
+    except Exception as e:
+        print(f'[월간 리포트] 재고 경고 실패: {e}')
+    try:
+        ch = _call_json(api_channel_stock, '/api/channel_stock')
+        it = ch.get('items', [])
+        snap['channel'] = {'n': len(it), 'c': dict(Counter(x.get('level') for x in it)),
+                           'top': [(x.get('name', '')[:24] + ' · ' + x.get('channel_name', '')) for x in it[:3]]}
+    except Exception as e:
+        print(f'[월간 리포트] 채널 품절 실패: {e}')
+    try:
+        sp = _call_json(api_supply_plan, '/api/supply_plan')
+        it = sp.get('items', [])
+        snap['plan'] = {'n': len(it), 'c': dict(Counter(x.get('level') for x in it)),
+                        'top': [(x.get('name') or x.get('code', ''))[:30] for x in it if x.get('level') == 'out'][:3]}
+    except Exception as e:
+        print(f'[월간 리포트] 수급 플래너 실패: {e}')
+    try:
+        ex = _call_json(api_excess_materials, '/api/excess_materials')
+        s = ex.get('summary', {})
+        top = [x for x in ex.get('items', []) if x.get('status') in ('dead', 'over12', 'over6')][:3]
+        snap['excess'] = {'excess': s.get('excess', {}), 'long': s.get('long', {}), 'by': s.get('by', {}),
+                          'top': [(x.get('name') or x.get('code', ''))[:30] for x in top]}
+    except Exception as e:
+        print(f'[월간 리포트] 과잉·장기 실패: {e}')
+    try:
+        vs = _call_json(api_vendor_scorecard, '/api/vendor_scorecard')
+        snap['vendors'] = sorted(vs.get('items', []), key=lambda x: -(x.get('amt') or 0))[:8]
+        snap['vendors_since'] = vs.get('since', '')
+    except Exception as e:
+        print(f'[월간 리포트] 거래처 평가 실패: {e}')
+    return snap
+
+
 _REPORT_CSS = """
 <style>
  body{font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif;background:#f4f5f7;color:#1e293b;margin:0}
@@ -9492,7 +9623,7 @@ _REPORT_CSS = """
  .kpi .d{font-size:11px;margin-top:3px;font-weight:700} .up{color:#dc2626} .down{color:#2563eb} .flat{color:#64748b}
  h2{font-size:14px;margin:22px 0 8px;padding-bottom:6px;border-bottom:2px solid #e2e8f0}
  table{width:100%;border-collapse:collapse;font-size:12px} th{background:#f8fafc;color:#475569;font-weight:700;text-align:left;padding:6px 8px;border-bottom:1px solid #e2e8f0}
- td{padding:6px 8px;border-bottom:1px solid #f1f5f9} .num{text-align:right;font-variant-numeric:tabular-nums}
+ td{padding:6px 8px;border-bottom:1px solid #f1f5f9} .num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:20px}
  .bar{display:flex;align-items:center;gap:8px;font-size:11px;margin:3px 0} .bar .lb{width:58px;color:#64748b}
  .bar .b{height:12px;border-radius:3px;background:#6366f1} .bar .b2{height:12px;border-radius:3px;background:#f59e0b}
@@ -9500,7 +9631,17 @@ _REPORT_CSS = """
  .note{font-size:11px;color:#94a3b8;margin-top:24px}
  .badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700}
  .ok{background:#f0fdf4;color:#16a34a} .warn{background:#fefce8;color:#ca8a04} .err{background:#fef2f2;color:#dc2626}
- @media print{body{background:#fff} .page{padding:0} .nav{display:none} .kpis{grid-template-columns:repeat(4,1fr)}}
+ /* 2026-11-18 추가 구역 */
+ h3{font-size:12px;margin:10px 0 6px;color:#475569}
+ .vrow{padding:6px 0 7px;border-bottom:1px solid #f1f5f9} .vrow .vh{display:flex;justify-content:space-between;font-size:12px;font-weight:700}
+ .vrow .vh .rk{color:#94a3b8;margin-right:6px} .vrow .it{display:grid;grid-template-columns:48px 1fr auto 56px;gap:8px;font-size:10.5px;color:#64748b;padding:1px 0 0 18px}
+ .vrow .it .q,.vrow .it .a{text-align:right;font-variant-numeric:tabular-nums} .vrow .it .a{color:#334155;font-weight:700}
+ .vrow .more{font-size:10px;color:#94a3b8;padding:1px 0 0 18px}
+ .shr{display:inline-block;height:8px;border-radius:2px;background:#2a78d6;vertical-align:0;margin-right:6px}
+ .chips span{display:inline-block;margin:1px 6px 1px 0;font-size:11px;white-space:nowrap} .chips i{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:4px}
+ .muted{color:#94a3b8} .snapnote{font-size:11px;color:#64748b;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:6px 10px;margin:4px 0 8px}
+ .late{color:#dc2626;font-weight:700}
+ @media print{body{background:#fff} .page{padding:0} .nav{display:none} .kpis{grid-template-columns:repeat(4,1fr)} .vrow,.grid2>div{break-inside:avoid}}
 </style>"""
 
 
@@ -9511,6 +9652,149 @@ def _fmt_won(v):
     if abs(v) >= 10_000:
         return f'{v/10_000:,.0f}만'
     return f'{v:,}'
+
+
+# ── 월간 리포트 추가 구역 (2026-11-18) ──
+def _report_kpi_receipts(rc):
+    n = rc.get('total', 0)
+    if not n:
+        return ('<div class="kpi"><div class="l">입고 완료 (Monday)</div><div class="v" style="color:#94a3b8">없음</div>'
+                '<span class="d flat">해당 월 입고 완료 기록 없음</span></div>')
+    rate = rc.get('rate')
+    col = '#64748b' if rate is None else ('#16a34a' if rate >= 80 else ('#ca8a04' if rate >= 60 else '#dc2626'))
+    sub = f'요청일 준수 {rate}% ({rc.get("with_req", 0)}건 중)' if rate is not None else '요청일 자료 없음'
+    return f'<div class="kpi"><div class="l">입고 완료 (Monday)</div><div class="v">{n:,}건</div><span class="d" style="color:{col}">{sub}</span></div>'
+
+
+def _report_sales_html(d, esc):
+    top, chs = d.get('sales_top') or [], d.get('ch_sales') or []
+    if not top and not chs:
+        return ''
+    tot = sum(x['amt'] for x in chs) or 1
+    mx = max([x['amt'] for x in chs] + [1])
+    h = ['<div class="grid2"><div><h2>제품 매출 TOP 10</h2><table><tr><th>제품</th><th>채널</th><th class="num">매출액</th></tr>']
+    for x in top:
+        nm, ch = esc((x.get('name') or '')[:30]), esc((x.get('div') or '')[:18])
+        h.append(f'<tr><td>{nm}</td><td class="muted" style="font-size:10.5px">{ch}</td><td class="num">{_fmt_won(x.get("amount", 0))}</td></tr>')
+    if not top:
+        h.append('<tr><td colspan=3 class="muted">없음</td></tr>')
+    h.append(f'</table><div class="muted" style="font-size:10.5px;margin-top:4px">판매 제품 {d.get("sales_count", 0)}종 중 상위 10</div></div>')
+    h.append('<div><h2>채널별 매출</h2><table><tr><th>채널</th><th class="num">매출액</th><th class="num">비중</th></tr>')
+    for x in chs:
+        w = x['amt'] / mx * 70
+        h.append(f'<tr><td><span class="shr" style="width:{w:.0f}px"></span>{esc(x["name"])}</td><td class="num">{_fmt_won(x["amt"])}</td>'
+                 f'<td class="num">{x["amt"] / tot * 100:.1f}%</td></tr>')
+    if not chs:
+        h.append('<tr><td colspan=3 class="muted">없음</td></tr>')
+    h.append('</table></div></div>')
+    return ''.join(h)
+
+
+def _report_vendor_html(d, esc):
+    po, rv = d.get('po_vendor_top5') or [], d.get('rcv_vendor_top5') or []
+    if not po and not rv:
+        return ''
+
+    def col(title, rows):
+        h = [f'<div><h3>{title}</h3>']
+        if not rows:
+            h.append('<div class="muted" style="font-size:12px">없음</div>')
+        for i, v in enumerate(rows, 1):
+            h.append(f'<div class="vrow"><div class="vh"><span><span class="rk">{i}</span>{esc(v.get("name", ""))}</span>'
+                     f'<span>{_fmt_won(v.get("amount", 0))}원</span></div>')
+            for p in v.get('items', []):
+                q = p.get('qty') or 0
+                qs = f'{q:,.0f}' if abs(q - round(q)) < 1e-9 else f'{q:,.2f}'
+                code, nm, unit = esc(p.get('code') or ''), esc((p.get('name') or '')[:26]), esc(p.get('unit') or '')
+                h.append(f'<div class="it"><span>{code}</span><span>{nm}</span><span class="q">{qs} {unit}</span>'
+                         f'<span class="a">{_fmt_won(p.get("amount", 0))}</span></div>')
+            more = (v.get('n_items') or 0) - len(v.get('items', []))
+            if more > 0:
+                h.append(f'<div class="more">외 {more}품목</div>')
+            h.append('</div>')
+        h.append('</div>')
+        return ''.join(h)
+    return '<h2>발주·입고 거래처 TOP 5 · 주요 품목 (금액 큰 순 3개)</h2><div class="grid2">' + col('📦 발주', po) + col('📥 입고', rv) + '</div>'
+
+
+def _report_receipts_html(rc, esc):
+    head = '<h2>입고 요청일 준수 (Monday 입고 완료)</h2>'
+    if not rc.get('kinds'):
+        return head + '<div class="muted" style="font-size:12px">해당 월 입고 완료 기록 없음</div>'
+    h = [head, '<table><tr><th>구분</th><th class="num">입고</th><th class="num">준수율</th><th class="num">지연 (평균)</th></tr>']
+    for k in rc['kinds']:
+        r = k['rate']
+        rate = '-' if r is None else f'{r}%'
+        st = '' if r is None else ' style="font-weight:700;color:' + ('#16a34a' if r >= 80 else ('#ca8a04' if r >= 60 else '#dc2626')) + '"'
+        late = f'{k["late"]}건 ({k["late_avg"]}일)' if k.get('late') else ('-' if r is None else '0')
+        h.append(f'<tr><td>{esc(k["kind"])}</td><td class="num">{k["n"]}건</td><td class="num"{st}>{rate}</td><td class="num">{late}</td></tr>')
+    h.append('</table><div class="muted" style="font-size:10.5px;margin-top:4px">준수 = 요청 입고일 이내 입고 · 원료·수입은 요청일 칸이 없어 건수만</div>')
+    return ''.join(h)
+
+
+def _report_late_html(rc, esc):
+    late = rc.get('late') or []
+    if not late:
+        return ''
+    h = ['<h2>입고 지연 TOP (요청일보다 늦은 순)</h2><table><tr><th>구분</th><th>품번</th><th>품명</th><th>업체 → 입고처</th>'
+         '<th class="num">요청일</th><th class="num">입고일</th><th class="num">지연</th></tr>']
+    for x in late:
+        nm, who = esc((x.get('name') or '')[:24]), esc((x.get('who') or '')[:30])
+        h.append(f'<tr><td style="font-size:11px">{esc(x["kind"])}</td><td>{esc(x["code"])}</td><td>{nm}</td><td style="font-size:11px">{who}</td>'
+                 f'<td class="num">{x["req"][5:]}</td><td class="num">{x["done"][5:]}</td><td class="num late">+{x["delay"]}일</td></tr>')
+    h.append('</table>')
+    return ''.join(h)
+
+
+def _report_snapshot_html(snap, esc):
+    if not snap:
+        return ''
+    LVC = {'out': '#dc2626', 'critical': '#ea580c', 'warning': '#ca8a04', 'low': '#16a34a', 'ok': '#9ca3af'}
+
+    def chips(c, labels):
+        out = []
+        for k, lb in labels:
+            n = (c or {}).get(k, 0)
+            dot = LVC.get(k, '#9ca3af') if n else '#d1d5db'   # f-string 식 안에 '#' 금지(GCP 파이썬 3.11)
+            out.append(f'<span><i style="background:{dot}"></i>{lb} <b>{n}</b></span>')
+        return '<div class="chips">' + ''.join(out) + '</div>'
+    stock_lb = [('out', '품절'), ('critical', '15일↓'), ('warning', '30일↓'), ('low', '45일↓')]
+    rows = []
+    for key, title, labels in (('stock_jasa', '자사 재고 경고 (45일 이하)', stock_lb), ('stock_outsource', '외주 재고 경고 (45일 이하)', stock_lb),
+                               ('channel', '채널 품절 경보 (7일 미만)', [('out', '품절'), ('critical', '3일↓'), ('warning', '7일↓')]),
+                               ('plan', '완제품 수급 (창고 재고)', [('out', '품절'), ('critical', '2주↓'), ('warning', '4주↓'), ('low', '8주↓'), ('ok', '여유')])):
+        s = snap.get(key)
+        if not s:
+            continue
+        top = ', '.join(esc(t) for t in s.get('top', []) if t) or '-'
+        rows.append(f'<tr><td>{title}</td><td>{chips(s.get("c"), labels)}</td><td style="font-size:11px;color:#475569">{top}</td></tr>')
+    ex = snap.get('excess')
+    if ex:
+        e1, lg = ex.get('excess') or {}, ex.get('long') or {}
+        top = ', '.join(esc(t) for t in ex.get('top', []) if t) or '-'
+        rows.append(f'<tr><td>부재료 과잉·장기</td><td class="chips"><span>과잉(6개월치 초과·안 씀) <b>{e1.get("n", 0)}</b>품목 · <b>{_fmt_won(e1.get("value", 0))}원</b></span>'
+                    f'<span>폐기&amp;장기 창고 <b>{lg.get("n", 0)}</b>품목 · <b>{_fmt_won(lg.get("value", 0))}원</b></span></td>'
+                    f'<td style="font-size:11px;color:#475569">{top}</td></tr>')
+    h = ['<h2>재고·수급·거래처 현황 <span class="badge warn" style="vertical-align:2px">생성 시점</span></h2>',
+         f'<div class="snapnote">{snap.get("at", "")} 기준 값입니다(그달 마감 값이 아님). 매월 1~5일 자동 저장본은 전월 말과 가까운 값입니다.</div>']
+    if rows:
+        h.append('<table><tr><th style="width:170px">항목</th><th>현황</th><th>주요 품목 (품절·과잉 상위)</th></tr>' + ''.join(rows) + '</table>')
+    vs = snap.get('vendors') or []
+    if vs:
+        vk = {'po': '구매', 'wp': '외주', 'both': '구매·외주'}
+        fm = lambda x, suf: '-' if x is None else f'{x}{suf}'
+        h.append('<h3>거래처 평가 — 최근 12개월 금액 상위 8 (거래처 스코어카드)</h3><table><tr><th>거래처</th><th>구분</th><th class="num">점수</th>'
+                 '<th class="num">납기 준수</th><th class="num">입고 충족</th><th class="num">리드</th><th class="num">단가 변동</th><th class="num">금액</th></tr>')
+        for v in vs:
+            sc = v.get('score')
+            scol = '#94a3b8' if sc is None else ('#16a34a' if sc >= 80 else ('#ca8a04' if sc >= 60 else '#dc2626'))
+            sct = '-' if sc is None else sc
+            h.append(f'<tr><td>{esc(_co_short(v.get("vendor", "")))}</td><td style="font-size:11px">{vk.get(v.get("kind"), "")}</td>'
+                     f'<td class="num" style="color:{scol};font-weight:800">{sct}</td><td class="num">{fm(v.get("ontime"), "%")}</td>'
+                     f'<td class="num">{fm(v.get("fill"), "%")}</td><td class="num">{fm(v.get("lead"), "일")}</td>'
+                     f'<td class="num">{v.get("price_changes", 0)}건</td><td class="num">{_fmt_won(v.get("amt", 0))}원</td></tr>')
+        h.append('</table>')
+    return ''.join(h)
 
 
 def _report_html(d):
@@ -9538,6 +9822,7 @@ def _report_html(d):
              f'<div class="d flat">판매 {int(d["sales_csv"]["qty"]):,}개</div>'),
          kpi('구매 발주액', d['po']['cur'], d['po']['pct']),
          kpi('입고액', d['rcv']['cur'], d['rcv']['pct']),
+         _report_kpi_receipts(d.get('receipts') or {}),
          '</div>']
     # 12개월 추이
     mx_s = max([t['sales'] for t in d['trend']] + [1]); mx_p = max([t['po'] for t in d['trend']] + [1])
@@ -9555,12 +9840,15 @@ def _report_html(d):
         for k, v in sorted(d['sales_csv']['by_class'].items(), key=lambda x: -x[1]):
             h.append(f'<tr><td>{esc(k)}</td><td class="num">{int(v):,}원</td><td class="num">{v/tot*100:.1f}%</td></tr>')
         h.append('</table>')
-    # 발주 TOP
-    h.append('<div class="grid2"><div><h2>발주 거래처 TOP 5</h2><table><tr><th>거래처</th><th class="num">발주액</th></tr>')
-    h += [f'<tr><td>{esc(x["name"])}</td><td class="num">{x["amt"]:,}원</td></tr>' for x in d['po_vendor_top']] or ['<tr><td colspan=2>없음</td></tr>']
-    h.append('</table></div><div><h2>발주 품목 TOP 5</h2><table><tr><th>품번</th><th>품명</th><th class="num">발주액</th></tr>')
-    h += [f'<tr><td>{esc(x["code"])}</td><td>{esc(x["name"][:26])}</td><td class="num">{int(x["amt"]):,}원</td></tr>' for x in d['po_item_top']] or ['<tr><td colspan=3>없음</td></tr>']
-    h.append('</table></div></div>')
+    # 제품 매출 TOP 10 · 채널별 매출 (2026-11-18 추가)
+    h.append(_report_sales_html(d, esc))
+    # 발주·입고 거래처 TOP 5 + 주요 품목 (2026-11-18: 예전 '발주 거래처 TOP 5'를 입고까지·품목 포함으로)
+    h.append(_report_vendor_html(d, esc))
+    # 발주 품목 TOP 5 · 입고 일정 준수 (2026-11-18 추가)
+    h.append('<div class="grid2"><div><h2>발주 품목 TOP 5</h2><table><tr><th>품번</th><th>품명</th><th class="num">수량</th><th class="num">발주액</th></tr>')
+    h += [f'<tr><td>{esc(x["code"])}</td><td>{esc(x["name"][:24])}</td><td class="num">{x["qty"]:,.0f}</td><td class="num">{int(x["amt"]):,}원</td></tr>' for x in d['po_item_top']] or ['<tr><td colspan=4>없음</td></tr>']
+    h.append('</table></div><div>' + _report_receipts_html(d.get('receipts') or {}, esc) + '</div></div>')
+    h.append(_report_late_html(d.get('receipts') or {}, esc))
     # 단가 변동
     h.append('<h2>이달 단가 변동 (영향액순)</h2>')
     if d['price_changes']:
@@ -9573,16 +9861,21 @@ def _report_html(d):
         h.append('</table>')
     else:
         h.append('<div style="font-size:12px;color:#64748b">이달 3% 이상 단가 변동 없음</div>')
+    # 재고·수급·거래처 현황 (생성 시점, 2026-11-18 추가)
+    h.append(_report_snapshot_html(d.get('snap'), esc))
     # 재고 마감 + 알림
     h.append('<div class="grid2"><div><h2>재고 마감 스냅샷</h2><table><tr><th>구분</th><th class="num">품목수</th><th class="num">재고 0</th><th>파일</th></tr>')
     for k, v in d['closing'].items():
         h.append(f'<tr><td>{k}</td><td class="num">{v["rows"]:,}</td><td class="num">{v["zero"] if v["zero"] is not None else "-"}</td><td style="font-size:10.5px;color:#94a3b8">{esc(v["file"])}</td></tr>'
                  if v else f'<tr><td>{k}</td><td colspan=3 style="color:#94a3b8">마감 파일 없음 (해당 월 자동보관 전)</td></tr>')
     h.append('</table></div><div><h2>알림 이력</h2><table><tr><th>종류</th><th class="num">건수</th></tr>')
-    names = {'out': '🔴 신규 품절', 'reorder': '🕐 지금 발주 진입', 'health': '⚠️ 데이터 이상', 'daily': '☀️ 아침 요약', 'report': '📊 월간 리포트'}
+    names = {'out': '🔴 신규 품절', 'reorder': '🕐 지금 발주 진입', 'health': '⚠️ 데이터 이상', 'daily': '☀️ 아침 요약', 'report': '📊 월간 리포트',
+             'chstock': '🏪 채널 품절', 'vendor': '👥 거래처 기록 끊김', 'sales': '📥 판매 자료 반영', 'closing': '📗 마감 자동 반영'}   # 2026-11-18 이름 없던 종류 추가
     h += [f'<tr><td>{names.get(k, k)}</td><td class="num">{v}</td></tr>' for k, v in sorted(d['alerts'].items())] or ['<tr><td colspan=2 style="color:#94a3b8">알림 없음</td></tr>']
     h.append('</table></div></div>')
-    h.append('<div class="note">※ 매출은 온라인팀 판매자료(쿠팡·마트 등 온라인+오프라인 납품) 공급가 합계, VAT 제외 · 발주/입고는 아마란스 합계금액 · 단가 변동은 발주단가 3% 이상 변경분 · 재고 마감은 매월 자동보관 스냅샷</div>')
+    h.append('<div class="note">※ 매출은 온라인팀 판매자료(쿠팡·마트 등 판매 API 채널) 공급가 합계, VAT 제외 — 회사 전체 매출이 아님 · 발주/입고는 아마란스 합계금액(거래처·품목 합 같은 기준) · '
+             '입고 요청일 준수는 Monday 입고 완료 기록(부자재 입고일 vs 입고 요청일, 외주 출고일 vs 요청 입고일) · 단가 변동은 발주단가 3% 이상 변경분 · '
+             '재고·수급·거래처 현황은 리포트 생성 시점 값 · 재고 마감은 매월 자동보관 스냅샷</div>')
     h.append('</div>')
     return '<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>월간 리포트 ' + d['ymd'] + '</title></head><body>' + ''.join(h) + '</body></html>'
 
