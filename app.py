@@ -1474,6 +1474,7 @@ def load_monday_data():
                  '채널','업무 상태','목표 출시일','카테고리','우선순위',
                  '입항일','계약번호','부모아이템ID',
                  'box 입수량','PT적재량',  # 입수 테스트(3D) 패널용
+                 '입고일','실입고 수량',  # 원/부자재 캘린더 입고 완료 이력 (2026-11-18)
                  '시안'}  # 부자재 규격 보드 시안 파일(URL) — 규격 패널 시안 아이콘 (2026-10-28)
     df = pd.read_csv(mon_files[0], encoding='utf-8-sig', dtype=str,
                      usecols=lambda c: c in _mon_keep)
@@ -13709,7 +13710,47 @@ def api_po_pending():
             })
 
     items.sort(key=lambda x: (not x['has_schedule'], x['eta_sort']))
-    return jsonify({'items': items, 'total': len(items)})
+    return jsonify({'items': items, 'total': len(items), 'done': _po_done_items()})
+
+
+def _po_done_items(days=400):
+    """입고 완료 이력 — 캘린더에 '입고 완료'로 남기기용 (2026-11-18 사용자 "10월 건이 입고되면 캘린더에서 사라짐 → 이력 확인").
+    예정 목록(items)과 따로 돌려줘서 예상입고일 패널·외부 API 등은 그대로. 최근 days일만.
+    - 부자재: Monday '원/부자재 발주 요청' '입고 완료(자사/외주)' 그룹 · '입고일' · 실입고 수량
+    - 원료: '원료 입고 일정' '입고완료' · '실제 입고일'(없으면 입항 일정)
+    - 수입: '원재료 수입 현황_하위' '입고 완료' · 입항일"""
+    from datetime import datetime, timedelta
+    if MONDAY_DF is None or MONDAY_DF.empty:
+        return []
+    cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+    sv = lambda r, c: '' if str(r.get(c, '') or '').strip().lower() in ('', 'nan', 'none') else str(r.get(c, '')).strip()
+    ymd = lambda s: s[:10] if re.match(r'^\d{4}-\d{2}-\d{2}', s or '') else ''
+    out = []
+
+    def add(typ, d, code, name, qty, sup, dest, extra=None):
+        if not d or d < cutoff:
+            return
+        it = {'type': typ, 'done': True, 'code': code, 'name': name, 'qty': qty,
+              'supplier_short': _co_short(sup), 'vendor': sup, 'destination': dest,
+              'has_schedule': True, 'eta_sort': d, 'eta_display': f'{int(d[5:7])}/{int(d[8:10])}'}
+        if extra:
+            it.update(extra)
+        out.append(it)
+
+    m = (MONDAY_DF['보드명'] == '원/부자재 발주 요청') & MONDAY_DF['그룹'].astype(str).str.startswith('입고 완료')
+    for _, r in MONDAY_DF.loc[m].iterrows():
+        add('po', ymd(sv(r, '입고일')), sv(r, '아이템명') or sv(r, '품번'), sv(r, '품명'),
+            sv(r, '실입고 수량') or sv(r, '실발주 수량') or sv(r, '요청수량'), sv(r, '발주업체'), sv(r, '입고처'))
+    m = (MONDAY_DF['보드명'] == '원료 입고 일정') & (MONDAY_DF['그룹'] == '입고완료')
+    for _, r in MONDAY_DF.loc[m].iterrows():
+        add('raw', ymd(sv(r, '실제 입고일')) or ymd(sv(r, '입항 일정')), sv(r, '그룹'), sv(r, '아이템명'),
+            sv(r, '입항 물량'), sv(r, '수입원'), '')
+    m = (MONDAY_DF['보드명'] == '원재료 수입 현황_하위') & (MONDAY_DF['그룹'] == '입고 완료')
+    for _, r in MONDAY_DF.loc[m].iterrows():
+        add('import_raw', ymd(sv(r, '입항일')), sv(r, '수입원'), sv(r, '아이템명'), sv(r, '입항 물량'),
+            sv(r, '수입원'), '', {'contract': sv(r, '계약번호')})
+    out.sort(key=lambda x: x['eta_sort'])
+    return out
 
 
 def _ext_qty_to_int(s):
@@ -13862,7 +13903,52 @@ def api_outsource_pending():
         })
     # 정렬: 그룹(발주완료→생산요청→확인필요) → 일정확정 → 날짜 오름차순
     items.sort(key=lambda x: (x['_sort_group'], not x['has_schedule'], x['eta_sort']))
-    return jsonify({'items': items, 'total': len(items)})
+    return jsonify({'items': items, 'total': len(items), 'done': _os_done_items()})
+
+
+def _os_maker_map():
+    """품번 → 아마란스 최근 발주 거래처(외주발주·구매발주 중 가장 최근) — 외주 입고 완료 이력 줄의 외주처 표시용.
+    _erp_orders를 수백 번 부르면 느려서 한 번에 만듦."""
+    parts = []
+    for df in (ORDER_DF, WP_ORDER_DF):
+        if df is None or df.empty or not {'품번', '거래처명', '발주일자'} <= set(df.columns):
+            continue
+        t = pd.DataFrame({'k': df['품번'].astype(str).str.strip().str.upper(),
+                          'v': df['거래처명'].astype(str).str.strip(),
+                          'd': df['발주일자'].astype(str).str.replace('-', '', regex=False).str[:8]})
+        parts.append(t[(t['v'] != '') & (t['v'].str.lower() != 'nan')])
+    if not parts:
+        return {}
+    t = pd.concat(parts).sort_values('d')
+    return dict(zip(t['k'], t['v']))   # 날짜 오름차순이라 마지막 = 가장 최근
+
+
+def _os_done_items(days=400):
+    """외주 입고 완료 이력 — 캘린더에 '입고 완료'로 남기기용 (2026-11-18 사용자 "외주 입고물량도 동일하게").
+    Monday '외주 생산 요청' 보드 '출고 완료' 그룹 · 날짜 = 외주 출고일(없으면 요청 입고일). 최근 days일만.
+    예정 목록(items)과 따로 돌려줘서 외주 입고 물량 패널은 그대로."""
+    from datetime import datetime, timedelta
+    if MONDAY_DF is None or MONDAY_DF.empty:
+        return []
+    cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+    sv = lambda r, c: '' if str(r.get(c, '') or '').strip().lower() in ('', 'nan', 'none') else str(r.get(c, '')).strip()
+    ymd = lambda s: s[:10] if re.match(r'^\d{4}-\d{2}-\d{2}', s or '') else ''
+    m = (MONDAY_DF['보드명'] == '외주 생산 요청') & (MONDAY_DF['그룹'] == '출고 완료')
+    if not m.any():
+        return []
+    makers = _os_maker_map()
+    out = []
+    for _, r in MONDAY_DF.loc[m].iterrows():
+        d = ymd(sv(r, '외주 출고일')) or ymd(sv(r, '요청 입고일'))
+        if not d or d < cutoff:
+            continue
+        code = sv(r, '아이템명')
+        out.append({'done': True, 'group': '출고 완료', 'code': code, 'name': sv(r, '품명'), 'qty': sv(r, '요청수량'),
+                    'vendor': sv(r, '업체명') or sv(r, '고객사'), 'customer': sv(r, '고객사'),
+                    'maker': makers.get(code.upper(), ''), 'destination': sv(r, '요청 입고지'),
+                    'has_schedule': True, 'eta_sort': d, 'eta_display': f'{int(d[5:7])}/{int(d[8:10])}'})
+    out.sort(key=lambda x: x['eta_sort'])
+    return out
 
 
 @app.route('/api/spec_list', methods=['GET'])
@@ -16477,6 +16563,16 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .pocal-dot { width: 7px; height: 7px; border-radius: 50%; }
   .pocal-dot.po, .pocal-dot.os-done { background: #2563eb; } .pocal-dot.raw { background: #059669; }
   .pocal-dot.import_raw, .pocal-dot.os-req { background: #d97706; }
+  /* 입고 완료 이력 (2026-11-18): 회색 점·회색 칸·회색 줄 + 초록 '✓ 입고 완료' */
+  .pocal-dot.done, .pocal-drow .tag.done { background: #a3a3a3; }
+  .pocal-cell.has-data.all-done { background: #f4f4f2; border-color: #e7e5e0; }
+  .pocal-cell.has-data.all-done .pocal-cnt { color: #6b7280; background: rgba(107,114,128,0.12); }
+  .pocal-drow.done { opacity: .72; }
+  .pocal-drow.done .dcode { color: #6b7280; background: #f1f1ef; }
+  .pocal-drow .donetag { color: #15803d; font-weight: 700; margin-right: 2px; }
+  /* 검색 결과 구역 머리 (2026-11-18): 입고 예정 / 지난 입고 내역 */
+  .pocal-sec { margin: 2px 2px 8px; font-size: 12px; font-weight: 800; color: #4f46e5; letter-spacing: .01em; }
+  .pocal-sec.past { margin-top: 22px; padding-top: 12px; border-top: 1px dashed #d6d4cc; color: #6b7280; }
   .pocal-cell.selected .pocal-dot { box-shadow: 0 0 0 1.5px rgba(255,255,255,0.7); }
   .pocal-cnt { position: absolute; right: 7px; bottom: 7px; min-width: 18px; height: 18px; padding: 0 5px;
     display: inline-flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 800;
@@ -18189,6 +18285,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
             <span><span class="pocal-dot po"></span>부자재</span>
             <span><span class="pocal-dot raw"></span>원료</span>
             <span><span class="pocal-dot import_raw"></span>수입</span>
+            <span title="Monday 입고 완료 그룹의 실제 입고일 — 최근 400일"><span class="pocal-dot done"></span>입고 완료</span>
           </div>
           <div class="pocal-mini" id="pocal-mini"></div>
         </div>
@@ -18227,6 +18324,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
           <div class="pocal-legend">
             <span><span class="pocal-dot os-done"></span>발주완료</span>
             <span><span class="pocal-dot os-req"></span>생산요청</span>
+            <span title="Monday 외주 생산 요청 '출고 완료' 그룹의 외주 출고일 — 최근 400일"><span class="pocal-dot done"></span>입고 완료</span>
           </div>
           <div class="pocal-mini" id="oscal-mini"></div>
         </div>
@@ -19270,12 +19368,13 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   // ───── KPI + Trend Charts ─────
   function fmtInt(v) { return Number(v || 0).toLocaleString(); }
 
-  let _poInlineItems = [];
+  let _poInlineItems = [], _poDoneItems = [];
   async function loadPoInline() {
     try {
       const res = await fetch('/api/po_pending');
       const d = await res.json();
       _poInlineItems = d.items || [];
+      _poDoneItems = d.done || [];   // 입고 완료 이력 — 캘린더에만 (2026-11-18)
       renderPoInline();
     } catch (e) {
       document.getElementById('po-inline-list').innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>';
@@ -19393,13 +19492,15 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   let _poCalSel = '';       // 선택된 'YYYY-MM-DD'
   let _poCalQ = '';         // 검색어 (소문자)
   function _poCalScheduled() {
-    const base = (_poInlineItems || []).filter(x => x.has_schedule && /^\\d{4}-\\d{2}-\\d{2}/.test(x.eta_sort || ''));
+    // 예정 건 + 입고 완료 이력(_poDoneItems, done:true — 회색 '입고 완료'로 표시)
+    const base = (_poInlineItems || []).concat(_poDoneItems || []).filter(x => x.has_schedule && /^\\d{4}-\\d{2}-\\d{2}/.test(x.eta_sort || ''));
     if (!_poCalQ) return base;
     return base.filter(x =>
       (x.code||'').toLowerCase().includes(_poCalQ) ||
       (x.name||'').toLowerCase().includes(_poCalQ) ||
       (x.contract||'').toLowerCase().includes(_poCalQ) ||
       (x.vendor||'').toLowerCase().includes(_poCalQ) ||
+      (x.maker||'').toLowerCase().includes(_poCalQ) ||
       (x.destination||'').toLowerCase().includes(_poCalQ));
   }
   let _poCalPre = null;   // 검색 시작 전에 보던 달·선택 날짜 — 검색창을 비우면 그대로 복귀 (2026-11-04)
@@ -19420,7 +19521,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     if (_poCalQ && matches.length) {
       const inMonth = matches.some(x => x.eta_sort.slice(0,4)+x.eta_sort.slice(5,7) === _poCalYm);
       if (!inMonth) {
-        const first = matches.map(x => x.eta_sort.slice(0,10)).sort()[0];
+        // 지난 입고 내역도 검색되므로(2026-11-18) 가장 오래된 달이 아니라 다가오는 입고 › 가장 최근 지난 입고의 달로
+        const ds = matches.map(x => x.eta_sort.slice(0,10)).sort(), td = todayYmd();
+        const tdd = td.slice(0,4) + '-' + td.slice(4,6) + '-' + td.slice(6,8);
+        const first = ds.find(d => d >= tdd) || ds[ds.length - 1];
         _poCalYm = first.slice(0,4) + first.slice(5,7);
       }
     }
@@ -19450,6 +19554,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     while (m < 1) { m += 12; y -= 1; }
     _poCalYm = y + String(m).padStart(2,'0');
     renderPoCal();
+    if (!_poCalSel) poCalRenderDetail();   // 전체 목록의 입고 완료 이력은 보고 있는 달 기준
   }
   function _adjYm(ym, delta) {
     let y = +ym.slice(0,4), m = +ym.slice(4,6) + delta;
@@ -19510,12 +19615,13 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       const list = byDate[ymd] || [];
       const cls = ['pocal-cell'];
       if (list.length) cls.push('has-data');
+      if (list.length && list.every(x => x.done)) cls.push('all-done');   // 그날 건이 모두 입고 완료면 회색 칸
       if (ymd === todayDash) cls.push('today');
       if (ymd === _poCalSel) cls.push('selected');
       if (wd === 0) cls.push('sun'); if (wd === 6) cls.push('sat');
       let dots = '';
       if (list.length) {
-        const types = [...new Set(list.map(x => x.type))];
+        const types = [...new Set(list.map(x => x.done ? 'done' : x.type))];   // 입고 완료는 회색 점
         dots = '<div class="pocal-dots">' + types.map(t => '<span class="pocal-dot ' + t + '"></span>').join('') + '</div>';
       }
       const cnt = list.length ? '<span class="pocal-cnt">' + list.length + '</span>' : '';
@@ -19536,6 +19642,13 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     // 발주 업체 → 입고처를 한 줄에 (2026-11-04 사용자 "어떤 업체로 발주가 나갔는지 캘린더만 봐서는 모름") · 클릭 = 이 건 상세
     const vend = it.supplier_short || _coShort(it.vendor || it.maker);   // 발주 업체 = 먼데이 발주업체 › 아마란스 최근 발주 거래처 › 부자재 규격 보드 업체 (짧은 상호)
     const dest = (vend ? ' · ' + escapeHtml(vend) + (it.destination ? ' → ' + escapeHtml(it.destination) : '') : (it.destination ? ' · ' + escapeHtml(it.destination) : ''));
+    if (it.done)   // 입고 완료 이력 — 회색 줄 + '입고 완료' 표시, 클릭 상세 없음 (2026-11-18)
+      return '<div class="pocal-drow done" title="입고 완료 ' + escapeHtml(it.eta_sort) + ' (Monday 입고일)">'
+         + '<span class="tag ' + it.type + '"></span>'
+         + '<span class="dcode">' + code + '</span>'
+         + '<div class="dname">' + name + '<span class="dsub"' + (/매홍/.test(it.destination || '') ? ' style="color:#dc2626;font-weight:700"' : '') + '>'
+         + '<b class="donetag">✓ 입고 완료</b> ' + (_poTypeLabel[it.type]||'') + dest + '</span>' + sub + '</div>'
+         + '<span class="dqty">' + escapeHtml(qtyText) + '</span></div>';
     return '<div class="pocal-drow clk" onclick="showImportDetail(' + _poInlineItems.indexOf(it) + ')" title="클릭 = 발주 업체·아마란스 발주 내역·말풍선">'
          + '<span class="tag ' + it.type + '"></span>'
          + '<span class="dcode">' + code + '</span>'
@@ -19548,16 +19661,22 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   function _ymdDow(ymd) { const y=+ymd.slice(0,4),m=+ymd.slice(5,7),d=+ymd.slice(8,10); return _DOW[new Date(y,m-1,d).getDay()]; }
   function poCalRenderDetail() {
     const detail = document.getElementById('pocal-detail');
-    const all = _poCalScheduled();
+    // 입고 완료 이력은 보고 있는 달 것만 목록에 (1년 치가 전체 목록 앞을 다 채우지 않게). 날짜를 고르면 그날 것은 다 나옴
+    // 검색 중이면 지난 입고 내역(400일)도 모두 (2026-11-18 사용자 "검색 시 이전 내역도 같이")
+    const ymDash = _poCalYm.slice(0,4) + '-' + _poCalYm.slice(4,6);
+    const all = _poCalScheduled().filter(x => !x.done || (_poCalSel ? x.eta_sort.slice(0,10) === _poCalSel : (_poCalQ || x.eta_sort.slice(0,7) === ymDash)));
     if (!all.length) {
       detail.innerHTML = '<div class="pocal-empty">' + (_poCalQ ? '검색 결과가 없습니다' : '예정된 입고 일정이 없습니다') + '</div>';
       return;
     }
+    if (_poCalQ && !_poCalSel) { detail.innerHTML = _calSearchHtml(all, 'poCalPick', _poCalRowHtml); return; }
     // 특정 날짜 선택 시 해당 날짜만
     if (_poCalSel) {
       const list = all.filter(it => it.eta_sort.slice(0,10) === _poCalSel);
       const md = (+_poCalSel.slice(5,7)) + '월 ' + (+_poCalSel.slice(8,10)) + '일 (' + _ymdDow(_poCalSel) + ')';
-      detail.innerHTML = '<h3>' + md + ' · 입고 예정 ' + list.length + '건 <span class="pocal-hint">항목을 누르면 발주 업체·내역</span>'
+      const nDone = list.filter(x => x.done).length;
+      detail.innerHTML = '<h3>' + md + ' · ' + (nDone && nDone === list.length ? '입고 완료 ' + nDone + '건' : '입고 예정 ' + (list.length - nDone) + '건' + (nDone ? ' · 완료 ' + nDone + '건' : ''))
+        + ' <span class="pocal-hint">항목을 누르면 발주 업체·내역</span>'
         + ' <span class="pocal-clear" onclick="poCalShowAll()">✕ 전체보기</span></h3>'
         + list.map(_poCalRowHtml).join('');
       return;
@@ -19566,7 +19685,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const byDate = {};
     all.forEach(it => { const k = it.eta_sort.slice(0,10); (byDate[k]=byDate[k]||[]).push(it); });
     const keys = Object.keys(byDate).sort();
-    let html = '<h3>전체 입고 일정 · ' + all.length + '건 <span class="pocal-hint">항목을 누르면 발주 업체·내역</span></h3>';
+    const nDoneAll = all.filter(x => x.done).length;
+    let html = '<h3>전체 입고 일정 · ' + (nDoneAll ? '예정 ' + (all.length - nDoneAll) + '건 · 완료 ' + nDoneAll + '건' : all.length + '건') + ' <span class="pocal-hint">항목을 누르면 발주 업체·내역</span></h3>';
     keys.forEach(k => {
       const md = (+k.slice(5,7)) + '월 ' + (+k.slice(8,10)) + '일';
       html += '<div class="pocal-dgroup" onclick="poCalPick(\\'' + k + '\\')">'
@@ -19575,6 +19695,24 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       html += byDate[k].map(_poCalRowHtml).join('');
     });
     detail.innerHTML = html;
+  }
+  // 검색 결과 목록 (원/부자재·외주 캘린더 공용, 2026-11-18): 위 '입고 예정'(날짜 빠른 순) + 아래 '지난 입고 내역'(최근 순).
+  // 날짜 묶음을 누르면 그 날짜로 이동. 올해가 아닌 날짜는 연도까지
+  function _calSearchHtml(all, pickFn, rowFn) {
+    const thisY = todayYmd().slice(0, 4);
+    const groups = (list, desc) => {
+      const by = {};
+      list.forEach(it => { const k = it.eta_sort.slice(0, 10); (by[k] = by[k] || []).push(it); });
+      const keys = Object.keys(by).sort(); if (desc) keys.reverse();
+      return keys.map(k => '<div class="pocal-dgroup" onclick="' + pickFn + '(&quot;' + k + '&quot;)">'
+        + (k.slice(0, 4) !== thisY ? k.slice(0, 4) + '년 ' : '') + (+k.slice(5, 7)) + '월 ' + (+k.slice(8, 10)) + '일'
+        + ' <span class="dgw">(' + _ymdDow(k) + ')</span><span class="dgn">' + by[k].length + '건</span></div>'
+        + by[k].map(rowFn).join('')).join('');
+    };
+    const up = all.filter(x => !x.done), past = all.filter(x => x.done);
+    return '<h3>검색 결과 · 예정 ' + up.length + '건 · 지난 입고 ' + past.length + '건 <span class="pocal-hint">날짜를 누르면 그 날로 이동</span></h3>'
+      + (up.length ? '<div class="pocal-sec">입고 예정 ' + up.length + '건</div>' + groups(up, false) : '')
+      + (past.length ? '<div class="pocal-sec past">지난 입고 내역 ' + past.length + '건 · 최근 순</div>' + groups(past, true) : '');
   }
   function poCalShowAll() { _poCalSel = ''; renderPoCal(); poCalRenderDetail(); }
   function poCalPick(ymd) {
@@ -19592,14 +19730,16 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   let _osCalYm = '';
   let _osCalSel = '';
   let _osCalQ = '';
-  function _osCalType(it) { return it.group === '발주 완료' ? 'os-done' : 'os-req'; }
+  function _osCalType(it) { return it.done ? 'done' : (it.group === '발주 완료' ? 'os-done' : 'os-req'); }
   function _osCalScheduled() {
-    const base = (_osInlineItems || []).filter(x => x.has_schedule && /^\\d{4}-\\d{2}-\\d{2}/.test(x.eta_sort || ''));
+    // 예정 건 + 입고 완료 이력(_osDoneItems, done:true — 회색 '입고 완료'로 표시, 2026-11-18)
+    const base = (_osInlineItems || []).concat(_osDoneItems || []).filter(x => x.has_schedule && /^\\d{4}-\\d{2}-\\d{2}/.test(x.eta_sort || ''));
     if (!_osCalQ) return base;
     return base.filter(x =>
       (x.code||'').toLowerCase().includes(_osCalQ) ||
       (x.name||'').toLowerCase().includes(_osCalQ) ||
       (x.vendor||'').toLowerCase().includes(_osCalQ) ||
+      (x.maker||'').toLowerCase().includes(_osCalQ) ||   // 외주처(아마란스 최근 발주 거래처)로도 검색
       (x.destination||'').toLowerCase().includes(_osCalQ));
   }
   let _osCalPre = null;   // 검색 시작 전에 보던 달·선택 날짜 — 검색창을 비우면 그대로 복귀 (2026-11-04)
@@ -19618,7 +19758,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     if (_osCalQ && matches.length) {
       const inMonth = matches.some(x => x.eta_sort.slice(0,4)+x.eta_sort.slice(5,7) === _osCalYm);
       if (!inMonth) {
-        const first = matches.map(x => x.eta_sort.slice(0,10)).sort()[0];
+        // 지난 입고 내역도 검색되므로(2026-11-18) 가장 오래된 달이 아니라 다가오는 입고 › 가장 최근 지난 입고의 달로
+        const ds = matches.map(x => x.eta_sort.slice(0,10)).sort(), td = todayYmd();
+        const tdd = td.slice(0,4) + '-' + td.slice(4,6) + '-' + td.slice(6,8);
+        const first = ds.find(d => d >= tdd) || ds[ds.length - 1];
         _osCalYm = first.slice(0,4) + first.slice(5,7);
       }
     }
@@ -19647,6 +19790,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     while (m < 1) { m += 12; y -= 1; }
     _osCalYm = y + String(m).padStart(2,'0');
     renderOsCal();
+    if (!_osCalSel) osCalRenderDetail();   // 전체 목록의 입고 완료 이력은 보고 있는 달 기준
   }
   function renderOsCal() {
     const ym = _osCalYm;
@@ -19672,6 +19816,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       const list = byDate[ymd] || [];
       const cls = ['pocal-cell'];
       if (list.length) cls.push('has-data');
+      if (list.length && list.every(x => x.done)) cls.push('all-done');   // 그날 건이 모두 입고 완료면 회색 칸
       if (ymd === todayDash) cls.push('today');
       if (ymd === _osCalSel) cls.push('selected');
       if (wd === 0) cls.push('sun'); if (wd === 6) cls.push('sat');
@@ -19694,6 +19839,12 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     // 외주처(아마란스 최근 외주발주 거래처) → 입고지. 먼데이 '업체명'은 고객사라 외주처로 쓰지 않음
     const dest = (it.maker ? ' · 외주 ' + escapeHtml(_coShort(it.maker)) : (it.vendor ? ' · ' + escapeHtml(it.vendor) : '')) + (it.destination ? ' → ' + escapeHtml(it.destination) : '');
     const grp = escapeHtml(it.group || '');
+    if (it.done)   // 입고 완료 이력 — 회색 줄 + '✓ 입고 완료', 클릭 상세 없음 (2026-11-18)
+      return '<div class="pocal-drow done" title="입고 완료 ' + escapeHtml(it.eta_sort) + ' (Monday 출고 완료 · 외주 출고일)">'
+         + '<span class="tag done"></span>'
+         + '<span class="dcode">' + code + '</span>'
+         + '<div class="dname">' + name + '<span class="dsub"><b class="donetag">✓ 입고 완료</b>' + dest + '</span></div>'
+         + '<span class="dqty">' + escapeHtml(it.qty || '') + '</span></div>';
     return '<div class="pocal-drow clk" onclick="showOsInlineDetail(' + _osInlineItems.indexOf(it) + ')" title="클릭 = 외주처·아마란스 외주발주 내역·말풍선">'
          + '<span class="tag ' + t + '"></span>'
          + '<span class="dcode">' + code + '</span>'
@@ -19702,15 +19853,21 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   }
   function osCalRenderDetail() {
     const detail = document.getElementById('oscal-detail');
-    const all = _osCalScheduled();
+    // 입고 완료 이력은 보고 있는 달 것만 목록에 (1년 치가 전체 목록 앞을 다 채우지 않게). 날짜를 고르면 그날 것은 다 나옴
+    // 검색 중이면 지난 입고 내역(400일)도 모두 (2026-11-18 사용자 "검색 시 이전 내역도 같이")
+    const ymDash = _osCalYm.slice(0,4) + '-' + _osCalYm.slice(4,6);
+    const all = _osCalScheduled().filter(x => !x.done || (_osCalSel ? x.eta_sort.slice(0,10) === _osCalSel : (_osCalQ || x.eta_sort.slice(0,7) === ymDash)));
     if (!all.length) {
       detail.innerHTML = '<div class="pocal-empty">' + (_osCalQ ? '검색 결과가 없습니다' : '예정된 입고 일정이 없습니다') + '</div>';
       return;
     }
+    if (_osCalQ && !_osCalSel) { detail.innerHTML = _calSearchHtml(all, 'osCalPick', _osCalRowHtml); return; }
     if (_osCalSel) {
       const list = all.filter(it => it.eta_sort.slice(0,10) === _osCalSel);
       const md = (+_osCalSel.slice(5,7)) + '월 ' + (+_osCalSel.slice(8,10)) + '일 (' + _ymdDow(_osCalSel) + ')';
-      detail.innerHTML = '<h3>' + md + ' · 입고 예정 ' + list.length + '건 <span class="pocal-hint">항목을 누르면 발주 업체·내역</span>'
+      const nDone = list.filter(x => x.done).length;
+      detail.innerHTML = '<h3>' + md + ' · ' + (nDone && nDone === list.length ? '입고 완료 ' + nDone + '건' : '입고 예정 ' + (list.length - nDone) + '건' + (nDone ? ' · 완료 ' + nDone + '건' : ''))
+        + ' <span class="pocal-hint">항목을 누르면 발주 업체·내역</span>'
         + ' <span class="pocal-clear" onclick="osCalShowAll()">✕ 전체보기</span></h3>'
         + list.map(_osCalRowHtml).join('');
       return;
@@ -19718,7 +19875,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const byDate = {};
     all.forEach(it => { const k = it.eta_sort.slice(0,10); (byDate[k]=byDate[k]||[]).push(it); });
     const keys = Object.keys(byDate).sort();
-    let html = '<h3>전체 입고 일정 · ' + all.length + '건 <span class="pocal-hint">항목을 누르면 발주 업체·내역</span></h3>';
+    const nDoneAll = all.filter(x => x.done).length;
+    let html = '<h3>전체 입고 일정 · ' + (nDoneAll ? '예정 ' + (all.length - nDoneAll) + '건 · 완료 ' + nDoneAll + '건' : all.length + '건') + ' <span class="pocal-hint">항목을 누르면 발주 업체·내역</span></h3>';
     keys.forEach(k => {
       const md = (+k.slice(5,7)) + '월 ' + (+k.slice(8,10)) + '일';
       html += '<div class="pocal-dgroup" onclick="osCalPick(\\'' + k + '\\')">'
@@ -22943,12 +23101,13 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     if (e.target.id === 'po-upd-modal') closePoUpdates();
   });
 
-  let _osInlineItems = [];
+  let _osInlineItems = [], _osDoneItems = [];
   async function loadOsInline() {
     try {
       const res = await fetch('/api/outsource_pending');
       const d = await res.json();
       _osInlineItems = d.items || [];
+      _osDoneItems = d.done || [];   // 출고(입고) 완료 이력 — 캘린더에만 (2026-11-18)
       renderOsInline();
     } catch (e) {
       document.getElementById('os-inline-list').innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>';
