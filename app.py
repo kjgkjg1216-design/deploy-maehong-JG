@@ -15999,7 +15999,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     font-size: 10.5px; color: var(--text-3);
   }
   /* 계산기 보기 개편 (2026-11-18 사용자 "보기 어려움"): 안내는 회색 한 줄, 재질 목록은 열 머리(재질·쓰인 제품·대략 단가) + 많이 쓰는 순 */
-  .pcalc-note { margin-left: auto; font-size: 10.5px; color: #8a8880; font-weight: 500; white-space: nowrap; }
+  .pcalc-note { margin-left: auto; font-size: 10.5px; color: #dc2626; font-weight: 600; white-space: nowrap; }   /* 2026-11-18 사용자 요청: 빨간 글씨 */
   .pcalc-est-empty { font-size: 11px; font-weight: 600; color: #9aa3ae; }
   .pcalc-lhead { position: sticky; top: -4px; z-index: 1; display: grid; grid-template-columns: 18px minmax(0, 1fr) 52px 62px; gap: 8px;
                  padding: 6px 10px 5px; margin: -4px -4px 2px; background: var(--surface); border-bottom: 1px solid #e7e6e0;
@@ -24027,6 +24027,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   const OR_WINDOW = 12;
   let _orAll = [];      // 전체 [{ym, order_amt, receipt_amt}]
   let _orOffset = 0;
+  const OR_C = { order: '#2a78d6', recv: '#eb6834' };   // 발주·입고 추이 색 (검증 팔레트 1·2번, 2026-11-18)
   async function loadOrderReceipt() {
     try {
       const res = await fetch('/api/order_receipt_summary');
@@ -24062,39 +24063,31 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       + '<span class="kpi-val">' + fmtEok(val) + '</span>'
       + (isCur ? live : '') + '</span>';
     const parts = [];
-    if (lastOrder) parts.push(chip('#d97706', '발주', lastOrder.ym, lastOrder.order_amt, lastOrder.is_current));
-    if (lastRecv)  parts.push(chip('#0f766e', '입고', lastRecv.ym, lastRecv.receipt_amt, lastRecv.is_current));
+    if (lastOrder) parts.push(chip(OR_C.order, '발주', lastOrder.ym, lastOrder.order_amt, lastOrder.is_current));
+    if (lastRecv)  parts.push(chip(OR_C.recv, '입고', lastRecv.ym, lastRecv.receipt_amt, lastRecv.is_current));
     document.getElementById('or-kpi').innerHTML = parts.join('');
     // 버튼
     const maxOff = Math.max(0, n - OR_WINDOW);
     document.getElementById('or-prev').disabled = _orOffset >= maxOff;
     document.getElementById('or-next').disabled = _orOffset <= 0;
-    // 당월(진행 중) 막대/점은 연하게 구분
-    const recvPointColors = win.map(m => m.is_current ? '#f43f5e' : '#0f766e');
-    const recvPointRadius = win.map(m => m.is_current ? 5.5 : 3.5);
-    // 발주액 막대: 또렷한 앰버 그라데이션 (당월은 진행중이라 연하게)
-    const orderBarBg = (c) => {
-      const a = c.chart.chartArea; if (!a) return '#f59e0b';
-      const cur = win[c.dataIndex] && win[c.dataIndex].is_current;
-      const g = c.chart.ctx.createLinearGradient(0, a.top, 0, a.bottom);
-      if (cur) { g.addColorStop(0, 'rgba(245,158,11,0.40)'); g.addColorStop(1, 'rgba(250,204,21,0.34)'); }
-      else     { g.addColorStop(0, '#f59e0b'); g.addColorStop(1, '#facc15'); }
-      return g;
-    };
-    // 차트
+    // 색 개편 (2026-11-18 사용자 "색깔 개선"): 매출 차트와 같은 검증 팔레트 — 발주 막대 파랑·입고 선 주황, 진행 중 달은 같은 색 옅게
+    // 막대 가늘게(최대 28px)·위쪽만 4px 둥글게·테두리 없음, 선 2px·흰 테두리 점, 흐린 실선 격자, 흰 툴팁, x축 '진행 중'
+    const cur = win.map(m => !!m.is_current);
+    const xLabels = labels.map((l, i) => cur[i] ? [l, '진행 중'] : l);
     const ctx = document.getElementById('orChart');
     if (_orChart) _orChart.destroy();
     _orChart = new Chart(ctx, {
       data: {
-        labels,
+        labels: xLabels,
         datasets: [
-          { type: 'bar', label: '발주액(억)', data: orderVals, backgroundColor: orderBarBg,
-            borderColor: '#d97706', borderWidth: 1, borderRadius: 6, borderSkipped: false, order: 2 },
-          { type: 'line', label: '입고액(억)', data: recvVals,
-            borderColor: '#0f766e', backgroundColor: '#0f766e', borderWidth: 3,
-            pointRadius: recvPointRadius, pointBackgroundColor: recvPointColors,
-            pointBorderColor: '#ffffff', pointBorderWidth: 1.5,
-            tension: 0.35, spanGaps: false, order: 1 }
+          { type: 'bar', label: '발주액', data: orderVals, backgroundColor: cur.map(c => c ? OR_C.order + '59' : OR_C.order),
+            borderWidth: 0, borderRadius: { topLeft: 4, topRight: 4 }, borderSkipped: 'bottom', maxBarThickness: 28, order: 2 },
+          { type: 'line', label: '입고액', data: recvVals,
+            borderColor: OR_C.recv, backgroundColor: OR_C.recv, borderWidth: 2,
+            pointRadius: cur.map(c => c ? 4.5 : 3.5), pointBackgroundColor: cur.map(c => c ? '#ffffff' : OR_C.recv),
+            pointBorderColor: cur.map(c => c ? OR_C.recv : '#ffffff'), pointBorderWidth: 2,
+            segment: { borderDash: s => cur[s.p1DataIndex] ? [4, 4] : undefined },   // 진행 중 달로 가는 선은 점선
+            tension: 0.3, spanGaps: false, order: 1 }
         ]
       },
       options: {
@@ -24102,15 +24095,20 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         onClick: (e, els) => { if (els.length) { const m = win[els[0].index]; if (m) openOrderReceiptDetail(m.ym); } },
         onHover: (e, els) => { e.native.target.style.cursor = els.length ? 'pointer' : 'default'; },
         plugins: {
-          legend: { display: true, labels: { boxWidth: 12, font: { size: 10 } } },
-          tooltip: { callbacks: { label: c => c.dataset.label.replace('(억)','') + ': '
-            + (c.parsed.y != null ? c.parsed.y + '억' : '데이터 없음'),
-            footer: () => '클릭하면 TOP 10 상세' } }
+          legend: { display: true, position: 'top', align: 'start',
+            labels: { usePointStyle: true, pointStyle: 'rectRounded', boxWidth: 10, boxHeight: 10, color: '#52514e', font: { size: 11, weight: '600' },
+              sort: (a, b) => a.datasetIndex - b.datasetIndex } },   // 범례 순서 = 발주 → 입고
+          tooltip: { backgroundColor: '#ffffff', titleColor: '#111827', bodyColor: '#374151', footerColor: '#8a8880',
+            borderColor: '#e1e0d9', borderWidth: 1, padding: 10, usePointStyle: true, boxPadding: 4,
+            titleFont: { weight: '700' }, footerFont: { weight: '500', size: 10.5 },
+            callbacks: { title: items => { const m = win[items[0].dataIndex]; return m ? m.ym.replace('-', '년 ') + '월' + (m.is_current ? ' (진행 중)' : '') : ''; },
+              label: c => ' ' + c.dataset.label + '  ' + (c.parsed.y != null ? c.parsed.y.toFixed(1) + '억' : '데이터 없음'),
+              footer: () => '클릭하면 TOP 10 상세' } }
         },
         scales: {
-          y: { beginAtZero: true, ticks: { font: { size: 10 }, callback: v => v + '억' },
-            grid: { color: '#eef2f7' } },
-          x: { ticks: { font: { size: 10 } }, grid: { display: false } }
+          y: { beginAtZero: true, border: { display: false },
+            ticks: { color: '#8a8880', font: { size: 10 }, callback: v => v + '억' }, grid: { color: '#eeede8' } },
+          x: { border: { color: '#d6d4cc' }, ticks: { color: '#52514e', font: { size: 10 } }, grid: { display: false } }
         }
       }
     });
