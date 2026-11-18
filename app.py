@@ -15689,6 +15689,20 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .sc-why { display: inline-block; margin: 1px 3px 1px 0; padding: 1px 6px; border-radius: 7px; font-size: 10.5px; font-weight: 700; white-space: nowrap; }
   .sc-cause { border: 1px solid var(--b); background: var(--b); color: var(--c); font: inherit; font-size: 11px; font-weight: 700; padding: 1px 8px; border-radius: 8px; margin-left: 4px; cursor: pointer; }
   .sc-cause.on { background: #fff; border-color: var(--c); box-shadow: inset 0 0 0 1px var(--c); }
+  /* 재고 비교 품번별 보기 (2026-11-18 사용자 "가독성"): 외주처마다 한 줄 — 재고 파일 → 아마란스 → 차이를 숫자 열로 맞춤 */
+  .sc-items .scn-name { font-weight: 700; color: #111827; line-height: 1.35; word-break: keep-all; overflow-wrap: anywhere; }
+  .sc-items .scn-sub { font-size: 10.5px; color: #94a3b8; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .sc-items .scl { height: 22px; line-height: 22px; white-space: nowrap; }
+  .sc-items .scl.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .sc-items .scl.tot { border-top: 1px solid #d6d4cc; margin-top: 2px; font-weight: 800; color: #111827; }
+  .sc-items .scn-none { color: #cbd5e1; font-size: 11px; font-weight: 500; }
+  .sc-items .scl-ref { font-size: 11px; line-height: 20px; color: #94a3b8; white-space: nowrap; }
+  .sc-items .scl-ref b { color: #64748b; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .scw-main { font-size: 12px; line-height: 1.5; }
+  .scw-main b { font-weight: 800; font-variant-numeric: tabular-nums; }
+  .scw-hint { font-size: 11px; color: #64748b; font-weight: 500; margin-left: 6px; }
+  .scw-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; vertical-align: 1px; }
+  .scw-rest { font-size: 11px; color: #94a3b8; margin-top: 2px; font-variant-numeric: tabular-nums; }
   .sc-items tbody tr[data-code] { cursor: pointer; }
   .sc-items tbody tr[data-code]:hover > td { background: #fafafa; }
   .sc-items tbody tr.open > td { background: #f5f3ff; }
@@ -21843,12 +21857,12 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         + chip(_scFilter === 'diff', '차이 나는 것만', "scSet('filter','diff')") + chip(_scFilter === 'all', '전체', "scSet('filter','all')")
         + '<span style="width:10px"></span>' + chip(_scKind === '', '원·부재료', "scSet('kind','')") + chip(_scKind === '원재료', '원재료', "scSet('kind','원재료')") + chip(_scKind === '부재료', '부재료', "scSet('kind','부재료')")
         + '<input id="sc-q" type="text" placeholder="품번/품명/거래처/창고 검색…" value="' + escapeHtml(_scQ) + '" oninput="_scQ=this.value;renderScItems()" style="margin-left:auto;padding:5px 9px;border:1px solid #e2e8f0;border-radius:8px;font-size:12px;width:200px"></div>'
-        + '<div style="font-size:11px;color:#64748b;margin-bottom:8px;display:flex;gap:10px;flex-wrap:wrap">'
-        + '<span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#fdba74"></span> 재고 파일 외주처</span>'
-        + '<span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#a78bfa"></span> 아마란스 외주처 위치</span>'
-        + '<span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#93c5fd"></span> 아마란스 자사창고</span>'
-        + '<span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#5eead4"></span> 아마란스 물류창고</span>'
-        + '<span style="color:#94a3b8">차이 = 아마란스 외주처 위치 합 − 재고 파일 합 (자사·물류창고 제외)</span></div>'
+        // 범례 (2026-11-18 보기 개편): 칩 색 대신 표 읽는 법 한 줄
+        + '<div style="font-size:11px;color:#64748b;margin-bottom:8px;display:flex;gap:14px;flex-wrap:wrap;align-items:center">'
+        + '<span><b style="color:#334155">차이 = 아마란스 − 재고 파일</b> (같은 외주처끼리)</span>'
+        + '<span><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#dc2626;margin-right:4px"></span>재고 파일이 더 많음</span>'
+        + '<span><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#7c3aed;margin-right:4px"></span>아마란스가 더 많음</span>'
+        + '<span style="color:#94a3b8">자사·기타 창고는 참고 (차이 계산 제외) · 행을 누르면 원인 자세히</span></div>'
         + '<div id="sc-count" style="font-size:11px;color:#94a3b8;padding-bottom:4px"></div></div>'
         + '<div id="sc-table"></div>';
       renderScItems();
@@ -21880,31 +21894,64 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const base = (d.items || []).filter(r => (_scFilter === 'all' || ((Math.abs(r.diff) >= 0.5 || isMoved(r)) && !r.exp)) && (!_scKind || r.kind === _scKind)
       && (!q || [r.code, r.name].concat(r.file.map(x => x.vendor), r.ama.map(x => x.wh + ' ' + x.loc)).join(' ').toLowerCase().includes(q)))
       .sort((a, b) => Math.abs(b.diff) - Math.abs(a.diff));
+    const hasV = r => r.ama.some(x => vl.includes(x.loc));
     const rows = _scSortRows(_scCause ? base.filter(r => _scMain(r.why) === _scCause) : base,
-      // 아마란스는 칸에 보이는 모든 창고·위치의 전체 합 (외주처 위치 합으로 하면 자사창고만 있는 행이 숫자가 보이는데도 0 취급됨)
-      (r, k) => k === 'file' ? (r.file.length ? r.file_t : null) : k === 'ama' ? (r.ama.length ? r.ama_t : null) : r.diff);
-    const cell = 'padding:7px 9px;border-bottom:1px solid #f1f5f9;vertical-align:top';
-    const none = '<span style="color:#cbd5e1;font-size:11px">없음</span>';
+      // 아마란스 열 = 외주처 위치 합(차이 계산에 쓰는 값) — 자사·기타 창고는 맨 오른쪽 참고 열 (2026-11-18)
+      (r, k) => k === 'file' ? (r.file.length ? r.file_t : null) : k === 'ama' ? (hasV(r) ? r.ama_v : null) : r.diff);
+    const cell = 'padding:8px 10px;border-bottom:1px solid #eef0f3;vertical-align:top';
     const cntEl = document.getElementById('sc-count'); if (cntEl) cntEl.innerHTML = rows.length + '개 품번' + scCauseBar(base);
     if (!rows.length) { el.innerHTML = '<div class="alert-empty">' + (_scFilter === 'diff' ? '차이 나는 품번이 없습니다 ✓' : '품번 없음') + '</div>'; return; }
+    // 보기 개편 (2026-11-18 사용자 "너무 보기 힘듦 → 가독성 좋게"): 외주처마다 한 줄로 재고 파일 → 아마란스 → 차이를 숫자 열로 나란히,
+    // 외주처가 둘 이상이면 합계 줄, 자사·기타 창고(차이 계산 제외)는 맨 오른쪽 회색 참고 열, 차이 원인은 가장 큰 원인 + 뜻 한마디 + 나머지 작게
+    const num = v => v == null ? '<span class="scn-none">없음</span>' : fmtInt(Math.round(v * 10) / 10);
+    const dcol = v => Math.abs(v) < 0.5 ? '#94a3b8' : (v > 0 ? '#7c3aed' : '#dc2626');
+    const dtxt = v => Math.abs(v) < 0.5 ? '일치' : (v > 0 ? '+' : '') + fmtInt(Math.round(v * 10) / 10);
+    const refName = l => l === '자사창고(폐기&장기품목)' ? '폐기&장기' : (l === '자사창고(샘플창고)' ? '샘플창고' : l);
     el.innerHTML = '<table class="sc-items" style="width:100%;font-size:12.5px;border-collapse:separate;border-spacing:0"><thead><tr style="color:#64748b;font-size:11px;white-space:nowrap">'
-      + '<th style="' + cell + ';text-align:left">품번</th><th style="' + cell + ';text-align:left">품명</th>'
-      + _scTh('file', '재고 파일 (외주처)', cell, 'left', '재고 파일 합') + _scTh('ama', '아마란스 (창고·위치)', cell, 'left', '아마란스 전체 합') + _scTh('diff', '차이', cell, 'right', '차이')
-      + '<th style="' + cell + ';text-align:left" title="기초·입고·사용·파일 이월이 차이에 미친 양 — 더하면 차이와 같음. 행을 누르면 자세히">차이 원인</th></tr></thead><tbody>'
+      + '<th style="' + cell + ';text-align:left">품목</th><th style="' + cell + ';text-align:left">외주처</th>'
+      + _scTh('file', '재고 파일', cell, 'right', '재고 파일 합') + _scTh('ama', '아마란스', cell, 'right', '아마란스 외주처 위치 합') + _scTh('diff', '차이', cell, 'right', '차이(아마란스 − 재고 파일)')
+      + '<th style="' + cell + ';text-align:left" title="기초·입고·사용·파일 이월이 차이에 미친 양 — 더하면 차이와 같음. 행을 누르면 자세히">차이 원인</th>'
+      + '<th style="' + cell + ';text-align:left" title="아마란스 자사창고·폐기&장기·샘플창고 등 — 외주처 재고가 아니라 차이 계산에서 빠짐">자사·기타 창고 <span style="font-weight:500">(참고)</span></th></tr></thead><tbody>'
       + rows.map(r => {
         const ok = Math.abs(r.diff) < 0.5;
+        const lines = _scVendorLines(r, vl), multi = lines.length > 1;
         // 위치 다름 = 재고 파일 외주처와 아마란스 외주처 위치가 서로 다른 곳 (예: 파일은 더고은, 아마란스는 정성)
         const fv = [...new Set(r.file.map(x => vl.find(l => x.vendor === l || x.vendor.startsWith(l)) || x.vendor))].sort().join(','),
               av = [...new Set(r.ama.filter(x => vl.includes(x.loc)).map(x => x.loc))].sort().join(',');
-        const moved = fv !== av ? '<div style="margin-top:3px"><span title="재고 파일: ' + escapeHtml(fv || '없음') + ' / 아마란스: ' + escapeHtml(av || '없음') + '" style="padding:1px 6px;border-radius:8px;font-size:10px;font-weight:700;background:#fef3c7;color:#92400e">위치 다름</span></div>' : '';
-        return '<tr data-code="' + escapeHtml(r.code) + '" onclick="scToggleWhy(this)" title="클릭 = 차이 원인 자세히" style="' + (ok && !moved ? 'opacity:.6' : '') + '"><td style="' + cell + ';font-weight:700;white-space:nowrap">' + escapeHtml(r.code) + '<div style="font-size:10px;color:#94a3b8;font-weight:500">' + r.kind + '</div></td>'
-          + '<td style="' + cell + ';min-width:160px">' + escapeHtml(r.name) + '</td>'
-          + '<td style="' + cell + '">' + (r.file.length ? r.file.map(x => scLoc(x, false, vl)).join('') + (r.file.length > 1 ? '<div style="font-size:10.5px;color:#94a3b8">합 ' + fmtInt(Math.round(r.file_t)) + '</div>' : '') : none) + '</td>'
-          + '<td style="' + cell + '">' + (r.ama.length ? r.ama.map(x => scLoc(x, true, vl)).join('') + (r.ama.length > 1 ? '<div style="font-size:10.5px;color:#94a3b8">외주처 위치 합 ' + fmtInt(Math.round(r.ama_v)) + ' · 전체 ' + fmtInt(Math.round(r.ama_t)) + '</div>' : '') : none) + '</td>'
-          + '<td style="' + cell + ';text-align:right;white-space:nowrap;font-weight:800;color:' + (ok ? '#047857' : r.diff > 0 ? '#7c3aed' : '#dc2626') + '">' + (ok ? '일치' : (r.diff > 0 ? '+' : '') + fmtInt(Math.round(r.diff * 10) / 10)) + moved + '</td>'
-          + '<td style="' + cell + ';min-width:150px">' + (r.exp ? SC_EXP_CHIP : (ok ? '' : scWhyChips(r.why))) + '</td></tr>';
+        const moved = fv !== av ? '<div style="margin-top:4px;text-align:right"><span title="재고 파일: ' + escapeHtml(fv || '없음') + ' / 아마란스: ' + escapeHtml(av || '없음') + '" style="padding:1px 6px;border-radius:8px;font-size:10px;font-weight:700;background:#fef3c7;color:#92400e">위치 다름</span></div>' : '';
+        const col = (f, tot) => (lines.length ? lines.map(f).join('') : '<div class="scl"><span class="scn-none">외주처 기록 없음</span></div>') + (multi ? tot : '');
+        const refs = r.ama.filter(x => !vl.includes(x.loc));
+        return '<tr data-code="' + escapeHtml(r.code) + '" onclick="scToggleWhy(this)" title="클릭 = 차이 원인 자세히" style="' + (ok && !moved ? 'opacity:.6' : '') + '">'
+          + '<td style="' + cell + ';min-width:190px"><div class="scn-name">' + escapeHtml(r.name) + '</div><div class="scn-sub">' + escapeHtml(r.code) + ' · ' + r.kind + '</div></td>'
+          + '<td style="' + cell + '">' + col(l => '<div class="scl" title="' + escapeHtml(l.v) + '">' + escapeHtml(l.v) + '</div>', '<div class="scl tot">합계</div>') + '</td>'
+          + '<td style="' + cell + '">' + col(l => '<div class="scl num">' + num(l.f) + '</div>', '<div class="scl num tot">' + fmtInt(Math.round(r.file_t)) + '</div>') + '</td>'
+          + '<td style="' + cell + '">' + col(l => '<div class="scl num">' + num(l.a) + '</div>', '<div class="scl num tot">' + fmtInt(Math.round(r.ama_v)) + '</div>') + '</td>'
+          + '<td style="' + cell + '">' + col(l => '<div class="scl num" style="color:' + dcol(l.d) + ';font-weight:' + (multi ? 600 : 800) + '">' + dtxt(l.d) + '</div>',
+              '<div class="scl num tot" style="color:' + dcol(r.diff) + '">' + dtxt(r.diff) + '</div>') + moved + '</td>'
+          + '<td style="' + cell + ';min-width:170px">' + (r.exp ? SC_EXP_CHIP : (ok ? '' : scWhyNice(r.why))) + '</td>'
+          + '<td style="' + cell + '">' + (refs.length ? refs.map(x => '<div class="scl-ref" title="' + escapeHtml(x.wh + ' / ' + x.loc) + '">' + escapeHtml(refName(x.loc)) + ' <b>' + fmtInt(Math.round(x.q * 10) / 10) + '</b></div>').join('') : '<span class="scn-none">-</span>') + '</td></tr>';
       }).join('') + '</tbody></table>';
     _scPin();
+  }
+  // 품번 하나의 외주처별 줄 — 재고 파일 외주처(이름이 위치명으로 시작하면 그 위치로 묶음) + 아마란스 외주처 위치, |차이| 큰 순 (2026-11-18)
+  function _scVendorLines(r, vl) {
+    const key = v => vl.find(l => v === l || v.startsWith(l)) || v, m = new Map();
+    r.file.forEach(x => { const k = key(x.vendor), e = m.get(k) || { f: null, a: null }; e.f = (e.f || 0) + x.q; m.set(k, e); });
+    r.ama.filter(x => vl.includes(x.loc)).forEach(x => { const e = m.get(x.loc) || { f: null, a: null }; e.a = (e.a || 0) + x.q; m.set(x.loc, e); });
+    return [...m.entries()].map(([v, e]) => ({ v: v, f: e.f, a: e.a, d: (e.a || 0) - (e.f || 0) })).sort((p, q) => Math.abs(q.d) - Math.abs(p.d));
+  }
+  // 차이 원인 (2026-11-18 읽기 쉽게): 가장 큰 원인을 굵게 + 뜻 한마디, 나머지는 작은 회색 한 줄
+  const SC_WHY_HINT = { in: v => v > 0 ? '아마란스 입고가 더 많음' : '재고 파일 입고가 더 많음', use: v => v > 0 ? '재고 파일 사용이 더 많음' : '아마란스 출고가 더 많음',
+                        open: v => '1월 기초재고가 다름', roll: v => '재고 파일 월말·다음 달 기초가 안 맞음' };
+  function scWhyNice(w) {
+    if (w && w.side) return '<div class="scw-main" style="color:#475569"><span class="scw-dot" style="background:#94a3b8"></span><b>' + (w.side === 'ama0' ? '아마란스 기록 없음' : '재고 파일 기록 없음') + '</b></div>'
+      + '<div class="scw-rest">' + (w.side === 'ama0' ? '재고 파일에만 있는 품번' : '아마란스에만 남은 재고') + '</div>';
+    const ks = w ? SC_PARTS.filter(k => Math.abs(w[k] || 0) >= 0.5).sort((a, b) => Math.abs(w[b]) - Math.abs(w[a])) : [];
+    if (!ks.length) return '<span class="scn-none">-</span>';
+    const k = ks[0];
+    return '<div class="scw-main" title="' + SC_WHY_TIP[k] + '" style="color:' + SC_WHY[k][1] + '"><span class="scw-dot" style="background:' + SC_WHY[k][1] + '"></span><b>' + SC_WHY[k][0] + ' ' + _scSg(w[k]) + '</b>'
+      + '<span class="scw-hint">' + SC_WHY_HINT[k](w[k]) + '</span></div>'
+      + (ks.length > 1 ? '<div class="scw-rest">' + ks.slice(1).map(x => '<span title="' + SC_WHY_TIP[x] + '">' + SC_WHY[x][0] + ' ' + _scSg(w[x]) + '</span>').join(' · ') + '</div>' : '');
   }
   function renderScTable() {
     const d = _scData, el = document.getElementById('sc-table'); if (!d || !el) return;
@@ -21933,7 +21980,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
           + '<td style="' + cell + ';text-align:right;white-space:nowrap">' + n(r.ama) + (r.unit ? ' <span style="font-size:10px;color:#94a3b8">' + escapeHtml(r.unit) + '</span>' : '') + '</td>'
           + '<td style="' + cell + ';text-align:right;white-space:nowrap;font-weight:800;color:' + (r.st === 'same' ? '#94a3b8' : r.diff > 0 ? '#7c3aed' : '#dc2626') + '">' + (r.diff > 0 ? '+' : '') + fmtInt(Math.round(r.diff * 10) / 10) + '</td>'
           + '<td style="' + cell + '">' + bar + '</td>'
-          + '<td style="' + cell + ';min-width:150px">' + (r.exp ? SC_EXP_CHIP : (r.st === 'same' ? '' : scWhyChips(r.w))) + '</td>'
+          + '<td style="' + cell + ';min-width:170px">' + (r.exp ? SC_EXP_CHIP : (r.st === 'same' ? '' : scWhyNice(r.w))) + '</td>'
           + '<td style="' + cell + '">' + (r.f_other || []).map(x => scLoc(x, false, d.vendor_locs || [])).join('') + (r.a_other || []).map(x => scLoc(x, true, d.vendor_locs || [])).join('') + '</td></tr>';
       }).join('') + '</tbody></table>';
     _scPin();
