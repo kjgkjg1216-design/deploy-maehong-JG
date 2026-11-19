@@ -3890,13 +3890,36 @@ def is_부재료(raw_val: str) -> bool:
 # ────────────────────────────────────────────
 # 단가 조회 함수 (품번 → 단가, 없으면 품명 유사도 매칭)
 # ────────────────────────────────────────────
+def _spec_price_checks():
+    """사용자 단가 확인 결과 data/price_check_answers_YYYYMMDD.csv → 품번(대문자) → (확인 당시 규격표 단가, 확인 단가, 'YYYY-MM-DD').
+    2026-11-04: 발주 이력 없는 77개를 사용자가 한 건씩 확인(20건 변경). Monday 규격표는 그대로 둠(사용자가 Monday 반영은 거부).
+    2026-11-19부터 규격표 단가가 확인 뒤 바뀌었는지와 무관하게 적용(Monday 단가는 안 씀). 파일이 여럿이면 최신 파일이 덮어씀.
+    _build_price_lookup(모듈 로드 중 실행)도 쓰므로 그보다 위에 둠. GCP에도 있어야 함 → seed_latest.py가 동기화 대상에 넣음."""
+    out = {}
+    for f in sorted(glob.glob(os.path.join(DATA_DIR, 'price_check_answers_*.csv'))):
+        m = re.search(r'(\d{8})', os.path.basename(f))
+        day = f'{m.group(1)[:4]}-{m.group(1)[4:6]}-{m.group(1)[6:]}' if m else ''
+        try:
+            df = pd.read_csv(f, encoding='utf-8-sig', dtype=str).fillna('')
+        except Exception as e:
+            print(f'[단가 확인] {os.path.basename(f)} 읽기 실패: {e}')
+            continue
+        for c, b, p in zip(df.get('품번', []), df.get('규격표단가', []), df.get('확인단가', [])):
+            try:
+                out[str(c).strip().upper()] = (float(b), float(p), day)
+            except ValueError:
+                continue
+    return out
+
+
 def _build_price_lookup():
     """품번 → 단가 딕셔너리 + 품명 역색인 구축.
 
     2026-09-11 단가 자동화: 구매팀 월간 엑셀(PRICE_DF)에만 의존하던 것을
       ① 최신 발주단가(발주정보·외주발주정보, 매시간 수집) > ② 아마란스 품목 매입단가(PURCH_PRICE) > ③ 엑셀
     순으로 합성. 엑셀은 발주이력·매입단가가 없는 품목의 보조로만 쓰이므로 매달 갱신하지 않아도 된다.
-    info 필드: 단가·거래처·품명·시트종류·기준년월(출처 표기)·단가출처(발주|매입단가|엑셀)·엑셀단가."""
+    2026-11-19: ①과 ② 사이에 구매팀 확인 단가(①-b) — 부자재 규격 단가(_spec_ama_price)와 같은 순서 (사용자 "현재 단가 카드도 확인 단가로").
+    info 필드: 단가·거래처·품명·시트종류·기준년월(출처 표기)·단가출처(발주|확인|매입단가|엑셀)·엑셀단가."""
     by_code, by_name = {}, {}
     # ③ 엑셀 (기본 정보: 품명·시트종류·거래처)
     if PRICE_DF is not None and not PRICE_DF.empty:
@@ -3910,11 +3933,17 @@ def _build_price_lookup():
             if code:
                 by_code[code] = {'단가': price, '거래처': str(row.get('거래처', '')).strip(), '품명': name,
                                  '시트종류': str(row.get('시트종류', '')).strip(),
-                                 '기준년월': '엑셀 ' + str(row.get('기준년월', '')).strip(), '단가출처': '엑셀', '엑셀단가': price}
+                                 '기준년월': '엑셀 ' + str(row.get('기준년월', '')).strip(), '단가출처': '엑셀', '엑셀단가': price,
+                                 '엑셀기준': str(row.get('기준년월', '')).strip()}   # 다른 출처가 기준년월을 덮어써도 남김 (_spec_ama_price 단가표 순서용)
     # ② 아마란스 품목 매입단가
     for code, p in (PURCH_PRICE or {}).items():
         info = by_code.setdefault(code, {'단가': None, '거래처': '', '품명': '', '시트종류': '', '기준년월': '', '단가출처': '', '엑셀단가': None})
         info.update({'단가': p, '기준년월': '아마란스 매입단가', '단가출처': '매입단가'})
+    # ①-b 구매팀 확인 단가 (2026-11-04 부자재 77건 한 건씩 확인) — 매입단가·엑셀보다 앞, 최신 발주단가보다는 뒤.
+    #     확인 77건 중 8건은 매입단가가 옛 값(Monday 규격표와 같음)이라 사용자가 고친 것, 4건은 매입단가가 없음 (2026-11-19)
+    for code, (_b, p, day) in _spec_price_checks().items():
+        info = by_code.setdefault(code, {'단가': None, '거래처': '', '품명': '', '시트종류': '', '기준년월': '', '단가출처': '', '엑셀단가': None})
+        info.update({'단가': p, '기준년월': '구매팀 확인 ' + day, '단가출처': '확인'})
     # ① 최신 발주단가 (구매 발주 + 외주 발주). 품번별 최신 발주일자의 단가
     latest = {}
     for df_, kind in ((ORDER_DF, '발주'), (WP_ORDER_DF, '외주발주')):
@@ -4068,6 +4097,16 @@ def search_spec_by_query(query_lower: str) -> list:
 def format_spec_row(info: dict) -> str:
     parts = []
     for k in ['외주업체명', '품번', '납품처', '품명', '규격(사이즈)', '재질', 'MOQ', '단가(원)', '중량(g)']:
+        if k == '단가(원)':
+            # 단가 = 아마란스 기준 + 출처 (2026-11-19 사용자 "세 곳 다 아마란스 기준") — Monday 규격표 단가는 갱신이 늦어 안 씀
+            ama = _spec_ama_price(info.get('품번', ''))
+            if ama:
+                p = float(ama['price'])
+                ps = f'{p:,.0f}' if p == int(p) else f'{p:,.2f}'.rstrip('0').rstrip('.')
+                parts.append(f"단가(원): {ps} ({ama['label']})")
+            else:
+                parts.append('단가(원): 단가 없음 (아마란스·구매팀 단가표 모두 없음)')
+            continue
         v = info.get(k, '')
         if v and v not in ('', 'nan'):
             parts.append(f"{k}: {v}")
@@ -6410,7 +6449,8 @@ BOM 관련 질문에 답변할 때 반드시 아래 순서를 따르세요:
 - 품번으로 재고 데이터와 연결 가능
 - 규격(사이즈): 포장재 크기 (예: 70*175mm, 130*155+40mm)
 - 재질: 포장재 소재 구성 (예: 공판 PET12/AL7/NY15/CPR1 50)
-- MOQ: 최소주문수량, 단가(원): 부자재 단가, 중량(g): 무게
+- MOQ: 최소주문수량, 중량(g): 무게
+- 단가(원): 부자재 단가 = **아마란스 기준**(최근 발주가 › 구매팀 확인 단가 › 아마란스 품목 매입단가 › 없으면 구매팀 단가표). 괄호 안이 출처·날짜 → 단가를 답할 땐 출처도 함께 말할 것. "단가 없음"이면 단가를 지어내지 말 것
 - "재질 알려줘", "사이즈는?", "규격 정보" 등 질문 시 이 데이터 참조
 - 외주업체명으로 해당 업체의 모든 부자재 규격 조회 가능"""
 
@@ -6568,7 +6608,7 @@ def index():
             session['_last_visit_log'] = _t.time()
             _log_visit('visit')
     import json as _json
-    return render_template_string(DASHBOARD_TEMPLATE, public_mode=public_mode, host_pc=_IS_HOST_PC,
+    return render_template_string(DASHBOARD_TEMPLATE, public_mode=public_mode, panels_locked=_HOST_ONLY_LOCK,
                                   user_json=_json.dumps(current_user()))
 
 
@@ -6786,7 +6826,7 @@ def api_spec_design(item_id):
     Monday 파일 칸 URL은 Monday 로그인이 필요해 바로 못 열므로, 클릭 때마다 1시간짜리 공개 URL을 받아 넘긴다.
     시안 칸에 적힌 순서대로 [{name, ext, kind(image|pdf|file|link), url}]."""
     import requests as _req
-    if not _IS_HOST_PC:   # 부자재 규격 패널은 호스트 PC 전용
+    if _HOST_ONLY_LOCK:   # 호스트 PC 전용 잠금을 켰을 때만 (2026-11-19부터 기본 해제 — GCP에서도 시안 보기)
         return jsonify({'ok': False, 'error': '호스트 PC에서만 볼 수 있습니다'}), 403
     api_key = os.getenv('MONDAY_API_KEy')
     if not api_key:
@@ -6845,6 +6885,10 @@ def api_spec_design(item_id):
 _DSG_LOCKS = {}
 _DSG_LOCKS_GUARD = threading.Lock()
 _IS_HOST_PC = os.path.exists('C:/Users/jgkim/OneDrive')   # 로컬 PC(OneDrive 있음) / GCP 구분
+# 호스트 PC 전용 잠금 — 부자재 규격·시안, 입수 테스트, 예상 단가 계산기 (2026-10-28~29 사용자 "host만 볼 수 있도록 잠가 줘").
+# 2026-11-19 사용자 "HOST에서만 보이던 자료들은 이제 GCP서버에서도 보이도록" → 기본 해제. 다시 잠그려면 GCP 환경변수 HOST_ONLY_PANELS=1
+# (API는 {'locked': True, 빈 값}, 화면은 🔒 잠금 표시 — 잠금 코드는 그대로 둠)
+_HOST_ONLY_LOCK = (not _IS_HOST_PC) and os.environ.get('HOST_ONLY_PANELS', '') == '1'
 
 
 _DSG_HD = 6000   # 확대용 고해상도 긴 변(px) — 기본 2400px를 4배로 늘리면 글자가 깨짐(2026-10-29 사용자 지적)
@@ -7154,8 +7198,8 @@ def api_spec_design_preview(item_id, asset_id):
     from flask import send_file
     if not (str(item_id).isdigit() and str(asset_id).isdigit()):
         return jsonify({'ok': False, 'error': '잘못된 요청'}), 400
-    # GCP에선 호스트 PC가 토큰으로 받아 가는 것만 허용 (부자재 규격 패널은 호스트 전용)
-    if not _IS_HOST_PC and not (os.environ.get('RELOAD_TOKEN') and request.args.get('token') == os.environ.get('RELOAD_TOKEN')):
+    # 호스트 PC 전용 잠금을 켰으면 GCP에선 호스트 PC가 토큰으로 받아 가는 것만 허용 (2026-11-19부터 기본 해제 — 로그인 사용자도 봄)
+    if _HOST_ONLY_LOCK and not (os.environ.get('RELOAD_TOKEN') and request.args.get('token') == os.environ.get('RELOAD_TOKEN')):
         return jsonify({'ok': False, 'error': '호스트 PC에서만 볼 수 있습니다'}), 403
     hd = request.args.get('hd') == '1'
     if request.args.get('check') == '1' and _IS_HOST_PC:   # GCP가 변환해 뒀으면 이쪽 것을 지워 아래에서 새로 받게
@@ -9425,7 +9469,8 @@ def _report_data(ym):
             po_item[code]['amt'] += amt
             po_item[code]['qty'] += _num(r.get('발주수량', 0))
     trend = [{'ym': _ym_dash(k), 'sales': _find(mon.get('monthly', []), _ym_dash(k)).get('amount', 0) or 0,
-              'po': _month_sum(ORDER_DF, '발주일자', '합계금액', k)} for k in months]
+              'po': _month_sum(ORDER_DF, '발주일자', '합계금액', k),
+              'rcv': _month_sum(RCV_DF, '입고일자', '합계금액', k)} for k in months]   # rcv: 2026-11-19 발주·입고 추이 그래프용
 
     # 단가 변동 (해당 월에 바뀐 것)
     with app.test_request_context('/api/price_changes'):
@@ -9613,36 +9658,89 @@ def _report_snapshot():
 
 _REPORT_CSS = """
 <style>
- body{font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif;background:#f4f5f7;color:#1e293b;margin:0}
- .page{max-width:1000px;margin:0 auto;padding:28px 32px 60px;background:#fff}
- h1{font-size:22px;margin:0 0 4px} .sub{color:#64748b;font-size:12px;margin-bottom:18px}
- .nav a{font-size:12px;color:#4f46e5;text-decoration:none;margin-right:12px}
- .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:14px 0 22px}
- .kpi{border:1px solid #e2e8f0;border-radius:10px;padding:12px 14px}
- .kpi .l{font-size:11px;color:#64748b;font-weight:600} .kpi .v{font-size:20px;font-weight:800;margin-top:4px;font-variant-numeric:tabular-nums}
- .kpi .d{font-size:11px;margin-top:3px;font-weight:700} .up{color:#dc2626} .down{color:#2563eb} .flat{color:#64748b}
- h2{font-size:14px;margin:22px 0 8px;padding-bottom:6px;border-bottom:2px solid #e2e8f0}
- table{width:100%;border-collapse:collapse;font-size:12px} th{background:#f8fafc;color:#475569;font-weight:700;text-align:left;padding:6px 8px;border-bottom:1px solid #e2e8f0}
- td{padding:6px 8px;border-bottom:1px solid #f1f5f9} .num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
- .grid2{display:grid;grid-template-columns:1fr 1fr;gap:20px}
- .bar{display:flex;align-items:center;gap:8px;font-size:11px;margin:3px 0} .bar .lb{width:58px;color:#64748b}
- .bar .b{height:12px;border-radius:3px;background:#6366f1} .bar .b2{height:12px;border-radius:3px;background:#f59e0b}
- .bar .n{color:#475569;font-variant-numeric:tabular-nums}
- .note{font-size:11px;color:#94a3b8;margin-top:24px}
- .badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700}
- .ok{background:#f0fdf4;color:#16a34a} .warn{background:#fefce8;color:#ca8a04} .err{background:#fef2f2;color:#dc2626}
- /* 2026-11-18 추가 구역 */
- h3{font-size:12px;margin:10px 0 6px;color:#475569}
- .vrow{padding:6px 0 7px;border-bottom:1px solid #f1f5f9} .vrow .vh{display:flex;justify-content:space-between;font-size:12px;font-weight:700}
- .vrow .vh .rk{color:#94a3b8;margin-right:6px} .vrow .it{display:grid;grid-template-columns:48px 1fr auto 56px;gap:8px;font-size:10.5px;color:#64748b;padding:1px 0 0 18px}
- .vrow .it .q,.vrow .it .a{text-align:right;font-variant-numeric:tabular-nums} .vrow .it .a{color:#334155;font-weight:700}
- .vrow .more{font-size:10px;color:#94a3b8;padding:1px 0 0 18px}
- .shr{display:inline-block;height:8px;border-radius:2px;background:#2a78d6;vertical-align:0;margin-right:6px}
- .chips span{display:inline-block;margin:1px 6px 1px 0;font-size:11px;white-space:nowrap} .chips i{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:4px}
- .muted{color:#94a3b8} .snapnote{font-size:11px;color:#64748b;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:6px 10px;margin:4px 0 8px}
- .late{color:#dc2626;font-weight:700}
- @media print{body{background:#fff} .page{padding:0} .nav{display:none} .kpis{grid-template-columns:repeat(4,1fr)} .vrow,.grid2>div{break-inside:avoid}}
+ :root{--ink:#111827;--ink2:#374151;--mut:#6b7280;--mut2:#9ca3af;--line:#e5e7eb;--line2:#f1f2f4;--up:#dc2626;--down:#2563eb}
+ *{box-sizing:border-box}
+ body{font-family:'Malgun Gothic','Apple SD Gothic Neo',system-ui,sans-serif;background:#eef0f3;color:var(--ink);margin:0;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+ .page{max-width:1080px;margin:0 auto;padding:22px 40px 56px;background:#fff}
+ .nav{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:18px}
+ .nav a{font-size:12px;color:#374151;text-decoration:none;padding:5px 11px;border:1px solid var(--line);border-radius:7px;background:#fff}
+ .nav a:hover{background:#f3f4f6}
+ .cover{display:flex;justify-content:space-between;align-items:flex-end;flex-wrap:wrap;gap:10px 16px;padding-bottom:14px;border-bottom:2px solid var(--ink)}
+ .cover .k{font-size:12px;font-weight:700;color:var(--mut);letter-spacing:.04em}
+ .cover h1{font-size:30px;margin:4px 0 0;letter-spacing:-.01em}
+ .cover .meta{text-align:right;font-size:11.5px;color:var(--mut);line-height:1.8}
+ .badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700;vertical-align:3px;letter-spacing:0}
+ .ok{background:#ecfdf3;color:#15803d} .warn{background:#fef9c3;color:#a16207} .err{background:#fef2f2;color:#dc2626}
+ .summary{margin:16px 0 4px;padding:12px 18px 12px;background:#f8fafc;border:1px solid var(--line);border-radius:12px;break-inside:avoid}
+ .summary h3{margin:0 0 4px;font-size:13px}
+ .summary ul{margin:0;padding-left:18px} .summary li{font-size:12.5px;line-height:1.85;color:var(--ink2)} .summary li b{color:var(--ink)}
+ .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:14px 0 6px}
+ .kpi{border:1px solid var(--line);border-top:3px solid var(--c);border-radius:10px;padding:11px 14px 10px;break-inside:avoid}
+ .kpi .l{font-size:11.5px;color:var(--mut);font-weight:700}
+ .kpi .v{font-size:25px;font-weight:800;margin-top:3px;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+ .kpi .v small{font-size:13px;font-weight:700;margin-left:2px;color:var(--ink2)}
+ .kpi .d{display:block;font-size:11.5px;margin-top:3px;font-weight:700}
+ .kpi .s{font-size:11px;color:var(--mut);margin-top:2px}
+ .up{color:var(--up)} .down{color:var(--down)} .flat{color:var(--mut)}
+ .sec{margin-top:30px}
+ .sec-h{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;padding-bottom:8px;border-bottom:1px solid var(--line);margin-bottom:12px;break-after:avoid}
+ .sec-h .no{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;background:var(--ink);color:#fff;font-size:12px;font-weight:800;align-self:center}
+ .sec-h h2{font-size:17px;margin:0}
+ .sec-h .ds{font-size:11.5px;color:var(--mut)}
+ .sub-h{font-size:12.5px;font-weight:800;margin:18px 0 6px;color:var(--ink2);break-after:avoid}
+ .grid2{display:grid;grid-template-columns:1fr 1fr;gap:22px}
+ .grid2>div{min-width:0}
+ .tw{overflow-x:auto}
+ table{width:100%;border-collapse:collapse;font-size:12px}
+ th{background:#f8fafc;color:#4b5563;font-weight:700;text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);font-size:11.5px;white-space:nowrap}
+ td{padding:6px 8px;border-bottom:1px solid var(--line2);vertical-align:top}
+ tbody tr:nth-child(even) td{background:#fbfbfc}
+ .num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+ .rk{color:var(--mut2);font-weight:700;width:24px}
+ .muted{color:var(--mut2)} .sm{font-size:11px}
+ .sbar{display:inline-block;height:7px;border-radius:2px;vertical-align:1px}
+ .chart{border:1px solid var(--line);border-radius:10px;padding:10px 12px 4px;break-inside:avoid}
+ .chart .t{display:flex;justify-content:space-between;align-items:baseline;gap:8px;font-size:12.5px;font-weight:800;color:var(--ink2);margin-bottom:2px}
+ .chart .cv{overflow-x:auto}
+ .legend{font-size:11px;font-weight:600;color:var(--mut);display:flex;gap:12px} .legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;vertical-align:-1px}
+ .stack{display:flex;height:12px;gap:2px;margin:4px 0 8px} .stack i{display:block;height:100%} .stack i:first-child{border-radius:3px 0 0 3px} .stack i:last-child{border-radius:0 3px 3px 0}
+ .vbox{border:1px solid var(--line);border-radius:10px;padding:2px 12px}
+ .vrow{padding:8px 0;border-bottom:1px solid var(--line2);break-inside:avoid} .vrow:last-child{border-bottom:0}
+ .vh{display:flex;justify-content:space-between;gap:8px;font-size:12.5px;font-weight:800}
+ .vh .rk{display:inline-block;width:18px}
+ .vh .p{font-size:11px;font-weight:600;color:var(--mut);margin-left:6px}
+ .vit{display:grid;grid-template-columns:52px minmax(0,1fr) auto 54px;gap:8px;font-size:11px;color:#4b5563;padding:2px 0 0 18px}
+ .vit .q,.vit .a{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap} .vit .a{font-weight:700;color:var(--ink2)}
+ .vit .c,.vit .n{overflow:hidden;text-overflow:ellipsis;white-space:nowrap} .vit .c{color:var(--mut2)}
+ .vmore{font-size:10.5px;color:var(--mut2);padding:1px 0 0 18px}
+ .rate{display:inline-block;width:80px;height:7px;border-radius:4px;background:#eef0f3;vertical-align:1px;margin-right:8px;overflow:hidden} .rate i{display:block;height:100%}
+ .chips span{display:inline-block;margin:1px 10px 1px 0;font-size:11.5px;white-space:nowrap} .chips i{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:4px}
+ .snapnote{font-size:11px;color:#6b7280;background:#f8fafc;border:1px solid var(--line);border-radius:8px;padding:6px 10px;margin:0 0 10px}
+ .late{color:var(--up);font-weight:800}
+ .tl{line-height:1.55}
+ .empty{font-size:12px;color:var(--mut2);padding:6px 0}
+ .note{font-size:10.5px;color:var(--mut2);margin-top:30px;line-height:1.75;border-top:1px solid var(--line);padding-top:10px}
+ @media screen and (max-width:760px){.page{padding:16px} .kpis{grid-template-columns:repeat(2,1fr)} .grid2{grid-template-columns:1fr} .cover .meta{text-align:left} .chart svg{min-width:680px}}
+ @media print{body{background:#fff} .page{max-width:none;padding:0} .nav{display:none} .tw,.chart .cv{overflow:visible} tr{break-inside:avoid}
+  .vit{grid-template-columns:42px minmax(0,1fr) auto 46px;gap:6px;padding-left:14px}}
+ @page{size:A4;margin:12mm}
 </style>"""
+
+# 리포트 색 (2026-11-19 보기 개편 — 대시보드와 같은 검증 팔레트). f-string 식 안에 '#'를 못 쓰므로(GCP 파이썬 3.11) 변수로
+_RP_BLUE, _RP_ORANGE, _RP_AQUA = '#2a78d6', '#eb6834', '#1baf7a'
+_RP_INK, _RP_INK2, _RP_MUT, _RP_GRID, _RP_BASE, _RP_HL = '#111827', '#374151', '#6b7280', '#eceef1', '#c9cdd3', '#f3f4f6'
+_RP_RED, _RP_ORG2, _RP_AMBER, _RP_GREEN, _RP_GRAY, _RP_DOWN = '#dc2626', '#ea580c', '#ca8a04', '#16a34a', '#9ca3af', '#2563eb'
+_RP_CLS = {'자사': _RP_BLUE, '유상사급': _RP_ORANGE, '상품매입': _RP_AQUA}
+
+
+def _rp_esc(s):
+    return str(s).replace('&', '&amp;').replace('<', '&lt;').replace('"', '&quot;')
+
+
+def _rp_cut(s, n):
+    """긴 이름 자르기 — 잘렸으면 '…' 붙임."""
+    s = str(s or '').strip()
+    return s if len(s) <= n else s[:n].rstrip() + '…'
 
 
 def _fmt_won(v):
@@ -9654,230 +9752,410 @@ def _fmt_won(v):
     return f'{v:,}'
 
 
-# ── 월간 리포트 추가 구역 (2026-11-18) ──
-def _report_kpi_receipts(rc):
-    n = rc.get('total', 0)
-    if not n:
-        return ('<div class="kpi"><div class="l">입고 완료 (Monday)</div><div class="v" style="color:#94a3b8">없음</div>'
-                '<span class="d flat">해당 월 입고 완료 기록 없음</span></div>')
-    rate = rc.get('rate')
-    col = '#64748b' if rate is None else ('#16a34a' if rate >= 80 else ('#ca8a04' if rate >= 60 else '#dc2626'))
-    sub = f'요청일 준수 {rate}% ({rc.get("with_req", 0)}건 중)' if rate is not None else '요청일 자료 없음'
-    return f'<div class="kpi"><div class="l">입고 완료 (Monday)</div><div class="v">{n:,}건</div><span class="d" style="color:{col}">{sub}</span></div>'
+def _rp_delta(p):
+    if p is None:
+        return '<span class="d flat">전월 자료 없음</span>'
+    cls = 'up' if p > 0 else ('down' if p < 0 else 'flat')
+    ar = '▲' if p > 0 else ('▼' if p < 0 else '―')
+    return f'<span class="d {cls}">{ar} {abs(p)}% <span class="flat" style="font-weight:600">전월 대비</span></span>'
 
 
-def _report_sales_html(d, esc):
-    top, chs = d.get('sales_top') or [], d.get('ch_sales') or []
-    if not top and not chs:
-        return ''
-    tot = sum(x['amt'] for x in chs) or 1
-    mx = max([x['amt'] for x in chs] + [1])
-    h = ['<div class="grid2"><div><h2>제품 매출 TOP 10</h2><table><tr><th>제품</th><th>채널</th><th class="num">매출액</th></tr>']
-    for x in top:
-        nm, ch = esc((x.get('name') or '')[:30]), esc((x.get('div') or '')[:18])
-        h.append(f'<tr><td>{nm}</td><td class="muted" style="font-size:10.5px">{ch}</td><td class="num">{_fmt_won(x.get("amount", 0))}</td></tr>')
-    if not top:
-        h.append('<tr><td colspan=3 class="muted">없음</td></tr>')
-    h.append(f'</table><div class="muted" style="font-size:10.5px;margin-top:4px">판매 제품 {d.get("sales_count", 0)}종 중 상위 10</div></div>')
-    h.append('<div><h2>채널별 매출</h2><table><tr><th>채널</th><th class="num">매출액</th><th class="num">비중</th></tr>')
-    for x in chs:
-        w = x['amt'] / mx * 70
-        h.append(f'<tr><td><span class="shr" style="width:{w:.0f}px"></span>{esc(x["name"])}</td><td class="num">{_fmt_won(x["amt"])}</td>'
-                 f'<td class="num">{x["amt"] / tot * 100:.1f}%</td></tr>')
-    if not chs:
-        h.append('<tr><td colspan=3 class="muted">없음</td></tr>')
-    h.append('</table></div></div>')
-    return ''.join(h)
+def _rp_sec(no, title, desc=''):
+    return f'<div class="sec-h"><span class="no">{no}</span><h2>{title}</h2><span class="ds">{desc}</span></div>'
 
 
-def _report_vendor_html(d, esc):
-    po, rv = d.get('po_vendor_top5') or [], d.get('rcv_vendor_top5') or []
-    if not po and not rv:
-        return ''
+def _rp_nice_max(v):
+    """축 최대값 — 절반 눈금도 깔끔한 수(예 6억→3억, 1.4억→7,000만)."""
+    import math
+    if v <= 0:
+        return 1
+    p = 10 ** math.floor(math.log10(v))
+    for s in (1, 1.2, 1.4, 1.6, 2, 2.4, 3, 4, 5, 6, 8, 10):
+        if v / p <= s + 1e-9:
+            return s * p
+    return 10 * p
 
-    def col(title, rows):
-        h = [f'<div><h3>{title}</h3>']
-        if not rows:
-            h.append('<div class="muted" style="font-size:12px">없음</div>')
-        for i, v in enumerate(rows, 1):
-            h.append(f'<div class="vrow"><div class="vh"><span><span class="rk">{i}</span>{esc(v.get("name", ""))}</span>'
-                     f'<span>{_fmt_won(v.get("amount", 0))}원</span></div>')
-            for p in v.get('items', []):
-                q = p.get('qty') or 0
-                qs = f'{q:,.0f}' if abs(q - round(q)) < 1e-9 else f'{q:,.2f}'
-                code, nm, unit = esc(p.get('code') or ''), esc((p.get('name') or '')[:26]), esc(p.get('unit') or '')
-                h.append(f'<div class="it"><span>{code}</span><span>{nm}</span><span class="q">{qs} {unit}</span>'
-                         f'<span class="a">{_fmt_won(p.get("amount", 0))}</span></div>')
-            more = (v.get('n_items') or 0) - len(v.get('items', []))
-            if more > 0:
-                h.append(f'<div class="more">외 {more}품목</div>')
-            h.append('</div>')
+
+def _rp_bar(x, y, w, h, fill, op, tip):
+    """윗면만 둥근 막대(바닥선은 각지게) + 마우스 올리면 값."""
+    r = min(4, w / 2, h)
+    yb = y + h
+    d = (f'M{x:.1f},{yb:.1f}V{y + r:.1f}Q{x:.1f},{y:.1f} {x + r:.1f},{y:.1f}H{x + w - r:.1f}'
+         f'Q{x + w:.1f},{y:.1f} {x + w:.1f},{y + r:.1f}V{yb:.1f}Z')
+    return f'<path d="{d}" fill="{fill}" opacity="{op}"><title>{tip}</title></path>'
+
+
+def _rp_svg_cols(trend, series, ym_dash):
+    """12개월 막대 SVG — series=[(키, 이름, 색)]. 리포트 달은 진하게 + 바탕 띠, 나머지 달은 옅게.
+    막대 아래에 달마다 금액 줄(표 대신) — 막대 위에 숫자를 다 얹지 않고도 인쇄본에서 값을 읽을 수 있게.
+    viewBox 폭 760 = 화면(약 970px)에선 1.3배, A4 인쇄(약 680px)에선 0.9배 — 두 곳 모두 글씨가 읽히는 크기."""
+    W, L, R, T, PH = 760, 50, 4, 12, 140
+    FS, RP = 10, 16                  # 금액·눈금 글씨, 금액 줄 간격
+    rows = len(series)
+    XL = T + PH + 15                 # 달 이름 줄
+    H = XL + 6 + RP * rows + 4
+    pw = W - L - R
+    raw = max([t.get(k) or 0 for t in trend for k, _, _ in series] + [0])
+    if raw <= 0:   # 12개월 내내 자료 없음 (예: 판매 API 수집 전 달)
+        return '<div class="empty" style="padding:24px 0;text-align:center">최근 12개월 자료 없음</div>'
+    mx = _rp_nice_max(raw)
+    n = max(1, len(trend))
+    band = pw / n
+    gw = min(34 if rows == 1 else 40, band * 0.66)
+    bw = (gw - 2 * (rows - 1)) / rows
+    s = [f'<svg viewBox="0 0 {W} {H}" width="100%" role="img" aria-label="최근 12개월 막대 그래프" style="display:block;font-family:inherit">']
+    for i, t in enumerate(trend):    # 리포트 달 바탕 띠 (막대·달·금액 줄 전체)
+        if t['ym'] == ym_dash:
+            s.append(f'<rect x="{L + i * band + 1:.1f}" y="0" width="{band - 2:.1f}" height="{H}" rx="5" fill="{_RP_HL}"/>')
+    for f in (0.5, 1):
+        y = T + PH * (1 - f)
+        ax = _fmt_won(mx * f).replace('.0억', '억')   # 축 눈금은 '12억'처럼 짧게
+        s.append(f'<line x1="{L}" x2="{W - R}" y1="{y:.1f}" y2="{y:.1f}" stroke="{_RP_GRID}" stroke-width="1"/>')
+        s.append(f'<text x="{L - 6}" y="{y + 3.5:.1f}" font-size="{FS}" fill="{_RP_MUT}" text-anchor="end">{ax}</text>')
+    s.append(f'<text x="{L - 6}" y="{T + PH + 3.5:.1f}" font-size="{FS}" fill="{_RP_MUT}" text-anchor="end">0</text>')
+    for i, t in enumerate(trend):
+        hot = t['ym'] == ym_dash
+        lab = t['ym'][2:4] + '/' + t['ym'][5:7]
+        x0 = L + i * band + (band - gw) / 2
+        cx = L + i * band + band / 2
+        for j, (k, nm, col) in enumerate(series):
+            v = t.get(k) or 0
+            h = PH * v / mx if mx else 0
+            if h > 0:
+                s.append(_rp_bar(x0 + j * (bw + 2), T + PH - h, bw, h, col, '1' if hot else '0.45', f'{lab} {nm} {_fmt_won(v)}원'))
+            fw, fc = ('800', _RP_INK) if hot else ('500', _RP_INK2)
+            vt = _fmt_won(v) if v else '-'
+            s.append(f'<text x="{cx:.1f}" y="{XL + 6 + RP * j + 11}" font-size="{FS}" font-weight="{fw}" fill="{fc}" text-anchor="middle">{vt}</text>')
+        fw, fc = ('800', _RP_INK) if hot else ('500', _RP_MUT)
+        s.append(f'<text x="{cx:.1f}" y="{XL}" font-size="10.5" font-weight="{fw}" fill="{fc}" text-anchor="middle">{lab}</text>')
+    s.append(f'<line x1="{L}" x2="{W - R}" y1="{T + PH:.1f}" y2="{T + PH:.1f}" stroke="{_RP_BASE}" stroke-width="1"/>')
+    for j, (k, nm, col) in enumerate(series):   # 금액 줄 이름 (= 범례)
+        y = XL + 6 + RP * j + 11
+        s.append(f'<rect x="1" y="{y - 8}" width="8" height="8" rx="2" fill="{col}"/>'
+                 f'<text x="12" y="{y}" font-size="{FS}" font-weight="700" fill="{_RP_INK2}">{nm}</text>')
+    s.append('</svg>')
+    return ''.join(s)
+
+
+def _rp_summary(d):
+    """맨 위 '이달 요약' — 숫자를 문장으로 (2026-11-19)."""
+    esc = _rp_esc
+    out = []
+    pctx = lambda p: '' if p is None else (' (전월 대비 ' + ('▲' if p > 0 else '▼' if p < 0 else '―') + f' {abs(p)}%)')
+    s = d['sales_monday']
+    if s['cur']:
+        ch = (d.get('ch_sales') or [])[:1]
+        top = (d.get('sales_top') or [])[:1]
+        tot = sum(x['amt'] for x in d.get('ch_sales') or []) or 1
+        line = f'매출(판매 API 채널) <b>{_fmt_won(s["cur"])}원</b>{pctx(s["pct"])}'
+        if ch:
+            line += f' — 채널 1위 {esc(ch[0]["name"])} {_fmt_won(ch[0]["amt"])}원 ({ch[0]["amt"] / tot * 100:.0f}%)'
+        if top:
+            line += f', 제품 1위 {esc(_rp_cut(top[0].get("name"), 36))}'
+        out.append(line)
+    else:
+        out.append('매출(판매 API 채널) 자료 없음')
+    po, rc = d['po'], d['rcv']
+    line = f'발주 <b>{_fmt_won(po["cur"])}원</b>{pctx(po["pct"])} · 입고 <b>{_fmt_won(rc["cur"])}원</b>{pctx(rc["pct"])}'
+    v = (d.get('po_vendor_top5') or [])[:1]
+    if v and po['cur']:
+        it = (v[0].get('items') or [{}])[0]
+        line += f' — 발주 1위 {esc(_co_short(v[0].get("name", "")))} {_fmt_won(v[0].get("amount", 0))}원 ({v[0].get("amount", 0) / po["cur"] * 100:.0f}%)'
+        if it.get('name'):
+            line += f', 주로 {esc(_rp_cut(it["name"], 24))}'
+    out.append(line)
+    r = d.get('receipts') or {}
+    if r.get('total'):
+        late = r.get('late') or []
+        late_n = sum(k.get('late', 0) for k in r.get('kinds', []))
+        line = f'입고 완료 <b>{r["total"]}건</b>'
+        if r.get('rate') is not None:
+            line += f' · 요청일 준수 <b>{r["rate"]}%</b> (늦은 입고 {late_n}건)'
+        if late:
+            line += f' — 가장 늦은 건 {esc(late[0]["code"])} {esc(_rp_cut(late[0].get("name"), 24))} +{late[0]["delay"]}일'
+        out.append(line)
+    pcs = d.get('price_changes') or []
+    if pcs:
+        upn = sum(1 for x in pcs if x['pct'] > 0)
+        imp = sum(x.get('impact') or 0 for x in pcs)
+        sign = '+' if imp > 0 else ('−' if imp < 0 else '')
+        out.append(f'단가 변동 <b>{len(pcs)}건</b> (오름 {upn} · 내림 {len(pcs) - upn}) — 월 영향 합 <b>{sign}{_fmt_won(abs(imp))}원</b>')
+    else:
+        out.append('이달 3% 이상 단가 변동 없음')
+    sn = d.get('snap') or {}
+    if sn:
+        g = lambda k: ((sn.get(k) or {}).get('c') or {}).get('out', 0)
+        out.append(f'지금 품절 — 자사 부자재 <b>{g("stock_jasa")}</b> · 외주 부자재 <b>{g("stock_outsource")}</b> · 채널 <b>{g("channel")}</b> · '
+                   f'완제품 창고 <b>{g("plan")}</b> <span class="muted">({sn.get("at", "")} 기준)</span>')
+    return out
+
+
+def _rp_vendor_box(rows, total):
+    esc = _rp_esc
+    if not rows:
+        return '<div class="empty">없음</div>'
+    h = ['<div class="vbox">']
+    for i, v in enumerate(rows, 1):
+        share = f'{v.get("amount", 0) / total * 100:.0f}%' if total else ''
+        h.append(f'<div class="vrow"><div class="vh"><span><span class="rk">{i}</span>{esc(_co_short(v.get("name", "")))}<span class="p">{share}</span></span>'
+                 f'<span>{_fmt_won(v.get("amount", 0))}원</span></div>')
+        for p in v.get('items', []):
+            q = p.get('qty') or 0
+            qs = f'{q:,.0f}' if abs(q - round(q)) < 1e-9 else f'{q:,.1f}'
+            code, nm, unit = esc(p.get('code') or ''), esc(p.get('name') or ''), esc(p.get('unit') or '')
+            h.append(f'<div class="vit"><span class="c">{code}</span><span class="n" title="{nm}">{nm}</span><span class="q">{qs} {unit}</span>'
+                     f'<span class="a">{_fmt_won(p.get("amount", 0))}</span></div>')
+        more = (v.get('n_items') or 0) - len(v.get('items', []))
+        if more > 0:
+            h.append(f'<div class="vmore">외 {more}품목</div>')
         h.append('</div>')
-        return ''.join(h)
-    return '<h2>발주·입고 거래처 TOP 5 · 주요 품목 (금액 큰 순 3개)</h2><div class="grid2">' + col('📦 발주', po) + col('📥 입고', rv) + '</div>'
-
-
-def _report_receipts_html(rc, esc):
-    head = '<h2>입고 요청일 준수 (Monday 입고 완료)</h2>'
-    if not rc.get('kinds'):
-        return head + '<div class="muted" style="font-size:12px">해당 월 입고 완료 기록 없음</div>'
-    h = [head, '<table><tr><th>구분</th><th class="num">입고</th><th class="num">준수율</th><th class="num">지연 (평균)</th></tr>']
-    for k in rc['kinds']:
-        r = k['rate']
-        rate = '-' if r is None else f'{r}%'
-        st = '' if r is None else ' style="font-weight:700;color:' + ('#16a34a' if r >= 80 else ('#ca8a04' if r >= 60 else '#dc2626')) + '"'
-        late = f'{k["late"]}건 ({k["late_avg"]}일)' if k.get('late') else ('-' if r is None else '0')
-        h.append(f'<tr><td>{esc(k["kind"])}</td><td class="num">{k["n"]}건</td><td class="num"{st}>{rate}</td><td class="num">{late}</td></tr>')
-    h.append('</table><div class="muted" style="font-size:10.5px;margin-top:4px">준수 = 요청 입고일 이내 입고 · 원료·수입은 요청일 칸이 없어 건수만</div>')
+    h.append('</div>')
     return ''.join(h)
 
 
-def _report_late_html(rc, esc):
-    late = rc.get('late') or []
-    if not late:
-        return ''
-    h = ['<h2>입고 지연 TOP (요청일보다 늦은 순)</h2><table><tr><th>구분</th><th>품번</th><th>품명</th><th>업체 → 입고처</th>'
-         '<th class="num">요청일</th><th class="num">입고일</th><th class="num">지연</th></tr>']
-    for x in late:
-        nm, who = esc((x.get('name') or '')[:24]), esc((x.get('who') or '')[:30])
-        h.append(f'<tr><td style="font-size:11px">{esc(x["kind"])}</td><td>{esc(x["code"])}</td><td>{nm}</td><td style="font-size:11px">{who}</td>'
-                 f'<td class="num">{x["req"][5:]}</td><td class="num">{x["done"][5:]}</td><td class="num late">+{x["delay"]}일</td></tr>')
-    h.append('</table>')
-    return ''.join(h)
-
-
-def _report_snapshot_html(snap, esc):
-    if not snap:
-        return ''
-    LVC = {'out': '#dc2626', 'critical': '#ea580c', 'warning': '#ca8a04', 'low': '#16a34a', 'ok': '#9ca3af'}
-
-    def chips(c, labels):
-        out = []
-        for k, lb in labels:
-            n = (c or {}).get(k, 0)
-            dot = LVC.get(k, '#9ca3af') if n else '#d1d5db'   # f-string 식 안에 '#' 금지(GCP 파이썬 3.11)
-            out.append(f'<span><i style="background:{dot}"></i>{lb} <b>{n}</b></span>')
-        return '<div class="chips">' + ''.join(out) + '</div>'
-    stock_lb = [('out', '품절'), ('critical', '15일↓'), ('warning', '30일↓'), ('low', '45일↓')]
-    rows = []
-    for key, title, labels in (('stock_jasa', '자사 재고 경고 (45일 이하)', stock_lb), ('stock_outsource', '외주 재고 경고 (45일 이하)', stock_lb),
-                               ('channel', '채널 품절 경보 (7일 미만)', [('out', '품절'), ('critical', '3일↓'), ('warning', '7일↓')]),
-                               ('plan', '완제품 수급 (창고 재고)', [('out', '품절'), ('critical', '2주↓'), ('warning', '4주↓'), ('low', '8주↓'), ('ok', '여유')])):
-        s = snap.get(key)
-        if not s:
-            continue
-        top = ', '.join(esc(t) for t in s.get('top', []) if t) or '-'
-        rows.append(f'<tr><td>{title}</td><td>{chips(s.get("c"), labels)}</td><td style="font-size:11px;color:#475569">{top}</td></tr>')
-    ex = snap.get('excess')
-    if ex:
-        e1, lg = ex.get('excess') or {}, ex.get('long') or {}
-        top = ', '.join(esc(t) for t in ex.get('top', []) if t) or '-'
-        rows.append(f'<tr><td>부재료 과잉·장기</td><td class="chips"><span>과잉(6개월치 초과·안 씀) <b>{e1.get("n", 0)}</b>품목 · <b>{_fmt_won(e1.get("value", 0))}원</b></span>'
-                    f'<span>폐기&amp;장기 창고 <b>{lg.get("n", 0)}</b>품목 · <b>{_fmt_won(lg.get("value", 0))}원</b></span></td>'
-                    f'<td style="font-size:11px;color:#475569">{top}</td></tr>')
-    h = ['<h2>재고·수급·거래처 현황 <span class="badge warn" style="vertical-align:2px">생성 시점</span></h2>',
-         f'<div class="snapnote">{snap.get("at", "")} 기준 값입니다(그달 마감 값이 아님). 매월 1~5일 자동 저장본은 전월 말과 가까운 값입니다.</div>']
-    if rows:
-        h.append('<table><tr><th style="width:170px">항목</th><th>현황</th><th>주요 품목 (품절·과잉 상위)</th></tr>' + ''.join(rows) + '</table>')
-    vs = snap.get('vendors') or []
-    if vs:
-        vk = {'po': '구매', 'wp': '외주', 'both': '구매·외주'}
-        fm = lambda x, suf: '-' if x is None else f'{x}{suf}'
-        h.append('<h3>거래처 평가 — 최근 12개월 금액 상위 8 (거래처 스코어카드)</h3><table><tr><th>거래처</th><th>구분</th><th class="num">점수</th>'
-                 '<th class="num">납기 준수</th><th class="num">입고 충족</th><th class="num">리드</th><th class="num">단가 변동</th><th class="num">금액</th></tr>')
-        for v in vs:
-            sc = v.get('score')
-            scol = '#94a3b8' if sc is None else ('#16a34a' if sc >= 80 else ('#ca8a04' if sc >= 60 else '#dc2626'))
-            sct = '-' if sc is None else sc
-            h.append(f'<tr><td>{esc(_co_short(v.get("vendor", "")))}</td><td style="font-size:11px">{vk.get(v.get("kind"), "")}</td>'
-                     f'<td class="num" style="color:{scol};font-weight:800">{sct}</td><td class="num">{fm(v.get("ontime"), "%")}</td>'
-                     f'<td class="num">{fm(v.get("fill"), "%")}</td><td class="num">{fm(v.get("lead"), "일")}</td>'
-                     f'<td class="num">{v.get("price_changes", 0)}건</td><td class="num">{_fmt_won(v.get("amt", 0))}원</td></tr>')
-        h.append('</table>')
-    return ''.join(h)
+def _rp_rate_bar(r):
+    if r is None:
+        return '<span class="muted">-</span>'
+    c = _RP_GREEN if r >= 80 else (_RP_AMBER if r >= 60 else _RP_RED)
+    return f'<span class="rate"><i style="width:{max(2, r)}%;background:{c}"></i></span><b style="color:{c}">{r}%</b>'
 
 
 def _report_html(d):
-    def pct(p):
-        if p is None:
-            return '<span class="d flat">전월 데이터 없음</span>'
-        cls = 'up' if p > 0 else ('down' if p < 0 else 'flat')
-        return f'<span class="d {cls}">{"▲" if p > 0 else ("▼" if p < 0 else "―")} {abs(p)}% vs 전월</span>'
-    def kpi(label, cur, p, extra=''):
-        if not cur:   # 당월 데이터 자체가 없음(예: Monday 매출 미입력) — −100%로 오해되지 않게
-            return f'<div class="kpi"><div class="l">{label}</div><div class="v" style="color:#94a3b8">미입력</div><span class="d flat">해당 월 데이터 없음</span>{extra}</div>'
-        return f'<div class="kpi"><div class="l">{label}</div><div class="v">{_fmt_won(cur)}원</div>{pct(p)}{extra}</div>'
+    """월간 리포트 HTML (2026-11-19 보기 개편, 사용자 "자료가 너무 보기 불편 → 가독성"):
+    표지 머리(달·생성 시각·자료 상태) → 이달 요약(문장) → 큰 숫자 4칸 → 번호 붙은 장
+    매출 · 구매·입고 · 입고 일정 · 단가 변동 · 재고·수급(생성 시점) · 거래처 평가(생성 시점) · 운영 기록.
+    12개월 추이는 SVG 막대(리포트 달 진하게 + 아래 금액 줄), 금액은 억·만으로 통일, 표는 숫자 오른쪽 정렬·줄무늬."""
     y, m = d['ym'][:4], int(d['ym'][4:6])
-    esc = lambda s: str(s).replace('&', '&amp;').replace('<', '&lt;')
-    cur_tag = ' <span class="badge warn">진행중</span>' if d['sales_csv']['is_current'] else ''
+    esc = _rp_esc
+    hc = {'ok': 'ok', 'warn': 'warn'}.get(d['health']['overall'], 'err')
+    cur_tag = ' <span class="badge warn">진행 중인 달</span>' if d['sales_csv']['is_current'] else ''
+    prev_ym, next_ym = _ym_shift(d['ym'], -1), _ym_shift(d['ym'], 1)
     h = [_REPORT_CSS, '<div class="page">',
-         f'<div class="nav"><a href="/report/monthly?ym={_ym_shift(d["ym"], -1)}">◀ 전월</a>'
-         f'<a href="/report/monthly?ym={_ym_shift(d["ym"], 1)}">다음달 ▶</a><a href="/">대시보드</a>'
-         f'<a href="#" onclick="window.print();return false">🖨 인쇄/PDF</a></div>',
-         f'<h1>📊 {y}년 {m}월 월간 리포트{cur_tag}</h1>',
-         f'<div class="sub">매홍 구매/외주 대시보드 · 생성 {d["generated"]} · 데이터 상태: '
-         f'<span class="badge {"ok" if d["health"]["overall"]=="ok" else ("warn" if d["health"]["overall"]=="warn" else "err")}">{esc(d["health"]["summary"])}</span></div>',
-         '<div class="kpis">',
-         kpi('매출 (판매자료·공급가)', d['sales_monday']['cur'], d['sales_monday']['pct'],
-             f'<div class="d flat">판매 {int(d["sales_csv"]["qty"]):,}개</div>'),
-         kpi('구매 발주액', d['po']['cur'], d['po']['pct']),
-         kpi('입고액', d['rcv']['cur'], d['rcv']['pct']),
-         _report_kpi_receipts(d.get('receipts') or {}),
-         '</div>']
-    # 12개월 추이
-    mx_s = max([t['sales'] for t in d['trend']] + [1]); mx_p = max([t['po'] for t in d['trend']] + [1])
-    h.append('<h2>12개월 추이</h2><div class="grid2"><div><div style="font-size:11px;color:#64748b;margin-bottom:4px">매출 (판매자료·공급가)</div>')
-    for t in d['trend']:
-        h.append(f'<div class="bar"><span class="lb">{t["ym"][2:]}</span><div class="b" style="width:{t["sales"]/mx_s*260:.0f}px"></div><span class="n">{_fmt_won(t["sales"])}</span></div>')
-    h.append('</div><div><div style="font-size:11px;color:#64748b;margin-bottom:4px">구매 발주액</div>')
-    for t in d['trend']:
-        h.append(f'<div class="bar"><span class="lb">{t["ym"][2:]}</span><div class="b2" style="width:{t["po"]/mx_p*260:.0f}px"></div><span class="n">{_fmt_won(t["po"])}</span></div>')
-    h.append('</div></div>')
-    # 채널 매출 분류
-    if d['sales_csv']['by_class']:
-        h.append('<h2>매출 분류별</h2><table><tr><th>분류</th><th class="num">매출액</th><th class="num">비중</th></tr>')
-        tot = d['sales_csv']['cur'] or 1
-        for k, v in sorted(d['sales_csv']['by_class'].items(), key=lambda x: -x[1]):
-            h.append(f'<tr><td>{esc(k)}</td><td class="num">{int(v):,}원</td><td class="num">{v/tot*100:.1f}%</td></tr>')
-        h.append('</table>')
-    # 제품 매출 TOP 10 · 채널별 매출 (2026-11-18 추가)
-    h.append(_report_sales_html(d, esc))
-    # 발주·입고 거래처 TOP 5 + 주요 품목 (2026-11-18: 예전 '발주 거래처 TOP 5'를 입고까지·품목 포함으로)
-    h.append(_report_vendor_html(d, esc))
-    # 발주 품목 TOP 5 · 입고 일정 준수 (2026-11-18 추가)
-    h.append('<div class="grid2"><div><h2>발주 품목 TOP 5</h2><table><tr><th>품번</th><th>품명</th><th class="num">수량</th><th class="num">발주액</th></tr>')
-    h += [f'<tr><td>{esc(x["code"])}</td><td>{esc(x["name"][:24])}</td><td class="num">{x["qty"]:,.0f}</td><td class="num">{int(x["amt"]):,}원</td></tr>' for x in d['po_item_top']] or ['<tr><td colspan=4>없음</td></tr>']
-    h.append('</table></div><div>' + _report_receipts_html(d.get('receipts') or {}, esc) + '</div></div>')
-    h.append(_report_late_html(d.get('receipts') or {}, esc))
-    # 단가 변동
-    h.append('<h2>이달 단가 변동 (영향액순)</h2>')
-    if d['price_changes']:
-        h.append('<table><tr><th>품번</th><th>품명</th><th>거래처</th><th class="num">이전→현재</th><th class="num">변동</th><th class="num">월 영향액</th></tr>')
-        for x in d['price_changes']:
-            cls = 'up' if x['pct'] > 0 else 'down'
-            h.append(f'<tr><td>{esc(x["code"])}</td><td>{esc(x["name"][:24])}</td><td>{esc(x["vendor"][:12])}</td>'
-                     f'<td class="num">{x["prev"]:,.0f}→{x["cur"]:,.0f}</td><td class="num {cls}"><b>{"+" if x["pct"]>0 else ""}{x["pct"]}%</b></td>'
-                     f'<td class="num">{x["impact"]:+,}원</td></tr>')
-        h.append('</table>')
+         f'<div class="nav"><a href="/report/monthly?ym={prev_ym}">◀ 전월</a><a href="/report/monthly?ym={next_ym}">다음달 ▶</a>'
+         '<a href="/">대시보드</a><a href="#" onclick="window.print();return false">🖨 인쇄 · PDF</a></div>',
+         '<div class="cover"><div><div class="k">매홍 구매 · 외주 월간 리포트</div>'
+         f'<h1>{y}년 {m}월{cur_tag}</h1></div>'
+         f'<div class="meta">생성 {d["generated"]}<br>자료 상태 <span class="badge {hc}">{esc(d["health"]["summary"])}</span></div></div>']
+    # 이달 요약
+    h.append('<div class="summary"><h3>이달 요약</h3><ul>' + ''.join('<li>' + x + '</li>' for x in _rp_summary(d)) + '</ul></div>')
+    # 큰 숫자 4칸
+    s, po, rc, rr = d['sales_monday'], d['po'], d['rcv'], d.get('receipts') or {}
+
+    def kpi(label, val, delta, sub, color):
+        if not val:
+            return (f'<div class="kpi" style="--c:{color}"><div class="l">{label}</div><div class="v" style="color:{_RP_GRAY}">-</div>'
+                    f'<span class="d flat">해당 월 자료 없음</span></div>')
+        return f'<div class="kpi" style="--c:{color}"><div class="l">{label}</div><div class="v">{val}</div>{delta}<div class="s">{sub}</div></div>'
+    rate = rr.get('rate')
+    late_n = sum(k.get('late', 0) for k in rr.get('kinds', []))
+    rate_col = _RP_GRAY if rate is None else (_RP_GREEN if rate >= 80 else (_RP_AMBER if rate >= 60 else _RP_RED))
+    if rate is not None:
+        rate_val, rate_d = f'{rate}<small>%</small>', f'<span class="d" style="color:{rate_col}">늦은 입고 {late_n}건</span>'
+    elif rr.get('total'):   # 입고는 있는데 요청일 칸이 없는 것만(원료 등) — 건수만
+        rate_val, rate_d = f'{rr.get("total", 0)}<small>건 입고</small>', '<span class="d flat">요청일 자료 없음</span>'
     else:
-        h.append('<div style="font-size:12px;color:#64748b">이달 3% 이상 단가 변동 없음</div>')
-    # 재고·수급·거래처 현황 (생성 시점, 2026-11-18 추가)
-    h.append(_report_snapshot_html(d.get('snap'), esc))
-    # 재고 마감 + 알림
-    h.append('<div class="grid2"><div><h2>재고 마감 스냅샷</h2><table><tr><th>구분</th><th class="num">품목수</th><th class="num">재고 0</th><th>파일</th></tr>')
-    for k, v in d['closing'].items():
-        h.append(f'<tr><td>{k}</td><td class="num">{v["rows"]:,}</td><td class="num">{v["zero"] if v["zero"] is not None else "-"}</td><td style="font-size:10.5px;color:#94a3b8">{esc(v["file"])}</td></tr>'
-                 if v else f'<tr><td>{k}</td><td colspan=3 style="color:#94a3b8">마감 파일 없음 (해당 월 자동보관 전)</td></tr>')
-    h.append('</table></div><div><h2>알림 이력</h2><table><tr><th>종류</th><th class="num">건수</th></tr>')
-    names = {'out': '🔴 신규 품절', 'reorder': '🕐 지금 발주 진입', 'health': '⚠️ 데이터 이상', 'daily': '☀️ 아침 요약', 'report': '📊 월간 리포트',
-             'chstock': '🏪 채널 품절', 'vendor': '👥 거래처 기록 끊김', 'sales': '📥 판매 자료 반영', 'closing': '📗 마감 자동 반영'}   # 2026-11-18 이름 없던 종류 추가
-    h += [f'<tr><td>{names.get(k, k)}</td><td class="num">{v}</td></tr>' for k, v in sorted(d['alerts'].items())] or ['<tr><td colspan=2 style="color:#94a3b8">알림 없음</td></tr>']
-    h.append('</table></div></div>')
-    h.append('<div class="note">※ 매출은 온라인팀 판매자료(쿠팡·마트 등 판매 API 채널) 공급가 합계, VAT 제외 — 회사 전체 매출이 아님 · 발주/입고는 아마란스 합계금액(거래처·품목 합 같은 기준) · '
-             '입고 요청일 준수는 Monday 입고 완료 기록(부자재 입고일 vs 입고 요청일, 외주 출고일 vs 요청 입고일) · 단가 변동은 발주단가 3% 이상 변경분 · '
-             '재고·수급·거래처 현황은 리포트 생성 시점 값 · 재고 마감은 매월 자동보관 스냅샷</div>')
+        rate_val, rate_d = '', ''
+    h.append('<div class="kpis">'
+             + kpi('매출 (판매 API 채널)', (_fmt_won(s['cur']) + '<small>원</small>') if s['cur'] else '', _rp_delta(s['pct']),
+                   f'전월 {_fmt_won(s["prev"])}원<br>판매 {int(d["sales_csv"]["qty"]):,}개', _RP_BLUE)
+             + kpi('구매 발주액', (_fmt_won(po['cur']) + '<small>원</small>') if po['cur'] else '', _rp_delta(po['pct']),
+                   f'전월 {_fmt_won(po["prev"])}원', _RP_INK2)
+             + kpi('입고액', (_fmt_won(rc['cur']) + '<small>원</small>') if rc['cur'] else '', _rp_delta(rc['pct']),
+                   f'전월 {_fmt_won(rc["prev"])}원', _RP_ORANGE)
+             + kpi('입고 요청일 준수', rate_val, rate_d,
+                   f'Monday 입고 완료 {rr.get("total", 0)}건<br>요청일 있는 {rr.get("with_req", 0)}건 기준', rate_col)
+             + '</div>')
+    no = 0
+    # ── 매출 ──
+    no += 1
+    h.append('<div class="sec">' + _rp_sec(no, '매출', '온라인팀 판매 API 11개 채널 공급가(VAT 제외) — 회사 전체 매출이 아님'))
+    h.append('<div class="chart"><div class="t"><span>최근 12개월 매출</span></div><div class="cv">'
+             + _rp_svg_cols(d['trend'], [('sales', '매출', _RP_BLUE)], d['ymd']) + '</div></div>')
+    cls = d['sales_csv']['by_class']
+    chs = d.get('ch_sales') or []
+    left = '<div class="sub-h">분류별</div>'
+    if cls:
+        tot = sum(cls.values()) or 1
+        items = sorted(cls.items(), key=lambda x: -x[1])
+        left += '<div class="stack">' + ''.join(f'<i style="width:{v / tot * 100:.2f}%;background:{_RP_CLS.get(k, _RP_GRAY)}"></i>' for k, v in items) + '</div>'
+        left += '<table><thead><tr><th>분류</th><th class="num">매출</th><th class="num">비중</th></tr></thead><tbody>'
+        for k, v in items:
+            left += (f'<tr><td><span class="sbar" style="width:9px;height:9px;background:{_RP_CLS.get(k, _RP_GRAY)};margin-right:6px"></span>{esc(k)}</td>'
+                     f'<td class="num">{_fmt_won(v)}원</td><td class="num">{v / tot * 100:.1f}%</td></tr>')
+        left += '</tbody></table>'
+    else:
+        left += '<div class="empty">분류 자료 없음</div>'
+    right = '<div class="sub-h">채널별</div>'
+    if chs:
+        tot = sum(x['amt'] for x in chs) or 1
+        mx = chs[0]['amt'] or 1
+        right += '<table><thead><tr><th>채널</th><th class="num">매출</th><th class="num">비중</th></tr></thead><tbody>'
+        for x in chs:
+            right += (f'<tr><td>{esc(x["name"])}</td><td class="num"><span class="sbar" style="width:{x["amt"] / mx * 56:.0f}px;background:{_RP_BLUE};margin-right:8px"></span>'
+                      f'{_fmt_won(x["amt"])}원</td><td class="num">{x["amt"] / tot * 100:.1f}%</td></tr>')
+        right += '</tbody></table>'
+    else:
+        right += '<div class="empty">채널 자료 없음</div>'
+    h.append(f'<div class="grid2"><div>{left}</div><div>{right}</div></div>')
+    top = d.get('sales_top') or []
+    if top:
+        tot = sum(x['amt'] for x in chs) or s['cur'] or 1
+        mx = top[0].get('amount', 0) or 1
+        h.append(f'<div class="sub-h">제품 매출 TOP 10 <span class="muted sm">· 판매 제품 {d.get("sales_count", 0)}종 중</span></div>'
+                 '<table><thead><tr><th class="rk">#</th><th>제품</th><th>판매 채널</th><th class="num">매출</th><th class="num">비중</th></tr></thead><tbody>')
+        for i, x in enumerate(top, 1):
+            a = x.get('amount', 0) or 0
+            h.append(f'<tr><td class="rk">{i}</td><td>{esc(_rp_cut(x.get("name"), 44))}</td><td class="muted sm">{esc(_rp_cut(x.get("div"), 30))}</td>'
+                     f'<td class="num"><span class="sbar" style="width:{a / mx * 50:.0f}px;background:{_RP_BLUE};margin-right:8px"></span>{_fmt_won(a)}원</td>'
+                     f'<td class="num">{a / tot * 100:.1f}%</td></tr>')
+        h.append('</tbody></table>')
     h.append('</div>')
-    return '<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>월간 리포트 ' + d['ymd'] + '</title></head><body>' + ''.join(h) + '</body></html>'
+    # ── 구매·입고 ──
+    no += 1
+    h.append('<div class="sec">' + _rp_sec(no, '구매 · 입고', '아마란스 발주정보·입고정보 합계금액(VAT 포함)'))
+    h.append('<div class="chart"><div class="t"><span>최근 12개월 발주 · 입고</span><span class="legend">'
+             f'<span><i style="background:{_RP_BLUE}"></i>발주</span><span><i style="background:{_RP_ORANGE}"></i>입고</span></span></div><div class="cv">'
+             + _rp_svg_cols(d['trend'], [('po', '발주', _RP_BLUE), ('rcv', '입고', _RP_ORANGE)], d['ymd']) + '</div></div>')
+    h.append('<div class="grid2"><div><div class="sub-h">발주 거래처 TOP 5 · 주요 품목</div>' + _rp_vendor_box(d.get('po_vendor_top5') or [], po['cur']) + '</div>'
+             '<div><div class="sub-h">입고 거래처 TOP 5 · 주요 품목</div>' + _rp_vendor_box(d.get('rcv_vendor_top5') or [], rc['cur']) + '</div></div>')
+    pit = d.get('po_item_top') or []
+    h.append('<div class="sub-h">발주 품목 TOP 5</div>')
+    if pit:
+        h.append('<table><thead><tr><th class="rk">#</th><th>품번</th><th>품명</th><th class="num">수량</th><th class="num">발주액</th><th class="num">비중</th></tr></thead><tbody>')
+        for i, x in enumerate(pit, 1):
+            shr = (x['amt'] / po['cur'] * 100) if po['cur'] else 0
+            h.append(f'<tr><td class="rk">{i}</td><td>{esc(x["code"])}</td><td>{esc(_rp_cut(x["name"], 40))}</td><td class="num">{x["qty"]:,.0f}</td>'
+                     f'<td class="num">{_fmt_won(x["amt"])}원</td><td class="num">{shr:.1f}%</td></tr>')
+        h.append('</tbody></table>')
+    else:
+        h.append('<div class="empty">없음</div>')
+    h.append('</div>')
+    # ── 입고 일정 ──
+    no += 1
+    h.append('<div class="sec">' + _rp_sec(no, '입고 일정 준수', 'Monday 입고 완료 기록 — 부자재 입고일 vs 입고 요청일, 외주 출고일 vs 요청 입고일'))
+    if rr.get('kinds'):
+        h.append('<table><thead><tr><th>구분</th><th class="num">입고</th><th class="num">요청일 있음</th><th>준수율</th><th class="num">늦은 입고</th><th class="num">평균 늦음</th></tr></thead><tbody>')
+        for k in rr['kinds']:
+            ln = (str(k['late']) + '건') if k.get('late') else '-'
+            la = (str(k['late_avg']) + '일') if k.get('late') else '-'
+            h.append(f'<tr><td><b>{esc(k["kind"])}</b></td><td class="num">{k["n"]}건</td><td class="num">{k["with_req"]}건</td><td>{_rp_rate_bar(k["rate"])}</td>'
+                     f'<td class="num">{ln}</td><td class="num">{la}</td></tr>')
+        h.append('</tbody></table><div class="muted sm" style="margin-top:5px">준수 = 요청 입고일 이내 입고 · 원료·수입 원료는 요청일 칸이 없어 건수만</div>')
+        late = rr.get('late') or []
+        if late:
+            h.append('<div class="sub-h">늦은 입고 TOP 8</div><table><thead><tr><th>구분</th><th>품번</th><th>품명</th><th>업체 → 입고처</th>'
+                     '<th class="num">요청일</th><th class="num">입고일</th><th class="num">늦음</th></tr></thead><tbody>')
+            for x in late:
+                nm, who = esc(_rp_cut(x.get('name'), 28)), esc(_rp_cut(x.get('who'), 32))
+                h.append(f'<tr><td class="sm">{esc(x["kind"])}</td><td>{esc(x["code"])}</td><td>{nm}</td><td class="sm">{who}</td>'
+                         f'<td class="num">{x["req"][5:]}</td><td class="num">{x["done"][5:]}</td><td class="num late">+{x["delay"]}일</td></tr>')
+            h.append('</tbody></table>')
+    else:
+        h.append('<div class="empty">해당 월 입고 완료 기록 없음</div>')
+    h.append('</div>')
+    # ── 단가 변동 ──
+    no += 1
+    pcs = d.get('price_changes') or []
+    h.append('<div class="sec">' + _rp_sec(no, '단가 변동', '이달 발주단가가 3% 이상 바뀐 품목 · 월 영향 = 단가 차이 × 최근 3개월 월평균 발주량'))
+    if pcs:
+        upn = sum(1 for x in pcs if x['pct'] > 0)
+        imp = sum(x.get('impact') or 0 for x in pcs)
+        imp_s = ('+' if imp > 0 else ('−' if imp < 0 else '')) + _fmt_won(abs(imp)) + '원'
+        imp_c = 'up' if imp > 0 else ('down' if imp < 0 else '')
+        h.append(f'<div class="chips" style="margin-bottom:8px"><span><i style="background:{_RP_RED}"></i>오름 <b>{upn}</b>건</span>'
+                 f'<span><i style="background:{_RP_DOWN}"></i>내림 <b>{len(pcs) - upn}</b>건</span><span>월 영향 합 <b class="{imp_c}">{imp_s}</b></span></div>')
+        h.append('<table><thead><tr><th>품번</th><th>품명</th><th>거래처</th><th class="num">이전 → 현재 (원)</th><th class="num">변동</th><th class="num">월 영향</th></tr></thead><tbody>')
+        for x in pcs:
+            c = 'up' if x['pct'] > 0 else 'down'
+            sg = '+' if x['pct'] > 0 else ''
+            ia = x.get('impact') or 0
+            isg = '+' if ia > 0 else ('−' if ia < 0 else '')
+            h.append(f'<tr><td>{esc(x["code"])}</td><td>{esc(_rp_cut(x["name"], 32))}</td><td class="sm">{esc(_rp_cut(_co_short(x["vendor"]), 18))}</td>'
+                     f'<td class="num">{x["prev"]:,.0f} → <b>{x["cur"]:,.0f}</b></td><td class="num {c}"><b>{sg}{x["pct"]}%</b></td>'
+                     f'<td class="num {c}">{isg}{_fmt_won(abs(ia))}원</td></tr>')
+        h.append('</tbody></table>')
+    else:
+        h.append('<div class="empty">이달 3% 이상 단가 변동 없음</div>')
+    h.append('</div>')
+    # ── 생성 시점 현황 (지난 달·이번 달 리포트만) ──
+    sn = d.get('snap')
+    if sn:
+        no += 1
+        h.append('<div class="sec">' + _rp_sec(no, '재고 · 수급 현황', '리포트를 만든 시점 값 (그달 마감 값이 아님)'))
+        h.append(f'<div class="snapnote">{sn.get("at", "")} 기준 · 매월 1~5일 자동 저장본은 전월 말과 가까운 값입니다.</div>')
+        LVC = {'out': _RP_RED, 'critical': _RP_ORG2, 'warning': _RP_AMBER, 'low': _RP_GREEN, 'ok': _RP_GRAY}
+        stock_lb = [('out', '품절'), ('critical', '15일↓'), ('warning', '30일↓'), ('low', '45일↓')]
+
+        def chips(c, labels):
+            out = []
+            for k, lb in labels:
+                n = (c or {}).get(k, 0)
+                dot = LVC.get(k, _RP_GRAY) if n else _RP_GRID
+                out.append(f'<span><i style="background:{dot}"></i>{lb} <b>{n}</b></span>')
+            return '<div class="chips">' + ''.join(out) + '</div>'
+
+        def tops(xs):   # 주요 품목 — 한 줄에 하나씩
+            return ''.join('<div class="tl">· ' + esc(_rp_cut(t, 44)) + '</div>' for t in xs or [] if t) or '-'
+        rows = []
+        for key, title, labels in (('stock_jasa', '자사 부자재 재고 (45일 이하)', stock_lb), ('stock_outsource', '외주 부자재 재고 (45일 이하)', stock_lb),
+                                   ('channel', '채널 재고 (7일 미만)', [('out', '품절'), ('critical', '3일↓'), ('warning', '7일↓')]),
+                                   ('plan', '완제품 창고 재고', [('out', '품절'), ('critical', '2주↓'), ('warning', '4주↓'), ('low', '8주↓'), ('ok', '여유')])):
+            x = sn.get(key)
+            if x:
+                tp = tops(x.get('top'))
+                rows.append(f'<tr><td><b>{title}</b></td><td>{chips(x.get("c"), labels)}</td><td class="sm" style="color:{_RP_INK2}">{tp}</td></tr>')
+        ex = sn.get('excess')
+        if ex:
+            e1, lg = ex.get('excess') or {}, ex.get('long') or {}
+            tp = tops(ex.get('top'))
+            rows.append(f'<tr><td><b>부재료 과잉 · 장기</b></td><td class="chips"><span>과잉 <b>{e1.get("n", 0)}</b>품목 · <b>{_fmt_won(e1.get("value", 0))}원</b></span>'
+                        f'<span>폐기&amp;장기 창고 <b>{lg.get("n", 0)}</b>품목 · <b>{_fmt_won(lg.get("value", 0))}원</b></span></td>'
+                        f'<td class="sm" style="color:{_RP_INK2}">{tp}</td></tr>')
+        if rows:
+            h.append('<table><thead><tr><th style="width:190px">항목</th><th>단계별 품목 수</th><th>주요 품목 (품절·과잉 상위)</th></tr></thead><tbody>'
+                     + ''.join(rows) + '</tbody></table>')
+        h.append('</div>')
+        vs = sn.get('vendors') or []
+        if vs:
+            no += 1
+            h.append('<div class="sec">' + _rp_sec(no, '거래처 평가', '최근 12개월 금액 상위 8곳 · 점수 = 납기 40 + 충족 30 + 단가 안정 30 (생성 시점)'))
+            vk = {'po': '구매', 'wp': '외주', 'both': '구매·외주'}
+            fm = lambda x, suf: '-' if x is None else f'{x}{suf}'
+            h.append('<table><thead><tr><th>거래처</th><th>구분</th><th class="num">점수</th><th class="num">납기 준수</th><th class="num">입고 충족</th>'
+                     '<th class="num">리드타임</th><th class="num">단가 변동</th><th class="num">금액</th></tr></thead><tbody>')
+            for v in vs:
+                sc = v.get('score')
+                scol = _RP_GRAY if sc is None else (_RP_GREEN if sc >= 80 else (_RP_AMBER if sc >= 60 else _RP_RED))
+                sct = '-' if sc is None else sc
+                h.append(f'<tr><td><b>{esc(_co_short(v.get("vendor", "")))}</b></td><td class="sm">{vk.get(v.get("kind"), "")}</td>'
+                         f'<td class="num" style="color:{scol};font-weight:800">{sct}</td><td class="num">{fm(v.get("ontime"), "%")}</td>'
+                         f'<td class="num">{fm(v.get("fill"), "%")}</td><td class="num">{fm(v.get("lead"), "일")}</td>'
+                         f'<td class="num">{v.get("price_changes", 0)}건</td><td class="num">{_fmt_won(v.get("amt", 0))}원</td></tr>')
+            h.append('</tbody></table></div>')
+    # ── 운영 기록 ──
+    no += 1
+    h.append('<div class="sec">' + _rp_sec(no, '운영 기록', '재고 마감 자동보관 · 알림 발송'))
+    left = '<div class="sub-h">재고 마감 스냅샷</div><table><thead><tr><th>구분</th><th class="num">품목 수</th><th class="num">재고 0</th><th>파일</th></tr></thead><tbody>'
+    for k, v in d['closing'].items():
+        if v:
+            zr = v['zero'] if v['zero'] is not None else '-'
+            left += f'<tr><td>{k}</td><td class="num">{v["rows"]:,}</td><td class="num">{zr}</td><td class="muted sm">{esc(v["file"])}</td></tr>'
+        else:
+            left += f'<tr><td>{k}</td><td colspan=3 class="muted">마감 파일 없음 (해당 월 자동보관 전)</td></tr>'
+    left += '</tbody></table>'
+    names = {'out': '🔴 신규 품절', 'reorder': '🕐 지금 발주 진입', 'health': '⚠️ 데이터 이상', 'daily': '☀️ 아침 요약', 'report': '📊 월간 리포트',
+             'chstock': '🏪 채널 품절', 'vendor': '👥 거래처 기록 끊김', 'sales': '📥 판매 자료 반영', 'closing': '📗 마감 자동 반영'}
+    al = sorted(d['alerts'].items(), key=lambda x: -x[1])
+    right = '<div class="sub-h">알림 이력</div><table><thead><tr><th>종류</th><th class="num">건수</th></tr></thead><tbody>'
+    right += ''.join(f'<tr><td>{names.get(k, esc(k))}</td><td class="num">{v}건</td></tr>' for k, v in al) or '<tr><td colspan=2 class="muted">알림 없음</td></tr>'
+    right += '</tbody></table>'
+    h.append(f'<div class="grid2"><div>{left}</div><div>{right}</div></div></div>')
+    h.append('<div class="note">※ 매출은 온라인팀 판매자료(쿠팡·마트 등 판매 API 채널) 공급가 합계, VAT 제외 — 회사 전체 매출이 아님 · 발주/입고는 아마란스 합계금액(거래처·품목 합 같은 기준) · '
+             '입고 요청일 준수는 Monday 입고 완료 기록 · 단가 변동은 발주단가 3% 이상 변경분 · 재고·수급·거래처는 리포트 생성 시점 값 · 재고 마감은 매월 자동보관 스냅샷</div>')
+    h.append('</div>')
+    body = ''.join(h).replace('<table>', '<div class="tw"><table>').replace('</table>', '</table></div>')   # 좁은 화면에서 표만 옆으로 밀리게
+    return ('<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<title>월간 리포트 ' + d['ymd'] + '</title></head><body>' + body + '</body></html>')
 
 
 @app.route('/api/monthly_report', methods=['GET'])
@@ -12665,12 +12943,13 @@ def api_return_cost():
             p = _num(r.get('단가', 0))
             if c and p > 0 and len(d) == 8 and (c not in last_po or d > last_po[c][1]):
                 last_po[c] = (p, d)
-    # 단가표 = 합성 단가(아마란스 매입단가 > 엑셀). 발주단가는 위 last_po가 우선이라 여기선 나머지만
+    # 단가표 = 합성 단가(구매팀 확인 > 아마란스 매입단가 > 엑셀). 발주단가는 위 last_po가 우선이라 여기선 나머지만
     tbl = {}
+    _src_lbl = {'매입단가': '매입단가', '확인': '확인 단가'}   # 확인 = 2026-11-04 구매팀 확인 단가 (2026-11-19)
     for c, info in (PRICE_BY_CODE or {}).items():
         p = info.get('단가')
         if p and p > 0:
-            tbl[c] = (float(p), '매입단가' if info.get('단가출처') == '매입단가' else ('단가표' if info.get('단가출처') == '엑셀' else '단가표'))
+            tbl[c] = (float(p), _src_lbl.get(info.get('단가출처'), '단가표'))
 
     RAW = {'원재료', '반제품(외주)'}
     SUB = {'부재료', '물류박스', '라벨스티커', 'RRP', '단상자', '부자재'}
@@ -13106,25 +13385,45 @@ def _spec_po_latest():
     return {c: (f'{d[:4]}-{d[4:6]}-{d[6:]}', p, v) for c, (d, p, v) in out.items()}
 
 
-def _spec_price_checks():
-    """사용자 단가 확인 결과 data/price_check_answers_YYYYMMDD.csv → 품번(대문자) → (확인 당시 규격표 단가, 확인 단가, 'YYYY-MM-DD').
-    2026-11-04: 발주 이력 없는 77개를 사용자가 한 건씩 확인(20건 변경). Monday 규격표는 그대로 두고 계산기 학습·'실제' 단가에만 씀.
-    쓰는 쪽에서 규격표 단가가 확인 당시와 같을 때만 적용(확인 뒤 Monday가 바뀌면 그게 더 새 정보). 파일이 여럿이면 최신 파일이 덮어씀."""
-    out = {}
-    for f in sorted(glob.glob(os.path.join(DATA_DIR, 'price_check_answers_*.csv'))):
-        m = re.search(r'(\d{8})', os.path.basename(f))
-        day = f'{m.group(1)[:4]}-{m.group(1)[4:6]}-{m.group(1)[6:]}' if m else ''
-        try:
-            df = pd.read_csv(f, encoding='utf-8-sig', dtype=str).fillna('')
-        except Exception as e:
-            print(f'[단가 확인] {os.path.basename(f)} 읽기 실패: {e}')
-            continue
-        for c, b, p in zip(df.get('품번', []), df.get('규격표단가', []), df.get('확인단가', [])):
-            try:
-                out[str(c).strip().upper()] = (float(b), float(p), day)
-            except ValueError:
-                continue
-    return out
+_SPEC_AMA = {'key': None, 'ts': 0.0, 'po': {}, 'chk': {}}
+
+
+def _spec_ama_price(code):
+    """부자재 단가 — 아마란스 기준 (2026-11-19 사용자 "Monday 자료는 수정 안 된 게 많음 → 아마란스 기준으로").
+    순서 = 아마란스 최근 발주가(구매·외주 발주, EA) › 구매팀 확인 단가(11-04, 발주 이력 없는 품목) › 아마란스 품목 매입단가
+    › 구매팀 단가표(엑셀, ZQ 공용 코드 제외). 품목 상세 '현재 단가'(PRICE_BY_CODE)와 같은 순서.
+    단가 계산기 학습 단가·규격 목록·품목 상세 창 '규격 정보 · 단가'·입수 테스트 포장재비·챗봇 규격 답변이 씀.
+    반환 {'price', 'kind'(po|chk|pur|tbl), 'date', 'vendor', 'label'(사람이 읽는 출처)} · 모두 없으면 None. Monday 규격표 단가는 안 씀."""
+    import time as _t
+    key = (id(ORDER_DF), id(WP_ORDER_DF))
+    now = _t.time()
+    if _SPEC_AMA['key'] != key or now - _SPEC_AMA['ts'] > 600:   # 발주 자료가 리로드되면 바로, 확인 파일은 10분마다 다시 읽음
+        _SPEC_AMA.update(po=_spec_po_latest(), chk=_spec_price_checks(), key=key, ts=now)
+    c = str(code or '').strip().upper()
+    if not c:
+        return None
+    po = _SPEC_AMA['po'].get(c)
+    if po:
+        return {'price': po[1], 'kind': 'po', 'date': po[0], 'vendor': po[2],
+                'label': '아마란스 최근 발주가 ' + po[0] + (' · ' + po[2] if po[2] else '')}
+    chk = _SPEC_AMA['chk'].get(c)
+    if chk:
+        return {'price': chk[1], 'kind': 'chk', 'date': chk[2], 'vendor': '', 'label': '구매팀 확인 단가 ' + chk[2]}
+    pur = (PURCH_PRICE or {}).get(c, 0) or 0
+    if pur > 0:
+        return {'price': float(pur), 'kind': 'pur', 'date': '', 'vendor': '', 'label': '아마란스 품목 매입단가'}
+    # 마지막 = 구매팀 단가표(엑셀 _단가.csv 최신단가) — 2026-11-19 사용자 "단가표도 마지막 순서로" (D0264 리드지 28.99원 등).
+    # ZQ = 여러 품목이 같이 쓰는 비용처리 공용 코드라 안 씀: 단가표의 ZQ01(79원)은 '올리브영 전용박스 간지'인데 규격 ZQ01은 누룽지 용기라벨
+    if not c.startswith('ZQ'):
+        info = PRICE_BY_CODE.get(c) or {}
+        xp = info.get('엑셀단가') or 0
+        if xp > 0:
+            raw = str(info.get('엑셀기준', '') or '')
+            m = re.search(r'(\d{4}|\d{2})\D+(\d{1,2})', raw)   # '26年 11月' → '2026-11'
+            ym = ((('20' + m.group(1)) if len(m.group(1)) == 2 else m.group(1)) + '-' + m.group(2).zfill(2)) if m else ''
+            return {'price': float(xp), 'kind': 'tbl', 'date': ym, 'vendor': str(info.get('거래처', '') or ''),
+                    'label': '구매팀 단가표 ' + (ym or raw) + (' · ' + str(info.get('거래처')) if info.get('거래처') else '')}
+    return None
 
 
 def _build_material_regression():
@@ -13155,27 +13454,24 @@ def _build_material_regression():
     # 모듈 수준 함수 재사용
     _box_tokens = _box_tokens_from_raw
 
-    po_latest = _spec_po_latest()
-    checks = _spec_price_checks()
     rows = []
     for _, r in spec.iterrows():
         code_u = str(r.get('품번', '')).strip().upper()
-        po_hit = po_latest.get(code_u)
-        if code_u in _PCALC_EXCLUDE_CODES and not po_hit:
-            continue  # 규격표 단가만 있는 노이즈 항목 제외
+        ama = _spec_ama_price(code_u)
+        if code_u in _PCALC_EXCLUDE_CODES and not (ama and ama['kind'] == 'po'):
+            continue  # 아마란스 발주가 없는 노이즈 항목 제외
         m_str = str(r.get('재질', '')).strip()
         try:
             board = float(str(r.get('단가(원)', '')).strip() or 0)
         except Exception:
             board = 0.0
-        # 학습 단가 = 아마란스 최신 발주단가 › 구매팀 확인 단가(확인 뒤 규격표가 안 바뀐 경우) › 규격표 단가
-        chk = checks.get(code_u)
-        if po_hit:
-            price, price_src = po_hit[1], '발주 ' + po_hit[0]
-        elif chk and abs(board - chk[0]) < 0.01:
-            price, price_src = chk[1], '확인 ' + chk[2]
-        else:
-            price, price_src = board, '규격표'
+        # 학습 단가 = 아마란스 기준 (2026-11-19 사용자 "Monday 자료는 수정 안 된 게 많음 → 아마란스 기준") = _spec_ama_price:
+        #   아마란스 최신 발주단가 › 구매팀 확인 단가(11-04, 아마란스 발주 없는 품목 — 그때 매입단가·단가표와 대조해 고른 값이라 매입단가보다 앞)
+        #   › 아마란스 품목 매입단가 › 구매팀 단가표. Monday 규격표 단가는 쓰지 않음(모두 없으면 샘플에서 뺌). 규격표 단가는 board_price로 기록만.
+        if not ama:
+            continue
+        price = float(ama['price'])
+        price_src = {'po': '발주 ', 'chk': '확인 ', 'tbl': '단가표 '}.get(ama['kind'], '') + ama['date'] if ama['kind'] != 'pur' else '매입단가'
         if not m_str or price <= 0:
             continue
         raw_cat = str(r.get('그룹', '')).strip()
@@ -13256,29 +13552,27 @@ def _build_material_regression():
         cat_unit_price[cat] = _stat.median([r['price']/r['area'] for r in sub])
         cat_avg_area[cat] = _stat.median([r['area'] for r in sub])
 
-    # 재질별 근사 단가: 이 재질을 포함한 샘플들의 단위면적당 가격 median × 카테고리 평균 area
+    # 재질 목록 단가 = 이 재질을 쓴 제품들의 실제 단가(위 학습 단가 = 아마란스 기준) 중앙값·범위, 분류별로도.
+    # 2026-11-19: 예전 '대략 단가'(단위면적 단가×평균 면적÷재질 수 = 재질 1개 몫)는 아마란스와 맞춰 볼 수 없는 계산값이라 바꿈 —
+    #   재질을 누르면 오른쪽에 나오는 제품 단가들의 가운데 값이라 바로 대조 가능.
+    def _mstat(ps):
+        return {'med': round(_stat.median(ps), 1), 'lo': round(min(ps), 1), 'hi': round(max(ps), 1), 'n': len(ps)}
     materials = []
     for m in sorted(usage_all.keys()):
         cats_for_m = sorted(cat_usage.get(m, {}).keys())
-        best_cat = max(cats_for_m, key=lambda c: cat_usage[m].get(c, 0)) if cats_for_m else None
-        sub = [r for r in rows if m in r['materials'] and r['area'] > 0
-               and (best_cat is None or r['category'] == best_cat)]
-        if sub:
-            unit = _stat.median([r['price']/r['area'] for r in sub])
-            avg_area = cat_avg_area.get(best_cat, _stat.median([r['area'] for r in sub]))
-            # 재질이 보통 1개 들어가는 경우의 기여 단가 ≈ 단위면적 × 평균 area / 평균 토큰수
-            avg_tokens = _stat.median([len(r['materials']) for r in sub]) or 1
-            price = max(unit * avg_area / avg_tokens, 0)
-        else:
-            price = 0.0
+        ps = [r['price'] for r in rows if m in r['materials']]
+        st = _mstat(ps) if ps else {'med': 0, 'lo': 0, 'hi': 0, 'n': 0}
+        by_cat = {c: _mstat([r['price'] for r in rows if m in r['materials'] and r['category'] == c]) for c in cats_for_m}
         materials.append({
-            'name': m, 'price': round(price, 2),
-            'usage': usage_all[m], 'categories': cats_for_m,
+            'name': m, 'price': st['med'], 'lo': st['lo'], 'hi': st['hi'],
+            'usage': usage_all[m], 'categories': cats_for_m, 'by_cat': by_cat,
         })
     materials.sort(key=lambda x: (-x['usage'], x['name']))
 
+    src_counts = Counter(r['price_src'].split()[0] for r in rows)   # 발주 / 확인 / 매입단가
     return {
         'materials': materials, 'total_samples': len(rows),
+        'src_counts': dict(src_counts),
         'items': rows,
         'cat_unit_price': cat_unit_price,
         'cat_avg_area': cat_avg_area,
@@ -13400,7 +13694,7 @@ def _mat_sort_key(m):
 @cached_api()
 def api_materials():
     """부자재 규격 재질별 역산 단가 목록 (단가 0원 제외, 숫자→영어→한글 순)"""
-    if not _IS_HOST_PC:   # 부자재 단가가 그대로 나가므로 호스트 PC 전용 (2026-10-29, 사용자 "예상 단가 계산기도 막고")
+    if _HOST_ONLY_LOCK:   # 호스트 PC 전용 잠금 (2026-10-29 "예상 단가 계산기도 막고" → 2026-11-19 기본 해제)
         return jsonify({'locked': True, 'materials': [], 'total_samples': 0})
     d = _get_material_data()
     mats = [m for m in d['materials'] if m['price'] > 0]
@@ -13408,6 +13702,7 @@ def api_materials():
     return jsonify({
         'materials': mats,
         'total_samples': d['total_samples'],
+        'src_counts': d.get('src_counts', {}),   # 학습 단가 출처별 건수 (발주·확인·매입단가) — 화면 제목 줄
     })
 
 
@@ -13416,7 +13711,7 @@ _ROLL_RE = re.compile(r'\d+\s*[mM]\b|자동롤|롤파우치|두께\s*\d+|이지�
 @app.route('/api/material_estimate', methods=['POST'])
 def api_material_estimate():
     """선택한 재질 + 사이즈 → 예상 단가 + 유사 샘플 (계층 kNN)."""
-    if not _IS_HOST_PC:   # 유사 샘플에 실제 품목·단가가 담김 → 호스트 PC 전용 (2026-10-29)
+    if _HOST_ONLY_LOCK:   # 유사 샘플에 실제 품목·단가가 담김 → 호스트 PC 전용 잠금 (2026-10-29 → 2026-11-19 기본 해제)
         return jsonify({'locked': True, 'estimate': 0, 'breakdown': [], 'similar': [], 'method': 'locked'})
     payload = request.get_json(silent=True) or {}
     selected = [s.strip() for s in (payload.get('materials') or []) if s and s.strip()]
@@ -14248,7 +14543,7 @@ def _os_done_items(days=400):
 @cached_api()
 def api_spec_list():
     """부자재 규격 보드 전체 항목 — 대시보드 하단 패널용."""
-    if not _IS_HOST_PC:   # 호스트 PC 전용 패널 (2026-10-28, 사용자 "host만 볼 수 있도록 잠가 줘") — GCP에선 내용 안 보냄
+    if _HOST_ONLY_LOCK:   # 호스트 PC 전용 잠금 (2026-10-28 "host만 볼 수 있도록 잠가 줘" → 2026-11-19 기본 해제, GCP에서도 보임)
         return jsonify({'locked': True, 'items': [], 'total': 0})
     if MONDAY_DF is None or MONDAY_DF.empty:
         return jsonify({'items': [], 'total': 0})
@@ -14257,19 +14552,14 @@ def api_spec_list():
         return jsonify({'items': [], 'total': 0})
     items = []
     _code_re = re.compile(r'^[A-Za-z0-9]+$')
-    po_latest = _spec_po_latest()   # 단가계산기 '실제' 단가 = 최신 발주단가 › 구매팀 확인 단가 › 규격표 (2026-11-04)
-    checks = _spec_price_checks()
+    # 목록 단가·계산기 '실제' 단가 = _spec_ama_price (아마란스 최신 발주단가 › 구매팀 확인 단가 › 아마란스 매입단가) — 계산기 학습 단가와 같은 기준.
+    # 2026-11-19: Monday 규격표 단가는 안 씀(사용자 "Monday 자료는 수정 안 된 게 많음")
     for _, r in spec.iterrows():
         code = str(r.get('품번', '')).strip()
         if not code or not _code_re.match(code):
             continue
-        po_hit = po_latest.get(code.upper())
-        chk = checks.get(code.upper())
-        try:
-            board_f = float(str(r.get('단가(원)', '')).strip().replace(',', '') or 0)
-        except Exception:
-            board_f = 0.0
-        chk_ok = bool(chk) and not po_hit and abs(board_f - chk[0]) < 0.01
+        ama = _spec_ama_price(code) or {}
+        kind = ama.get('kind', '')
         name = str(r.get('품명', '')).strip()
         size = str(r.get('사이즈', '')).strip()
         material = str(r.get('재질', '')).strip()
@@ -14280,7 +14570,7 @@ def api_spec_list():
             moq = 0
         price_raw = str(r.get('단가(원)', '')).strip().replace(',', '')
         try:
-            price = int(float(price_raw)) if price_raw else 0
+            price = float(price_raw) if price_raw else 0
         except Exception:
             price = 0
         vendor = str(r.get('아이템명', '')).strip()
@@ -14288,9 +14578,14 @@ def api_spec_list():
         div = str(r.get('구분', '')).strip()
         items.append({
             'code': code, 'name': name, 'size': size,
-            'material': material, 'moq': moq, 'price': price,
-            'po_price': po_hit[1] if po_hit else 0, 'po_date': po_hit[0] if po_hit else '',
-            'chk_price': chk[1] if chk_ok else 0, 'chk_date': chk[2] if chk_ok else '',
+            # 목록 '단가' 칸 = 아래 아마란스 단가(po › chk › pur, 셋 중 하나만 값) — 2026-11-19 사용자 "규격 목록 단가도 아마란스 기준"
+            # board_price(Monday 규격표 단가)는 마우스 올렸을 때 참고로만 보임
+            'material': material, 'moq': moq, 'board_price': price,
+            'po_price': ama['price'] if kind == 'po' else 0, 'po_date': ama['date'] if kind == 'po' else '',
+            'po_vendor': ama['vendor'] if kind == 'po' else '',
+            'chk_price': ama['price'] if kind == 'chk' else 0, 'chk_date': ama['date'] if kind == 'chk' else '',
+            'pur_price': ama['price'] if kind == 'pur' else 0,   # 아마란스 품목 매입단가 (발주·확인 단가가 없을 때만)
+            'tbl_price': ama['price'] if kind == 'tbl' else 0, 'tbl_date': ama['date'] if kind == 'tbl' else '',   # 구매팀 단가표 (위 셋 다 없을 때)
             'vendor': vendor, 'category': cat, 'div': div,
             'tokens': _material_tokens(material, cat),  # 단가계산기 연동용 (서버 동일 토큰)
             # 시안 파일 수 — Monday 파일 칸 텍스트는 'URL, URL' (2026-10-28). 열어 볼 때 /api/spec_design/<item_id>
@@ -14366,11 +14661,9 @@ def _ipsu_specs_list():
         size = str(r.get('사이즈', '')).strip()
         dim = _parse_ipsu_size(size)
         n = _IPSU_N_RE.search(name)
-        price_raw = str(r.get('단가(원)', '')).strip().replace(',', '')
-        try:
-            price = float(price_raw) if price_raw else 0.0
-        except Exception:
-            price = 0.0
+        # 포장재비 단가 = 아마란스 기준 (2026-11-19 사용자 "세 곳 다 아마란스 기준") — Monday 규격표 단가는 안 씀, 없으면 0(포장재비 계산 안 함)
+        ama = _spec_ama_price(code)
+        price = float(ama['price']) if ama else 0.0
         specs.append({
             'code': code, 'name': name, 'size': size,
             'material': str(r.get('재질', '')).strip(),
@@ -14378,7 +14671,8 @@ def _ipsu_specs_list():
             'div': str(r.get('구분', '')).strip(),
             'tier': _ipsu_tier(name),
             'ipsu': int(n.group(1)) if n else None,   # 품명의 'N입'
-            'price': price,                            # 단가(원) — 포장재비 계산용
+            'price': price,                            # 단가(원) — 포장재비 계산용 (아마란스 기준)
+            'price_src': ama['label'] if ama else '',  # 단가 출처 — 포장재비 줄에 마우스 올리면 보임
             'dim': dim,                                # None이면 수동 입력 필요
         })
     specs.sort(key=lambda x: x['code'])
@@ -14415,7 +14709,7 @@ def _ipsu_boxes_list():
 @cached_api()
 def api_ipsu_specs():
     """입수 테스트 패널용 — 부자재 규격(파우치/단상자/외박스 치수) + 박스입수 적재량."""
-    if not _IS_HOST_PC:   # 부자재 규격이 그대로 나가므로 호스트 PC 전용 (2026-10-29, 사용자 "A도 막자")
+    if _HOST_ONLY_LOCK:   # 호스트 PC 전용 잠금 (2026-10-29 "A도 막자" → 2026-11-19 기본 해제)
         return jsonify({'locked': True, 'specs': [], 'boxes': [], 'total': 0, 'parsed': 0, 'box_total': 0})
     specs, boxes = _ipsu_specs_list(), _ipsu_boxes_list()
     parsed = sum(1 for s in specs if s['dim'])
@@ -14636,6 +14930,44 @@ def _pallet_answers():
     return out
 
 
+_PLT_SNAP = 'pallet_snapshot.csv'   # data/ 안 — 호스트가 만든 PT 보조값 사본 (GCP용, seed_latest.py가 동기화)
+
+
+def _pallet_snap_save(plist, ptab):
+    """호스트 PC: 제품리스트·재고파악 PT 보조값 → data/pallet_snapshot.csv (OneDrive 없는 GCP가 같은 값을 쓰게, 2026-11-19).
+    내용이 같으면 다시 쓰지 않음(동기화 md5가 바뀌지 않게)."""
+    rows = [{'품번': c, '출처': '제품리스트', 'PT': v[0], '설명': v[1]} for c, v in sorted(plist.items())]
+    rows += [{'품번': c, '출처': '재고파악', 'PT': v, '설명': ''} for c, v in sorted(ptab.items())]
+    new = pd.DataFrame(rows, columns=['품번', '출처', 'PT', '설명']).to_csv(index=False, lineterminator='\n')
+    path = os.path.join(DATA_DIR, _PLT_SNAP)
+    if os.path.exists(path):
+        with open(path, encoding='utf-8-sig', newline='') as f:
+            if f.read() == new:
+                return
+    with open(path, 'w', encoding='utf-8-sig', newline='') as f:
+        f.write(new)
+
+
+def _pallet_snap_load():
+    """GCP: data/pallet_snapshot.csv → (제품리스트 {code: (PT, 설명)}, 재고파악 {code: PT}). 없으면 빈 값."""
+    plist, ptab = {}, {}
+    path = os.path.join(DATA_DIR, _PLT_SNAP)
+    if not os.path.exists(path):
+        return plist, ptab
+    df = pd.read_csv(path, encoding='utf-8-sig', dtype=str).fillna('')
+    for c, s, v, e in zip(df['품번'], df['출처'], df['PT'], df['설명']):
+        try:
+            v = int(float(v))
+        except ValueError:
+            continue
+        c = c.strip().upper()
+        if s == '제품리스트':
+            plist[c] = (v, e)
+        elif s == '재고파악':
+            ptab[c] = v
+    return plist, ptab
+
+
 def _inv_pallet_table():
     """지금 재고파악 엑셀의 '품번 등 데이터' 시트 품번별 Pallet 적재량 {code: PT} (1 이하는 자리 채움 값이라 버림). 수정시각 캐시."""
     path = CSV_PATH if str(CSV_PATH or '').lower().endswith('.xlsx') else _find_inventory_xlsx()
@@ -14685,7 +15017,7 @@ def api_ipsu_bom():
     - 상자류(form='상자')는 C코드=외박스, B코드=단상자로 구분
     - 파우치는 depth 0=2차, depth 1 이상=1차 (품명의 '1차/2차' 표기가 있으면 우선)
     """
-    if not _IS_HOST_PC:   # 규격 치수·품명이 포함됨 → 호스트 PC 전용 (2026-10-29)
+    if _HOST_ONLY_LOCK:   # 규격 치수·품명이 포함됨 → 호스트 PC 전용 잠금 (2026-10-29 → 2026-11-19 기본 해제)
         return jsonify({'locked': True, 'products': [], 'total': 0})
     if BOM_DF is None or BOM_DF.empty:
         return jsonify({'products': [], 'total': 0})
@@ -14793,16 +15125,31 @@ def api_ipsu_bom():
         })
     products.sort(key=lambda x: x['code'])
     # PT적재량 보조 출처로 빈 곳 채우기 (2026-11-05) — Monday › 제품리스트 › 재고파악 '품번 등 데이터'
-    try:
-        plist = _pallet_from_product_list(products)
-    except Exception as e:
-        print(f'[입수] 제품리스트 PT 읽기 실패: {e}')
-        plist = {}
-    try:
-        ptab = _inv_pallet_table()
-    except Exception as e:
-        print(f'[입수] 재고파악 PT 읽기 실패: {e}')
-        ptab = {}
+    # 제품리스트·재고파악은 OneDrive 엑셀이라 호스트 PC에서만 읽힘 → 호스트가 결과를 data/pallet_snapshot.csv로 남기고
+    # GCP는 그 사본(update_cloud가 올림)을 씀 (2026-11-19 사용자 "HOST에서만 보이던 자료들 GCP에서도")
+    if _IS_HOST_PC:
+        ok = True
+        try:
+            plist = _pallet_from_product_list(products)
+        except Exception as e:
+            print(f'[입수] 제품리스트 PT 읽기 실패: {e}')
+            plist, ok = {}, False
+        try:
+            ptab = _inv_pallet_table()
+        except Exception as e:
+            print(f'[입수] 재고파악 PT 읽기 실패: {e}')
+            ptab, ok = {}, False
+        if ok:   # 엑셀을 못 읽었을 땐 사본을 빈 값으로 덮지 않음
+            try:
+                _pallet_snap_save(plist, ptab)
+            except Exception as e:
+                print(f'[입수] PT 사본 저장 실패: {e}')
+    else:
+        try:
+            plist, ptab = _pallet_snap_load()
+        except Exception as e:
+            print(f'[입수] PT 사본 읽기 실패: {e}')
+            plist, ptab = {}, {}
     try:
         pans = _pallet_answers()
     except Exception as e:
@@ -14865,7 +15212,7 @@ def _ipsu_norm(s: str) -> str:
 def api_ipsu_calib():
     """실측 캘리브레이션용 — 부자재 규격(파우치 치수) ↔ 박스입수 적재량(실측 입수) 매칭 쌍.
     프론트에서 실측 입수와 기하 계산치를 비교해 눌림(압축)계수를 역산한다."""
-    if not _IS_HOST_PC:   # 호스트 PC 전용 (2026-10-29)
+    if _HOST_ONLY_LOCK:   # 호스트 PC 전용 잠금 (2026-10-29 → 2026-11-19 기본 해제)
         return jsonify({'locked': True, 'pairs': [], 'total': 0})
     if MONDAY_DF is None or MONDAY_DF.empty:
         return jsonify({'pairs': [], 'total': 0})
@@ -15446,6 +15793,13 @@ def api_item_detail(code):
 
     # 규격
     spec = SPEC_BY_CODE.get(code)
+    if spec:
+        # '규격 정보 · 단가' = 아마란스 기준 (2026-11-19 사용자 "세 곳 다 아마란스 기준") — Monday 규격표 단가 대신.
+        # SPEC_BY_CODE는 챗봇과 같이 쓰는 역색인이라 복사해서 바꿈
+        ama = _spec_ama_price(code)
+        spec = dict(spec)
+        spec['단가(원)'] = ama['price'] if ama else ''
+        spec['단가출처'] = ama['label'] if ama else '단가 없음 (아마란스·구매팀 단가표 모두 없음)'
 
     # 단가
     price_info = get_price_info(code, name)
@@ -16146,7 +16500,15 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .spec-row .sc-size { color: #0369a1; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .spec-row .sc-mat { color: #0d9488; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 10.5px; letter-spacing: -0.01em; }
   .spec-row .sc-moq { color: #c2410c; font-weight: 600; font-variant-numeric: tabular-nums; text-align: right; }
-  .spec-row .sc-price { color: #b91c1c; font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; }
+  .spec-row .sc-price { color: #b91c1c; font-weight: 700; font-variant-numeric: tabular-nums; text-align: right;
+    display: flex; flex-direction: column; align-items: flex-end; gap: 1px; white-space: nowrap; }
+  .spec-row .sc-price.none { color: var(--text-3); font-weight: 600; }
+  /* 단가 출처 한 줄 (2026-11-19 아마란스 기준) — 계산기 출처 표시(.pcalc-src)와 같은 색 */
+  .spec-row .sc-psrc { font-style: normal; font-size: 9px; font-weight: 700; line-height: 1.1; letter-spacing: -0.01em; color: var(--text-3); }
+  .spec-row .sc-psrc.po { color: #047857; }
+  .spec-row .sc-psrc.chk { color: #1d4ed8; }
+  .spec-row .sc-psrc.pur { color: #6d28d9; }
+  .spec-row .sc-psrc.tbl { color: #b45309; }   /* 구매팀 단가표 (아마란스 단가 없을 때) */
   .spec-row .sc-vendor {
     display: inline-block; font-size: 10px; font-weight: 600;
     background: #eef2ff; color: #4338ca; padding: 2px 7px; border-radius: 8px;
@@ -16477,7 +16839,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .pcalc-src { display: inline-block; font-size: 9.5px; font-weight: 700; padding: 1px 5px; border-radius: 5px; background: #f1f5f9; color: #64748b; margin-right: 5px; vertical-align: 1px; letter-spacing: -0.01em; }
   .pcalc-src.po { background: #ecfdf5; color: #047857; }
   .pcalc-src.chk { background: #eff6ff; color: #1d4ed8; }
-  .pcalc-src.diff { background: #fff7ed; color: #c2410c; }
+  .pcalc-src.pur { background: #f5f3ff; color: #6d28d9; }   /* 아마란스 품목 매입단가 (2026-11-19) */
+  .pcalc-src.tbl { background: #fef3c7; color: #92400e; }   /* 구매팀 단가표 — 아마란스 단가 없을 때 마지막 (2026-11-19) */
   .pcalc-sim-src { margin-top: 2px; line-height: 1.2; }
   .pcalc-sim-src .pcalc-src { margin-right: 0; }
   .pcalc-sim-name { font-size: 12px; font-weight: 600; color: #111827; line-height: 1.35; min-width: 0; word-break: keep-all; overflow-wrap: anywhere; }
@@ -17577,16 +17940,13 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     <a href="#" onclick="openVendorLinks();return false;" title="더고은·정성·데이웰즈 담당자 입력 링크 · 입력 현황 · 마감 생성">📝 외주재고 입력</a>
     <a href="#" onclick="openStockCompare();return false;" title="외주처 재고 파일 vs 아마란스 재고 차이 (원재료·부재료)">⚖️ 재고 비교</a>
     <a href="#" onclick="openHistory();return false;">채팅내역</a>
-    {% if not public_mode %}
     <!-- 관리자 메뉴 제거(2026-09-02): 미사용. 라우트 /admin은 유지 -->
     <!-- 업로드 메뉴 제거(2026-09-02): 재고·자사재고·단가 전부 OneDrive/공유링크 자동 반영. /upload 라우트는 비상용으로 유지 -->
-
+    <!-- 외주처별 재고 화면 링크 — 예전엔 호스트(localhost)에서만 보임 → 2026-11-19 사용자 "HOST 자료 GCP에서도" GCP에서도 보임 -->
     <a href="/vendor/데이웰즈" target="_blank">데이웰즈</a>
     <a href="/vendor/더고은" target="_blank">더고은</a>
     <a href="/vendor/정성" target="_blank">정성</a>
     <!-- 청통본가 메뉴 제거(2026-09-02): 부재료를 외주처가 직접 관리 → 매홍 부재료 재고 없음 -->
-
-    {% endif %}
     <div class="user-chip" id="user-chip" style="display:none">
       <img id="user-photo" src="" alt="">
       <span class="name" id="user-name"></span>
@@ -17800,7 +18160,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   </div>
   <div class="chart-panel pcalc-panel">
     <div class="chart-head">
-      <div><span class="chart-title">🧮 예상 단가 계산기</span><span class="chart-sub">재질 선택 · <span id="pcalc-samples">-</span>건 샘플 기반 추정</span></div>
+      <div><span class="chart-title">🧮 예상 단가 계산기</span><span class="chart-sub" id="pcalc-sub">아마란스 단가 기준 · 제품 <span id="pcalc-samples">-</span>건으로 추정</span></div>
       <div id="pcalc-est-inline" style="font-size:14px;font-weight:800;color:#0c4a6e;font-variant-numeric:tabular-nums"><span class="pcalc-est-empty">재질을 고르면 예상 단가</span></div>
     </div>
     <div id="pcalc-compare-bar" style="display:none;margin-bottom:6px"></div>
@@ -17834,7 +18194,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
 <section class="spec-strip">
   <div class="chart-panel spec-panel">
     <div class="chart-head">
-      <div><span class="chart-title">📐 부자재 규격</span><span class="chart-sub">Monday 부자재 규격 보드 · 카테고리·품번 정렬</span></div>
+      <div><span class="chart-title">📐 부자재 규격</span><span class="chart-sub">규격 = Monday 부자재 규격 보드 · 단가 = 아마란스 최근 발주가 › 구매팀 확인 › 매입단가 › 구매팀 단가표</span></div>
       <div id="spec-count" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
     </div>
     <input id="spec-search" type="text" placeholder="품번/품명/재질/업체/구분 검색…" oninput="renderSpecList()"
@@ -19264,7 +19624,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         html += infoRow('규격(사이즈)', d.spec['규격(사이즈)']);
         html += infoRow('재질', d.spec['재질']);
         html += infoRow('MOQ', d.spec['MOQ']);
-        html += infoRow('단가', d.spec['단가(원)'] ? fmtNum(d.spec['단가(원)']) + '원' : '-');
+        html += infoRow('단가', (d.spec['단가(원)'] ? fmtNum(d.spec['단가(원)']) + '원' : '-') + (d.spec['단가출처'] ? ' · ' + d.spec['단가출처'] : ''));   // 아마란스 기준 (2026-11-19)
         html += infoRow('중량', d.spec['중량(g)'] ? d.spec['중량(g)'] + 'g' : '-');
         html += '</table>';
       }
@@ -22977,17 +23337,20 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   let _pcalcSizeRaw = '';  // 체크박스 연동 시 원본 사이즈 문자열 (롤파우치 감지용)
   let _pcalcMatRaw  = '';  // 체크박스 연동 시 원본 재질 문자열 (박스 토크나이저용)
   let _pcalcActualPrice = 0;  // 체크박스로 연동한 품목의 실제 단가 (원래 사이즈일 때 표시)
-  let _pcalcActualSrc = '', _pcalcActualBoard = 0;   // 실제 단가 출처 — '발주 YYYY-MM-DD'(아마란스 최신 발주) | '규격표', 규격표 단가 (2026-11-04)
-  // 단가 출처 꼬리표: 발주 → '발주 26.10.12', 규격표 → '규격표'. 규격표 단가와 다르면 글자색으로 표시 + 툴팁
-  // 출처: '발주 YYYY-MM-DD'(아마란스 최신 발주) | '확인 YYYY-MM-DD'(구매팀 단가 확인, 발주 이력 없는 품목) | '규격표'
-  function _pcalcSrcTag(src, price, board) {
+  let _pcalcActualSrc = '', _pcalcActualBoard = 0;   // 실제 단가 출처 — '발주 YYYY-MM-DD' | '확인 YYYY-MM-DD' | '매입단가' (_pcalcActualBoard는 2026-11-19부터 안 씀)
+  // 단가 출처 꼬리표 (2026-11-19 아마란스 기준 — Monday 규격표 단가는 비교로도 안 보여 줌):
+  //   '발주 YYYY-MM-DD' → '발주 26.10.12'(아마란스 최근 발주) / '확인 YYYY-MM-DD' → '확인 26.11.04'(아마란스 발주 없는 품목, 구매팀 확인) / '매입단가'(아마란스 품목 매입단가)
+  //   '단가표 YYYY-MM' → '단가표 26.11'(아마란스 단가가 없을 때 구매팀 단가표, 2026-11-19 마지막 순서로 추가)
+  function _pcalcSrcTag(src) {
     if (!src) return '';
-    const kind = src.indexOf('발주') === 0 ? 'po' : (src.indexOf('확인') === 0 ? 'chk' : '');
-    const label = kind ? src.slice(0, 2) + ' ' + src.slice(5).replace(/-/g, '.') : '규격표';
-    const diff = kind && board > 0 && Math.abs(price - board) / board >= 0.02;
-    const tip = (kind === 'po' ? '아마란스 최근 ' + src + ' 단가' : kind === 'chk' ? '구매팀이 ' + src.slice(3) + '에 확인한 단가 (발주 이력 없음)' : 'Monday 부자재 규격 보드 단가 (발주 이력 없음)')
-      + (kind ? (board > 0 ? ' · 규격표 ' + fmtInt(board) + '원' : ' · 규격표 단가 없음') : '');
-    return '<span class="pcalc-src' + (kind ? ' ' + kind : '') + (diff ? ' diff' : '') + '" title="' + escapeHtml(tip) + '">' + escapeHtml(label) + (diff ? ' · 규격표 ' + fmtInt(board) : '') + '</span>';
+    const kind = src.indexOf('발주') === 0 ? 'po' : (src.indexOf('확인') === 0 ? 'chk' : (src.indexOf('매입') === 0 ? 'pur' : (src.indexOf('단가표') === 0 ? 'tbl' : '')));
+    if (!kind) return '';
+    const label = kind === 'pur' ? '매입단가' : kind === 'tbl' ? '단가표 ' + src.slice(6).replace(/-/g, '.') : src.slice(0, 2) + ' ' + src.slice(5).replace(/-/g, '.');
+    const tip = kind === 'po' ? '아마란스 최근 발주 단가 (' + src.slice(3) + ')'
+      : kind === 'chk' ? '아마란스 발주 이력이 없어 구매팀이 ' + src.slice(3) + '에 확인한 단가'
+      : kind === 'tbl' ? '아마란스 단가가 없어 구매팀 단가표(' + src.slice(4) + ') 값'
+      : '아마란스 품목 매입단가 (발주 이력 없음)';
+    return '<span class="pcalc-src ' + kind + '" title="' + escapeHtml(tip) + '">' + escapeHtml(label) + '</span>';
   }
 
   async function loadPriceCalc() {
@@ -23000,6 +23363,15 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       }
       _pcalcMaterials = d.materials || [];
       document.getElementById('pcalc-samples').textContent = d.total_samples || 0;
+      // 학습 단가 출처별 건수 (2026-11-19 아마란스 기준) — 제목 줄 뒤에 '(발주가 153 · 확인 77)'
+      const sc = d.src_counts || {}, scTxt = [['발주', '발주가'], ['확인', '구매팀 확인'], ['매입단가', '매입단가'], ['단가표', '단가표']]
+        .filter(([k]) => sc[k]).map(([k, lb]) => lb + ' ' + fmtInt(sc[k])).join(' · ');
+      const subEl = document.getElementById('pcalc-sub');
+      if (subEl && scTxt && !subEl.dataset.src) {
+        subEl.dataset.src = '1';
+        subEl.insertAdjacentHTML('beforeend', ' <span style="color:#94a3b8">(' + escapeHtml(scTxt) + ')</span>');
+        subEl.title = '단가 = 아마란스 최근 발주가 › 구매팀 확인 단가(아마란스 발주 이력 없는 품목, 11-04) › 아마란스 품목 매입단가 › 구매팀 단가표. Monday 규격표 단가는 쓰지 않음';
+      }
       document.querySelectorAll('.pcalc-cat-tab').forEach(t => {
         t.addEventListener('click', () => {
           document.querySelectorAll('.pcalc-cat-tab').forEach(x => x.classList.remove('active'));
@@ -23075,18 +23447,22 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       list.innerHTML = '<div class="search-empty" style="padding:20px">검색 결과 없음</div>';
       return;
     }
-    // 2026-11-18 보기 개편: 열 머리(재질·쓰인 제품·대략 단가) + 많이 쓰는 재질부터 + 고른 재질은 줄 색으로, 전체 탭에선 분류 꼬리표
-    const rows = filtered.slice().sort((a, b) => (b.usage || 0) - (a.usage || 0) || a.name.localeCompare(b.name));
+    // 2026-11-18 보기 개편: 열 머리(재질·쓰인 제품·단가) + 많이 쓰는 재질부터 + 고른 재질은 줄 색으로, 전체 탭에선 분류 꼬리표
+    // 2026-11-19 아마란스 기준: 단가 열 = 이 재질을 쓴 제품들의 아마란스 단가 중앙값(분류 탭이면 그 분류만) — 재질을 누르면 오른쪽 제품 단가와 바로 대조
+    const st = m => (_pcalcCat && m.by_cat && m.by_cat[_pcalcCat]) || { med: m.price, lo: m.lo, hi: m.hi, n: m.usage };
+    const rows = filtered.slice().sort((a, b) => (st(b).n || 0) - (st(a).n || 0) || a.name.localeCompare(b.name));
     list.innerHTML = '<div class="pcalc-lhead"><span></span><span>재질' + (_pcalcCat ? ' · ' + escapeHtml(_pcalcCat) : '') + ' (' + rows.length + ')</span>'
-      + '<span title="이 재질이 들어간 샘플 제품 수">쓰인 제품</span><span title="이 재질 1개가 들어갈 때의 대략적인 단가 기여분">대략 단가</span></div>'
+      + '<span title="이 재질이 들어간 제품 수">쓰인 제품</span><span title="이 재질을 쓴 제품들의 아마란스 단가 중앙값 (발주가 › 구매팀 확인 › 매입단가)">단가 중앙값</span></div>'
       + rows.map(m => {
       const on = _pcalcSelected.has(m.name);
       const safeName = m.name.replace(/"/g,'&quot;');
+      const s = st(m);
+      const tip = s.n + '개 제품 아마란스 단가 · 중앙값 ' + pcWon(s.med) + '원' + (s.n > 1 ? ' (' + pcWon(s.lo) + '~' + pcWon(s.hi) + '원)' : '');
       return '<label class="pcalc-item' + (on ? ' on' : '') + '">'
            + '<input type="checkbox" ' + (on ? 'checked' : '') + ' data-name="' + escapeHtml(safeName) + '" onchange="togglePriceCalc(this)">'
            + '<span class="pcalc-name">' + escapeHtml(m.name) + (!_pcalcCat && (m.categories || []).length ? '<span class="ct">' + escapeHtml(m.categories.join('·')) + '</span>' : '') + '</span>'
-           + '<span class="pcalc-use">' + fmtInt(m.usage || 0) + '</span>'
-           + '<span class="pcalc-price">' + pcWon(m.price) + '원</span>'
+           + '<span class="pcalc-use">' + fmtInt(s.n || 0) + '</span>'
+           + '<span class="pcalc-price" title="' + escapeHtml(tip) + '">' + pcWon(s.med) + '원</span>'
            + '</label>';
     }).join('');
   }
@@ -23127,7 +23503,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     if (_pcalcSelected.size === 0) {
       _pcalcDropLink(false);   // 재질을 다 빼면 비교할 기준도 없음 → 차이 막대 숨김
       estEl.innerHTML = '<span class="pcalc-est-empty">재질을 고르면 예상 단가</span>';   // '0원'이 결과처럼 보이던 것 (2026-11-18)
-      simEl.innerHTML = '<div class="pcalc-sim-empty">재질을 고르면 같은 재질을 쓴 제품과<br>실제 단가가 여기에 나옵니다</div>';
+      simEl.innerHTML = '<div class="pcalc-sim-empty">재질을 고르면 같은 재질을 쓴 제품과<br>아마란스 단가가 여기에 나옵니다</div>';
       return;
     }
     const selected = Array.from(_pcalcSelected);
@@ -23162,7 +23538,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
           '<span style="font-size:10px;font-weight:800;background:#dcfce7;color:#15803d;padding:2px 6px;border-radius:6px;vertical-align:middle">실제</span>'
           + '<span style="color:#059669;font-size:16px;font-weight:800;margin-left:5px;vertical-align:middle">' + fmtInt(_pcalcActualPrice)
           + '<span style="font-size:10px;font-weight:700;margin-left:1px">원</span></span>'
-          + (_pcalcActualSrc ? '<span style="margin-left:6px;vertical-align:middle">' + _pcalcSrcTag(_pcalcActualSrc, _pcalcActualPrice, _pcalcActualBoard) + '</span>' : '')
+          + (_pcalcActualSrc ? '<span style="margin-left:6px;vertical-align:middle">' + _pcalcSrcTag(_pcalcActualSrc) + '</span>' : '')
           + '<span style="font-size:10px;font-weight:600;color:#9aa5b1;margin-left:7px;vertical-align:middle">예상 ' + fmtInt(Math.round(d.estimate || 0)) + '원</span>';
       }
 
@@ -23265,7 +23641,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
              + '<span class="pcalc-sim-price">' + fmtInt(s.price) + '원</span>'
              + '</div>'
              + '<div class="stk-meta">' + meta.join(stkSep)
-             + (s.price_src ? _pcalcSrcTag(s.price_src, s.price, s.board_price) : '') + '</div>'
+             + (s.price_src ? _pcalcSrcTag(s.price_src) : '') + '</div>'
              + '<div class="pcalc-sim-mats" id="pcalc-mats-' + i + '" style="display:' + (isOpen ? 'flex' : 'none') + '">' + mats + '</div>'
              + '</div>';
       }).join('');
@@ -23751,16 +24127,17 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     ['.lens-shift', () => loadDemandShift(), 410], ['.lens-dormant', () => loadDormant(), 410],
     ['.lens-gaps', () => loadDeliveryGaps(), 530], ['.lens-new', () => loadNewProducts(), 530], ['.lens-abc', () => loadAbc(), 530],
   ];
-  // 호스트 PC 전용 패널 — GCP에선 서버가 빈 값만 주므로 클릭해서 여는 형태가 아니라 처음부터 잠긴 모양으로
+  // 호스트 PC 전용 잠금을 켠 GCP — 서버가 빈 값만 주므로 클릭해서 여는 형태가 아니라 처음부터 잠긴 모양으로
   // (2026-10-30 사용자 "입수 테스트가 로그인 후 첫 화면에 너무 길게 자리잡음 → 잠궈뒀으니 접힌 상태로, 그냥 잠궈둔 형태로")
   // 값 = 머리 한 줄로 접고 오른쪽에 붙일 잠금 문구. 예상 단가 계산기는 단가 변동과 한 줄이라 접지 않고 본문에 안내(높이는 옆 패널 따라감)
-  const HOST_PC = {{ host_pc|tojson }};
-  const PANEL_LOCKS = HOST_PC ? {} : { '.ipsu-panel': '정확도를 위해 추후 배포 예정', '.spec-panel': '호스트 PC 전용' };
+  // 2026-11-19 사용자 "HOST에서만 보이던 자료들 GCP에서도" → 잠금 기본 해제(서버 환경변수 HOST_ONLY_PANELS=1일 때만 잠금)
+  const PANELS_LOCKED = {{ panels_locked|tojson }};
+  const PANEL_LOCKS = PANELS_LOCKED ? { '.ipsu-panel': '정확도를 위해 추후 배포 예정', '.spec-panel': '호스트 PC 전용' } : {};
   function _pnl(x) { return typeof x === 'string' ? document.querySelector('.chart-panel' + x) : x; }
   function _pnlKey(p) { return p._pnlSel + (window.innerWidth > 900 ? '@w' : '@n'); }   // PC·모바일 높이 따로
   function _pnlH() { try { return JSON.parse(localStorage.getItem('mhPanelH') || '{}'); } catch (e) { return {}; } }
   function initPanels() {
-    if (!HOST_PC) {
+    if (PANELS_LOCKED) {
       Object.entries(PANEL_LOCKS).forEach(([sel, msg]) => panelLockStrip(_pnl(sel), msg));
       window._ipsuLocked = true;
       panelLockNote(_pnl('.pcalc-panel'), '단가의 잦은 변동으로 인한 안정화 시 오픈', '단가가 안정되면 다시 열립니다');
@@ -23987,7 +24364,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       + '<div class="rc-card tot"><div class="k">합계' + (q ? ' (' + _rcQty(q) + '개)' : '') + '</div><div class="v">' + won(tot) + '</div>' + (q ? '<div class="s">' + (etc ? '기타 ' + _rcFmt(etc) + '원 포함' : '체크 해제 항목 제외') + '</div>' : noq) + '</div>'
       + '<div class="rc-card"><div class="k">개당 자재원가</div><div class="v">' + _rcFmt(unit) + '원</div><div class="s">원재료 ' + _rcFmt(uraw) + ' + 부재료 ' + _rcFmt(usub) + '</div></div>'
       + '<div class="rc-card"><div class="k">판매단가 대비</div><div class="v">' + ratio + '</div><div class="s">' + (d.sale_price > 0 ? '판매단가 ' + _rcFmt(d.sale_price) + '원' : '판매단가 없음') + '</div></div>';
-    const src = s => s.startsWith('발주') ? 'po' : s === '단가표' ? 'tbl' : s === 'BOM' ? 'bom' : 'none';
+    const src = s => s.startsWith('발주') ? 'po' : (s === '단가표' || s === '매입단가' || s === '확인 단가') ? 'tbl' : s === 'BOM' ? 'bom' : 'none';   // 매입단가·확인 단가도 단가표 색 (빨강=없음)
     let html = '<table><thead><tr><th></th><th>품번</th><th>품명</th><th>구분</th><th class="num">개당 소요</th><th class="num">총 소요량</th><th>단위</th><th class="num">단가</th><th>단가 출처</th><th class="num">금액</th></tr></thead><tbody>';
     ['원재료', '부재료', '기타'].forEach(g => {
       const rows = d.lines.filter(x => x.grp === g); if (!rows.length) return;
@@ -26342,21 +26719,31 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     document.getElementById('ipsu-boh').value = document.getElementById('ipsu-ch').value;
     ipsuCalc();
   }
-  // 포장재비 — 선택한 규격의 단가(원) 기준
+  // 포장재비 — 선택한 규격의 단가 기준. 단가 = 아마란스 최근 발주가 › 구매팀 확인 › 매입단가 › 구매팀 단가표 (2026-11-19 Monday 규격표 단가 안 씀)
   function ipsuCost(n1, n2) {
     const el = document.getElementById('ipsu-cost');
     const pA = _ipsuSelA && _ipsuSelA.price > 0 ? _ipsuSelA.price : 0;
     const none = document.getElementById('ipsu-b-form').value === '없음';
     const pB = (!none && _ipsuSelB && _ipsuSelB.price > 0) ? _ipsuSelB.price : 0;
+    const missA = !!_ipsuSelA && !pA, missB = !none && !!_ipsuSelB && !pB;   // 규격은 골랐는데 단가가 없음
+    el.title = '';
     if (!pA && !pB) {
-      el.textContent = '※ 실측 입수 기반 시각화 — 규격을 검색 선택하면 포장재비도 계산됩니다';
+      el.textContent = (missA || missB)
+        ? '※ 고른 규격에 단가가 없어(아마란스·구매팀 단가표 모두 없음) 포장재비는 계산하지 않았습니다'
+        : '※ 실측 입수 기반 시각화 — 규격을 검색 선택하면 포장재비도 계산됩니다';
       return;
     }
     const perBox = pA * n1 * n2 + pB * n2;          // 외박스 1개당 파우치 자재비
     const perUnit = perBox / Math.max(1, n1 * n2);  // 1차파우치 1개당
     const f = v => Math.round(v).toLocaleString();
-    el.textContent = `포장재비 개당 ${f(perUnit)}원 · 박스당 ${f(perBox)}원`
-      + (pA ? ` (1차 ${f(pA)}원` : '') + (pB ? ` + 2차 ${f(pB)}원` : '') + (pA ? ')' : '');
+    const parts = [pA ? `1차 ${f(pA)}원` : '', pB ? `2차 ${f(pB)}원` : ''].filter(Boolean).join(' + ');
+    const srcs = [pA ? (_ipsuSelA.price_src || '') : '', pB ? (_ipsuSelB.price_src || '') : ''].filter(Boolean);
+    const isTbl = s => s.indexOf('구매팀 단가표') === 0;
+    const basis = srcs.length && srcs.every(isTbl) ? '구매팀 단가표' : (srcs.some(isTbl) ? '아마란스·단가표 단가' : '아마란스 단가');
+    el.textContent = `포장재비 개당 ${f(perUnit)}원 · 박스당 ${f(perBox)}원 (${parts} · ${basis})`
+      + (missA ? ' · 1차 단가 없음' : '') + (missB ? ' · 2차 단가 없음' : '');
+    el.title = [pA ? `1차 ${_ipsuSelA.code}: ${_ipsuSelA.price_src || ''}` : '', pB ? `2차 ${_ipsuSelB.code}: ${_ipsuSelB.price_src || ''}` : '']
+      .filter(Boolean).join(' / ');
   }
   // 실측 최대입수 → 파우치 두께(_ipsuThinMul) 역산. 1차파우치가 담기는 컨테이너 기준.
   function ipsuCalibThickness() {
@@ -26715,11 +27102,13 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const cat  = cb.dataset.cat  || '';
     _pcalcSizeRaw = size;  // 롤파우치 감지용 원본 사이즈 저장
     _pcalcMatRaw  = mat;   // 박스 토크나이저용 원본 재질 저장
-    // 알고있는 품목의 실제 단가 = 아마란스 최신 발주단가 › 규격표 단가 (계산기 학습 단가와 같은 기준, 2026-11-04)
-    _pcalcActualBoard = +(cb.dataset.price || 0) || 0;
-    const _poP = +(cb.dataset.poPrice || 0) || 0, _chkP = +(cb.dataset.chkPrice || 0) || 0;
-    _pcalcActualPrice = _poP || _chkP || _pcalcActualBoard;
-    _pcalcActualSrc = _poP ? '발주 ' + (cb.dataset.poDate || '') : (_chkP ? '확인 ' + (cb.dataset.chkDate || '') : (_pcalcActualBoard ? '규격표' : ''));
+    // 알고있는 품목의 실제 단가 = 아마란스 최신 발주단가 › 구매팀 확인 단가 › 아마란스 매입단가 (계산기 학습 단가와 같은 기준).
+    // 2026-11-19 아마란스 기준: Monday 규격표 단가는 안 씀 — 셋 다 없으면 '실제' 없이 예상만
+    _pcalcActualBoard = 0;
+    const _poP = +(cb.dataset.poPrice || 0) || 0, _chkP = +(cb.dataset.chkPrice || 0) || 0, _purP = +(cb.dataset.purPrice || 0) || 0;
+    const _tblP = +(cb.dataset.tblPrice || 0) || 0;   // 구매팀 단가표 — 마지막 순서 (2026-11-19)
+    _pcalcActualPrice = _poP || _chkP || _purP || _tblP;
+    _pcalcActualSrc = _poP ? '발주 ' + (cb.dataset.poDate || '') : (_chkP ? '확인 ' + (cb.dataset.chkDate || '') : (_purP ? '매입단가' : (_tblP ? '단가표 ' + (cb.dataset.tblDate || '') : '')));
 
     // 사이즈 파싱: "150*200+밑지70", "W70*H175", "70*175" 등
     let w = 0, h = 0, d = 0;
@@ -26812,6 +27201,30 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     if (calc) { tabReveal(calc); calc.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }   // 규격·입수 탭에서 누르면 단가·원가 탭으로
   }
 
+  // 규격 목록 '단가' 칸 (2026-11-19 아마란스 기준) — 윗줄 단가, 아랫줄 출처. 서버가 po/chk/pur 중 하나만 채워 보냄 (계산기 '실제' 단가와 같은 순서)
+  function specPriceCell(it) {
+    const yymm = s => (s || '').slice(2, 7).replace('-', '.');   // '2026-10-12' → '26.10'
+    const board = it.board_price ? ' · 참고: Monday 규격표 ' + fmtNum(it.board_price) + '원' : '';
+    let p = 0, kind = '', tag = '', tip = '';
+    if (it.po_price) {
+      p = it.po_price; kind = 'po'; tag = '발주 ' + yymm(it.po_date);
+      tip = '아마란스 최근 발주가 · ' + (it.po_date || '') + (it.po_vendor ? ' · ' + it.po_vendor : '');
+    } else if (it.chk_price) {
+      p = it.chk_price; kind = 'chk'; tag = '확인 ' + yymm(it.chk_date);
+      tip = '구매팀 확인 단가 · ' + (it.chk_date || '') + ' (아마란스 발주 이력 없음)';
+    } else if (it.pur_price) {
+      p = it.pur_price; kind = 'pur'; tag = '매입단가';
+      tip = '아마란스 품목 매입단가 (발주 이력·확인 단가 없음)';
+    } else if (it.tbl_price) {
+      p = it.tbl_price; kind = 'tbl'; tag = '단가표 ' + yymm(it.tbl_date);
+      tip = '구매팀 단가표 ' + (it.tbl_date || '') + ' (아마란스 단가 없음)';
+    }
+    if (!p) return '<span class="sc-price none" title="' + escapeHtml('단가 없음 (아마란스·구매팀 단가표 모두 없음)'
+      + (/^ZQ/i.test(it.code || '') ? ' · ZQ는 여러 품목이 같이 쓰는 공용 코드라 품목별 단가가 없음' : '') + board) + '">-</span>';
+    return '<span class="sc-price" title="' + escapeHtml(tip + board) + '">' + fmtNum(p) + '원'
+      + '<i class="sc-psrc ' + kind + '">' + escapeHtml(tag) + '</i></span>';
+  }
+
   function renderSpecList() {
     const list = document.getElementById('spec-list');
     const cnt = document.getElementById('spec-count');
@@ -26833,7 +27246,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       + '<div>품번</div><div>품명</div><div>구분</div><div>사이즈</div><div>재질</div>'
       + '<div class="h-design" title="Monday 시안 파일 — 아이콘을 누르면 보기">시안</div>'
       + '<div class="h-check" title="단가 계산기 연동">↑</div>'
-      + '<div class="h-moq">MOQ</div><div class="h-price">단가</div><div>업체</div>'
+      + '<div class="h-moq">MOQ</div><div class="h-price" title="아마란스 기준 — 최근 발주가 › 구매팀 확인 단가 › 품목 매입단가 › 없으면 구매팀 단가표. Monday 규격표 단가는 마우스를 올리면 참고로 보입니다">단가</div><div>업체</div>'
       + '</div>';
     html += items.map(it => {
       const catCls = it.category === '파우치' ? 'sc-cat-pouch' : (it.category === '단상자' ? 'sc-cat-단상자' : (it.category && it.category.indexOf('RRP') >= 0 ? 'sc-cat-rrp' : ''));
@@ -26841,9 +27254,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         + ' data-size="' + escapeHtml(it.size||'') + '"'
         + ' data-mat="' + escapeHtml(it.material||'') + '"'
         + ' data-cat="' + escapeHtml(it.category||'') + '"'
-        + ' data-price="' + (it.price || 0) + '"'
         + ' data-po-price="' + (it.po_price || 0) + '" data-po-date="' + escapeHtml(it.po_date || '') + '"'
         + ' data-chk-price="' + (it.chk_price || 0) + '" data-chk-date="' + escapeHtml(it.chk_date || '') + '"'
+        + ' data-pur-price="' + (it.pur_price || 0) + '"'
+        + ' data-tbl-price="' + (it.tbl_price || 0) + '" data-tbl-date="' + escapeHtml(it.tbl_date || '') + '"'
         + ' data-tokens="' + escapeHtml(JSON.stringify(it.tokens||[])) + '"';
       const divVal = it.div || '';
       const divCls = divVal === '쿠팡' ? 'sc-div-쿠팡'
@@ -26865,7 +27279,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         + '<input type="checkbox" class="spec-calc-cb" ' + cbAttrs + ' onchange="specLinkToCalc(this)" title="단가 계산기에 연동">'
         + '</span>'
         + '<span class="sc-moq">' + (it.moq ? fmtNum(it.moq) : '-') + '</span>'
-        + '<span class="sc-price">' + (it.price ? fmtNum(it.price) + '원' : '-') + '</span>'
+        + specPriceCell(it)
         + '<span class="sc-vendor ' + catCls + '" title="' + escapeHtml(it.vendor) + '">' + escapeHtml(it.vendor || '-') + '</span>'
         + '</div>';
     }).join('');
@@ -29341,6 +29755,13 @@ def export_source_csv():
                     ym_i = f'{y_i + (m_i > 12)}{(m_i - 1) % 12 + 1:02d}'
             except Exception as e:
                 print(f'[export] 입고일지 CSV 실패: {e}')
+        # 입수 테스트 PT적재량 보조값(제품리스트·재고파악 = OneDrive) 사본 갱신 → data/pallet_snapshot.csv → GCP (2026-11-19)
+        # 캐시가 살아 있으면 다시 계산하지 않음(캐시 15분 < 동기화 30분이라 보통 매번 갱신)
+        try:
+            with app.test_request_context('/api/ipsu_bom'):
+                api_ipsu_bom()
+        except Exception as e:
+            print(f'[export] PT 사본 갱신 실패: {e}')
         print(f"[export] OneDrive 소스 CSV 저장: {out} (+마감보관 {ym})")
         return jsonify({'ok': True, 'exported': out, 'date': today})
     except Exception as e:

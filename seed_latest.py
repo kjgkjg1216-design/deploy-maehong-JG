@@ -17,6 +17,13 @@ PATTERNS = [
     '*_생산지시.csv', '*_monday.csv', '*_판매단가.csv', '*_판매일별.csv',
 ]
 
+# 날짜별 최신 1개가 아니라 전부 올리는 파일 — 앱이 모두 읽어 합침
+# price_check_answers_*.csv: 구매팀 단가 확인 결과(2026-11-04~). 부자재 단가 아마란스 기준(발주가 › 확인 단가 › 매입단가)이라
+# GCP 챗봇 규격 답변도 같은 단가가 나오려면 필요 (2026-11-19)
+# pallet_answers_*.csv: 구매팀 PT적재량 확인 결과 / pallet_snapshot.csv: 호스트가 OneDrive 엑셀(제품리스트·재고파악)로 만든
+# PT적재량 보조값 사본 — 입수 테스트를 GCP에서도 열면서 같은 값이 나오게 (2026-11-19 사용자 "HOST 자료 GCP에서도")
+ALL_PATTERNS = ['price_check_answers_*.csv', 'pallet_answers_*.csv', 'pallet_snapshot.csv']
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     # 이전 실행 잔여 파일 제거 — 최신 1개씩만 남겨 업로드 md5 비교가 VM과 일치하도록
@@ -38,6 +45,12 @@ def main():
         sz = os.path.getsize(src) / 1024 / 1024
         total += sz
         print(f'  복사 {os.path.basename(src)}  ({sz:.1f}MB)')
+    for pat in ALL_PATTERNS:
+        for src in sorted(glob.glob(os.path.join(DATA, pat))):
+            shutil.copy2(src, os.path.join(OUT, os.path.basename(src)))
+            sz = os.path.getsize(src) / 1024 / 1024
+            total += sz
+            print(f'  복사 {os.path.basename(src)}  ({sz:.2f}MB)')
     print(f'\n[완료] {OUT} 에 최신 파일 모음 ({total:.1f}MB)')
 
 if __name__ == '__main__':
