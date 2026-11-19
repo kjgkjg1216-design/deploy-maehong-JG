@@ -112,6 +112,41 @@ def current_user():
     return session.get('user')
 
 
+# ── 사용자 차단 (2026-11-19 사용자 "방문자 이력에 체크박스 → 불필요한 사람은 체크하면 자료가 안 보이게") ──
+# Firestore 'blocked_users' (문서 id = 소문자 이메일). 관리자 화면(/admin/visits) '차단' 체크박스로 켜고 끔.
+# 로그인 관문(_require_login)이 막음 — 화면은 '접근 제한' 안내, /api/는 403. 관리자(ADMIN_EMAILS)는 차단 불가(잠김 방지).
+# gunicorn 워커마다 30초 캐시 → 다른 워커에도 30초 안에 반영.
+_BLOCKED = {'at': 0.0, 'set': frozenset()}
+_BLOCK_TTL = 30
+
+
+def _admin_emails_lower():
+    return {e.lower() for e in _ADMIN_EMAILS}
+
+
+def _blocked_emails(force=False):
+    """차단된 이메일(소문자) 집합. 읽기 실패 시 마지막으로 읽은 값 유지."""
+    now = time.time()
+    if force or now - _BLOCKED['at'] > _BLOCK_TTL:
+        _BLOCKED['at'] = now   # 실패해도 30초 동안은 다시 묻지 않음 (요청마다 Firestore 대기 방지)
+        try:
+            _BLOCKED['set'] = frozenset(str(d.id).strip().lower() for d in FIRESTORE_DB.collection('blocked_users').stream())
+        except Exception as e:
+            print(f'[차단 목록] 읽기 실패: {e}')
+    return _BLOCKED['set']
+
+
+_BLOCKED_PAGE = '''<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>접근 제한</title>
+<style>body{font-family:-apple-system,'Malgun Gothic',sans-serif;background:#f5f6fa;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;color:#1e293b;padding:16px;box-sizing:border-box}
+.box{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:32px 28px;max-width:420px;text-align:center;box-shadow:0 4px 18px rgba(15,23,42,.06)}
+h1{font-size:19px;margin:10px 0 8px} p{color:#64748b;font-size:14px;line-height:1.6;margin:0 0 18px}
+a{display:inline-block;padding:9px 18px;border-radius:9px;background:#4f46e5;color:#fff;text-decoration:none;font-weight:700;font-size:14px}</style></head>
+<body><div class="box"><div style="font-size:40px">🚫</div><h1>접근이 제한된 계정입니다</h1>
+<p><b>__EMAIL__</b> 계정은 관리자가 대시보드 열람을 막아 두었습니다.<br>필요하면 관리자에게 문의해 주세요.</p>
+<a href="/auth/logout">다른 계정으로 로그인</a></div></body></html>'''
+
+
 def _log_visit(kind='login'):
     """방문/로그인 이력을 Firestore 'visits' 컬렉션에 기록 (Firebase 콘솔에서 조회 가능)."""
     try:
@@ -146,7 +181,14 @@ def _require_login():
         _tok = os.environ.get('RELOAD_TOKEN', '')
         if _tok and request.args.get('token') == _tok:
             return None
-    if session.get('user'):
+    u = session.get('user')
+    if u:
+        # 관리자가 차단한 계정 (방문자 이력 '차단' 체크, 2026-11-19) — 관리자는 차단 대상 아님
+        em = str(u.get('email') or '').strip().lower()
+        if em and em in _blocked_emails() and em not in _admin_emails_lower():
+            if p.startswith('/api/'):
+                return jsonify({'error': 'blocked', 'message': '접근이 제한된 계정입니다'}), 403
+            return _BLOCKED_PAGE.replace('__EMAIL__', _html_esc(em)), 403
         return None
     if p.startswith('/api/'):
         return jsonify({'error': 'login_required'}), 401
@@ -280,6 +322,59 @@ def _fmt_kst(ts, fmt='%Y-%m-%d %H:%M:%S'):
         return ts.strftime(fmt)
 
 
+# 방문자 이력 '차단' 체크박스 동작 (2026-11-19) — f-string 밖에 둬서 중괄호를 두 번 쓰지 않음
+_ADMIN_BLOCK_JS = r'''<script>
+function blkEsc(s){ return String(s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+function blkPaint(list){
+  var on = {}; list.forEach(function(e){ on[e] = 1; });
+  document.querySelectorAll('.blk-cb').forEach(function(c){
+    var b = !!on[c.dataset.email]; c.checked = b;
+    var tr = c.closest('tr'); if (tr) tr.classList.toggle('is-blocked', b);
+  });
+  var box = document.getElementById('blk-list'); if (!box) return;
+  box.innerHTML = list.length
+    ? list.map(function(e){ return '<span class="blk-chip">' + blkEsc(e) + ' <button type="button" data-email="' + blkEsc(e) + '" onclick="blkSet(this.dataset.email,false)">해제</button></span>'; }).join(' ')
+    : '<span class="muted">없음 — 아래 표의 차단 칸을 체크하면 그 사용자는 자료를 볼 수 없습니다</span>';
+}
+function blkSet(email, on, cb){
+  if (on && !confirm(email + ' 사용자를 차단할까요? 차단하면 로그인해도 대시보드 자료를 볼 수 없습니다.')) { if (cb) cb.checked = false; return; }
+  document.querySelectorAll('.blk-cb').forEach(function(c){ if (c.dataset.email === email) c.disabled = true; });
+  fetch('/admin/block', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({email: email, blocked: !!on})})
+    .then(function(r){ return r.json().then(function(d){ if (!r.ok || !d.ok) throw new Error(d.error || ('HTTP ' + r.status)); return d; }); })
+    .then(function(d){ blkPaint(d.blocked || []); })
+    .catch(function(e){ alert('저장하지 못했습니다: ' + e.message); if (cb) cb.checked = !on; })
+    .then(function(){ document.querySelectorAll('.blk-cb').forEach(function(c){ if (c.dataset.email === email) c.disabled = false; }); });
+}
+function blk(cb){ blkSet(cb.dataset.email, cb.checked, cb); }
+</script>'''
+
+
+@app.route('/admin/block', methods=['POST'])
+def admin_block():
+    """방문자 이력 '차단' 체크박스 (관리자 전용, 2026-11-19) — JSON {email, blocked} → Firestore blocked_users 문서 추가/삭제."""
+    u = current_user()
+    if not u or str(u.get('email') or '').strip().lower() not in _admin_emails_lower():
+        return jsonify({'ok': False, 'error': '권한 없음 (관리자만)'}), 403
+    d = request.get_json(silent=True) or {}
+    em = str(d.get('email') or '').strip().lower()
+    if not em or '@' not in em or '/' in em or len(em) > 200:
+        return jsonify({'ok': False, 'error': '이메일이 올바르지 않습니다'}), 400
+    if em in _admin_emails_lower():
+        return jsonify({'ok': False, 'error': '관리자는 차단할 수 없습니다'}), 400
+    on = bool(d.get('blocked'))
+    try:
+        ref = FIRESTORE_DB.collection('blocked_users').document(em)
+        if on:
+            ref.set({'email': em, 'at': fs_admin.SERVER_TIMESTAMP, 'by': u.get('email', '')})
+        else:
+            ref.delete()
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'저장 오류: {e}'}), 500
+    blocked = _blocked_emails(force=True)
+    print(f"[차단] {u.get('email', '')} → {em} {'차단' if on else '해제'}")
+    return jsonify({'ok': True, 'blocked': sorted(blocked)})
+
+
 @app.route('/admin/visits')
 def admin_visits():
     """방문/로그인 이력 조회 (관리자 전용)."""
@@ -325,14 +420,39 @@ def admin_visits():
     from collections import Counter
     by_email = Counter(r['email'] for r in rows if r['email'])
     logins = sum(1 for r in rows if r['kind'] == 'login')
-    stat_html = ' · '.join(f'{e or "(미상)"}: {n}회' for e, n in by_email.most_common(20)) or '기록 없음'
+    stat_html = ' · '.join(f'{_html_esc(e) or "(미상)"}: {n}회' for e, n in by_email.most_common(20)) or '기록 없음'
     SHOW = 10   # 처음엔 최근 10건만, 나머지는 버튼으로 펼침
     OLD_ATTR = ' class="old"'   # f-string 식 안에 백슬래시 금지(GCP 파이썬 <3.12 호환)
     def _tr_old(i):
         return OLD_ATTR if i >= SHOW else ''
+
+    # 차단 체크박스 (2026-11-19) — 이메일마다 하나의 상태, 같은 이메일 줄은 함께 바뀜. 관리자 줄은 비활성
+    blocked = _blocked_emails(force=True)
+    admins = _admin_emails_lower()
+
+    def _tr_v(i, email):
+        cls = (['old'] if i >= SHOW else []) + (['is-blocked'] if str(email or '').strip().lower() in blocked else [])
+        return (' class="' + ' '.join(cls) + '"') if cls else ''
+
+    def _blk_cell(email):
+        em = str(email or '').strip().lower()
+        if not em or '@' not in em:
+            return '<td class="blk"></td>'
+        if em in admins:
+            return '<td class="blk"><input type="checkbox" disabled title="관리자는 차단할 수 없습니다"></td>'
+        return ('<td class="blk"><input type="checkbox" class="blk-cb" data-email="' + _html_esc(em) + '"'
+                + (' checked' if em in blocked else '')
+                + ' onchange="blk(this)" title="체크하면 이 사용자는 대시보드 자료를 볼 수 없습니다"></td>')
+
+    def _blk_list_html():
+        if not blocked:
+            return '<span class="muted">없음 — 아래 표의 차단 칸을 체크하면 그 사용자는 자료를 볼 수 없습니다</span>'
+        return ' '.join('<span class="blk-chip">' + _html_esc(e) + ' <button type="button" data-email="' + _html_esc(e)
+                        + '" onclick="blkSet(this.dataset.email,false)">해제</button></span>' for e in sorted(blocked))
+
     body = ''.join(
-        f'<tr{_tr_old(i)}><td class="nw">{r["ts"]}</td><td><span class="k k-{r["kind"]}">{"로그인" if r["kind"]=="login" else "방문"}</span></td>'
-        f'<td>{_html_esc(r["name"])}</td><td>{_html_esc(r["email"])}</td><td class="ip">{_html_esc(r["ip"])}</td></tr>'
+        f'<tr{_tr_v(i, r["email"])}><td class="nw">{r["ts"]}</td><td><span class="k k-{r["kind"]}">{"로그인" if r["kind"]=="login" else "방문"}</span></td>'
+        f'<td>{_html_esc(r["name"])}</td><td class="em">{_html_esc(r["email"])}</td>{_blk_cell(r["email"])}<td class="ip">{_html_esc(r["ip"])}</td></tr>'
         for i, r in enumerate(rows))
     chat_body = ''.join(
         f'<tr{_tr_old(i)}><td class="nw">{c["ts"]}</td><td>{_html_esc(c["name"])}</td>'
@@ -366,19 +486,27 @@ def admin_visits():
  .more{{text-align:center;margin:8px 0 4px}}
  .more-btn{{padding:7px 16px;font-size:12.5px;font-weight:700;border:1px solid #cbd5e1;border-radius:8px;background:#fff;color:#475569;cursor:pointer}}
  .more-btn:hover{{background:#f8fafc;border-color:#94a3b8}}
+ .blk{{text-align:center}} .blk input{{width:16px;height:16px;margin:0;cursor:pointer;accent-color:#dc2626;vertical-align:middle}}
+ .blk input:disabled{{cursor:not-allowed;opacity:.35}}
+ tr.is-blocked td{{background:#fef2f2}} tr.is-blocked td.em{{color:#b91c1c;text-decoration:line-through}}
+ .blk-line{{margin-top:10px;padding-top:10px;border-top:1px dashed #e2e8f0}}
+ .blk-chip{{display:inline-block;background:#fee2e2;color:#b91c1c;border-radius:7px;padding:2px 4px 2px 8px;margin:2px 4px 2px 0;font-size:12px;font-weight:700}}
+ .blk-chip button{{border:0;background:#fff;color:#b91c1c;border-radius:5px;padding:1px 7px;margin-left:4px;font-size:11px;font-weight:700;cursor:pointer}}
+ .muted{{color:#94a3b8;font-weight:400}}
 </style>
 <script>
 function toggleOld(b){{var t=document.getElementById(b.dataset.t);var open=t.classList.toggle('open');
   b.textContent=(open?'▲ 최근 10건만 보기':'▼ 과거 이력 '+b.dataset.n+'건 더 보기');
   if(!open) t.scrollIntoView({{block:'start',behavior:'smooth'}});}}
-</script></head><body>
+</script>{_ADMIN_BLOCK_JS}</head><body>
  <h1>📋 방문자 · 검색 이력</h1>
  <div class="sub">관리자 전용 · <a href="/">← 대시보드</a></div>
- <div class="stat"><b>사용자별 접속 횟수:</b><br>{stat_html}<br><br><b>총 로그인:</b> {logins}회 · <b>방문기록:</b> {len(rows)}건 · <b>검색/채팅:</b> {len(chat_rows)}건</div>
+ <div class="stat"><b>사용자별 접속 횟수:</b><br>{stat_html}<br><br><b>총 로그인:</b> {logins}회 · <b>방문기록:</b> {len(rows)}건 · <b>검색/채팅:</b> {len(chat_rows)}건
+  <div class="blk-line">🚫 <b>차단 중:</b> <span id="blk-list">{_blk_list_html()}</span></div></div>
 
  <h2>👥 방문 · 로그인 이력 <span style="font-size:12px;color:#64748b;font-weight:600">최근 {min(SHOW, len(rows))}건 표시 · 전체 {len(rows)}건</span></h2>
- <table id="t-visit"><thead><tr><th style="width:160px">시각 (KST)</th><th style="width:70px">구분</th><th style="width:110px">이름</th><th>이메일</th><th style="width:130px">IP</th></tr></thead>
- <tbody>{body or '<tr><td colspan=5 style="text-align:center;color:#64748b;padding:30px">아직 기록이 없습니다</td></tr>'}</tbody></table>
+ <table id="t-visit"><thead><tr><th style="width:160px">시각 (KST)</th><th style="width:70px">구분</th><th style="width:110px">이름</th><th>이메일</th><th style="width:64px;text-align:center" title="체크하면 이 사용자는 대시보드 자료를 볼 수 없습니다(로그인해도 접근 제한 화면). 다시 풀면 바로 볼 수 있습니다">차단</th><th style="width:130px">IP</th></tr></thead>
+ <tbody>{body or '<tr><td colspan=6 style="text-align:center;color:#64748b;padding:30px">아직 기록이 없습니다</td></tr>'}</tbody></table>
  {visit_more}
 
  <h2>🔍 검색 · 채팅 내역 <span style="font-size:12px;color:#64748b;font-weight:600">최근 {min(SHOW, len(chat_rows))}건 표시 · 전체 {len(chat_rows)}건</span></h2>
