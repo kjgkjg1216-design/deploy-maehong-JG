@@ -7851,7 +7851,8 @@ def _dsgchk_free_extract(pages):
         best = row if key(row) == exp(row) else (col if key(col) == exp(col) else row)
         items = [{'name': o['name'], 'amount': o['amount'], 'unit': o['unit'], 'pct': o['pct']} for o in best]
     algs_in, algs_mk = [], []
-    ing = fields.get('원재료명', '')
+    # 원재료명 값에서 혼입 주의 문구('*이 제품은 난류, 우유… 사용한 제품과 같은 시설')는 뺌 — 알레르기 '없음' 오경고 방지 (2026-11-20)
+    ing = re.split(r'[*※•]|[본이]\s*제품은|사용한\s*제품|같은\s*(?:제조|생산)?\s*시설', fields.get('원재료명', ''))[0]
     for a, pat in _ALG_PAT.items():
         if re.search(pat, ing):
             algs_in.append(a)
@@ -7890,6 +7891,8 @@ def _dsgchk_rules(ai, spec, mode='ai', fulltext=None):
     norm = lambda s: re.sub(r'\s+', '', str(s or ''))
 
     # 소비기한 용어
+    # 시안 여백의 인쇄 안내('유통기한 날인 부분: 60×22mm')는 표시가 아님 — 빼고 봄 (2026-11-20)
+    alltext = re.sub(r'유\s*통\s*기\s*한\s*(?:날\s*인|인\s*쇄|각\s*인|표\s*기\s*(?:부\s*분|위\s*치|자\s*리)|자\s*리|위\s*치)', ' ', alltext)
     if '유통기한' in norm(alltext):
         add('error', '소비기한', "'유통기한'으로 표시됨 → '소비기한'으로 바꿔야 함", '2023년부터 소비기한 표시제(유통기한 표기는 위반). 읽은 글자: ' + (f.get('소비기한') or '유통기한 …'))
     elif f.get('소비기한'):
@@ -8175,7 +8178,11 @@ def _dsgchk_run(item_id, asset_id, mode='free'):
             with _DSGCHK_GUARD:
                 _DSGCHK_RES[str(asset_id)] = rec
                 _DSGCHK_JOBS.pop(str(asset_id), None)
-                _DSGCHK_SUM['at'] = 0.0
+                # 목록 요약은 Firestore를 다시 다 읽지 않고 이 한 건만 고침 (전체 점검 중 5초마다 읽으면 하루 읽기 한도를 넘김)
+                lst = [x for x in _DSGCHK_SUM['items'].get(str(item_id), []) if x['asset_id'] != str(asset_id)]
+                lst.append({'asset_id': str(asset_id), 'file': rec['file'], 'error': rec['summary']['error'], 'warn': rec['summary']['warn'],
+                            'applicable': rec['applicable'], 'at': rec['at']})
+                _DSGCHK_SUM['items'][str(item_id)] = lst
             print(f"[시안 점검 {mode}] {spec.get('code', '')} {a['name']} — 오류 {rec['summary']['error']} · 확인 {rec['summary']['warn']} · {rec['secs']}초 · 그림 {n_img}장")
         except Exception as e:
             msg = str(e)
@@ -8237,12 +8244,108 @@ def api_design_check(item_id, asset_id):
     return jsonify({'ok': True, 'state': 'done' if rec else 'none', 'result': rec, 'free_ok': _IS_HOST_PC})
 
 
+# ── 전체 무료 점검 (2026-11-20 사용자 "모든 시안 무료 점검 한 번에 — 일일이 클릭 불편") ──
+_DSGCHK_BATCH = {'state': 'idle', 'total': 0, 'done': 0, 'ok': 0, 'fail': 0, 'cur': '', 'started': 0.0, 'ended': 0.0, 'errors': []}
+
+
+def _design_assets_bulk(item_ids):
+    """Monday 부자재 규격 품목들의 '시안' 파일 {item_id: [{id, name, ext}]} — 25개씩 묶어 조회."""
+    import requests as _req
+    api_key = os.getenv('MONDAY_API_KEy')
+    out = {}
+    ids = [str(i) for i in item_ids if str(i).isdigit()]
+    for k in range(0, len(ids), 25):
+        q = ('{ items(ids: [%s]) { id column_values { type value column { title } } assets { id name file_extension } } }'
+             % ','.join(ids[k:k + 25]))
+        r = _req.post('https://api.monday.com/v2', json={'query': q},
+                      headers={'Authorization': api_key, 'API-Version': '2024-10'}, timeout=60)
+        for it in (r.json().get('data') or {}).get('items') or []:
+            amap = {str(a.get('id')): a for a in (it.get('assets') or [])}
+            files = []
+            for cv in it.get('column_values') or []:
+                if cv.get('type') != 'file' or (cv.get('column') or {}).get('title') != '시안':
+                    continue
+                try:
+                    entries = (json.loads(cv.get('value') or '{}') or {}).get('files') or []
+                except (TypeError, ValueError):
+                    entries = []
+                for f in entries:
+                    a = amap.get(str(f.get('assetId') or ''))
+                    if a:
+                        files.append({'id': str(a.get('id')), 'name': a.get('name') or '',
+                                      'ext': (a.get('file_extension') or '').lower().lstrip('.')})
+            out[str(it.get('id'))] = files
+    return out
+
+
+def _dsgchk_batch_run(redo, since=''):
+    """부자재 규격의 모든 시안을 하나씩 무료 점검 (뒤에서). redo=False면 이미 무료 점검한 시안은 건너뜀."""
+    B = _DSGCHK_BATCH
+    try:
+        spec = MONDAY_DF[MONDAY_DF['보드명'] == '부자재 규격']
+        item_ids = sorted({str(r.get('아이템ID', '')).strip() for _, r in spec.iterrows()
+                           if 'http' in str(r.get('시안', '') or '')})
+        B['cur'] = f'시안 목록 받는 중 ({len(item_ids)}개 품목)'
+        assets = _design_assets_bulk(item_ids)
+        todo, seen = [], set()
+        for iid in item_ids:
+            for f in assets.get(iid, []):
+                if f['id'] in seen or f['ext'] not in ('ai', 'pdf', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'):
+                    continue
+                seen.add(f['id'])
+                if not redo or since:
+                    old = _dsgchk_get(f['id'])
+                    # redo=False: 무료 점검한 것 건너뜀 / since='YYYY-MM-DD HH:MM': 그 뒤에 무료 점검한 것만 건너뜀(이어서 하기)
+                    if old and old.get('mode') == 'free' and (not since or str(old.get('at') or '') >= since):
+                        continue
+                todo.append((iid, f))
+        B.update(total=len(todo), done=0, ok=0, fail=0)
+        for iid, f in todo:
+            if B.get('stop'):
+                break
+            B['cur'] = f['name']
+            B['cur_item'] = iid
+            with _DSGCHK_GUARD:
+                _DSGCHK_JOBS[f['id']] = {'state': 'running', 'mode': 'free', 'at': time.time()}
+            _dsgchk_run(iid, f['id'], 'free')
+            with _DSGCHK_GUARD:
+                j = _DSGCHK_JOBS.get(f['id'])
+            if j and j.get('state') == 'error':
+                B['fail'] += 1
+                B['errors'] = (B['errors'] + [f"{f['name']}: {j.get('msg', '')}"[:160]])[-30:]
+            else:
+                B['ok'] += 1
+            B['done'] += 1
+        B.update(state='done', cur='', cur_item='', ended=time.time())
+    except Exception as e:
+        B.update(state='error', cur=str(e)[:200], ended=time.time())
+    print(f"[시안 전체 점검] 끝 — {B['done']}/{B['total']}건, 실패 {B['fail']}")
+
+
+@app.route('/api/design_check_batch', methods=['GET', 'POST'])
+def api_design_check_batch():
+    """전체 무료 점검 — POST {redo: true면 이미 한 것도 다시, stop: true면 멈춤} 시작 / GET 진행 상황. 회사 PC(윈도우 글자 인식)만."""
+    B = _DSGCHK_BATCH
+    if request.method == 'POST':
+        if not _IS_HOST_PC:
+            return jsonify({'ok': False, 'error': '전체 무료 점검은 회사 PC 대시보드에서만 할 수 있어요'}), 400
+        d = request.get_json(silent=True) or {}
+        if d.get('stop'):
+            B['stop'] = True
+            return jsonify({'ok': True, **{k: v for k, v in B.items() if k != 'errors'}})
+        if B['state'] == 'running':
+            return jsonify({'ok': True, **{k: v for k, v in B.items() if k != 'errors'}})
+        B.update(state='running', total=0, done=0, ok=0, fail=0, cur='시작하는 중', started=time.time(), ended=0.0, errors=[], stop=False)
+        threading.Thread(target=_dsgchk_batch_run, args=(bool(d.get('redo')), str(d.get('since') or '')), daemon=True, name='design-check-all').start()
+    return jsonify({'ok': True, 'free_ok': _IS_HOST_PC, **B})
+
+
 @app.route('/api/design_check_summary', methods=['GET'])
 def api_design_check_summary():
     """점검한 시안 요약 {item_id: [{asset_id, file, error, warn, applicable, at}]} — 규격 목록 시안 아이콘 옆 점 (60초 캐시)."""
     if _HOST_ONLY_LOCK:
         return jsonify({'ok': False, 'items': {}})
-    if time.time() - _DSGCHK_SUM['at'] > 60:
+    if time.time() - _DSGCHK_SUM['at'] > 300:   # 새 결과는 저장 때 바로 고쳐 넣으므로 5분마다만 다시 읽음
         items = {}
         try:
             for d in FIRESTORE_DB.collection('design_checks').select(['item_id', 'file', 'summary', 'applicable', 'at']).stream():
@@ -17607,6 +17710,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     .spec-row .sc-mat    { grid-area: mat; white-space: normal; font-size: 11px; }
     .spec-row .sc-moq    { grid-area: moq; text-align: right; }
     .spec-row .sc-price  { grid-area: price; text-align: right; }
+    .spec-row .sc-chk    { grid-area: price; justify-self: end; }
     .spec-row .sc-vendor { grid-area: vendor; justify-self: start; }
     .spec-row + .spec-row { border-top: 1px solid rgba(15,23,42,0.08); }
   }
@@ -17733,6 +17837,16 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .dck-foot { margin-top: 12px; padding-top: 8px; border-top: 1px dashed #e5e7eb; font-size: 11px; color: #94a3b8; line-height: 1.5; }
   /* 규격 목록 시안 아이콘 옆 점검 결과 점 */
   .sc-dck { position: absolute; bottom: -4px; right: -4px; width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid #fff; }   /* 위 오른쪽은 시안 수 배지 자리 */
+  /* 규격 목록 '점검' 칸 (2026-11-20, 옛 단가 칸 자리) */
+  .spec-row .sc-chk { display: flex; justify-content: center; }
+  .sc-chk .ck { display: inline-flex; gap: 3px; align-items: center; font-size: 10.5px; font-weight: 800; padding: 2px 7px; border-radius: 7px;
+                white-space: nowrap; cursor: pointer; border: 1px solid transparent; }
+  .sc-chk .ck:hover { filter: brightness(0.96); border-color: #c4b5fd; }
+  .sc-chk .ck.err { background: #fee2e2; color: #b91c1c; } .sc-chk .ck.warn { background: #fef3c7; color: #92400e; }
+  .sc-chk .ck.ok { background: #dcfce7; color: #15803d; } .sc-chk .ck.na { background: #f1f5f9; color: #64748b; }
+  .sc-chk .ck.todo { background: #fff; color: #94a3b8; border-color: #e2e8f0; font-weight: 600; }
+  .sc-chk .ck.run { background: #ede9fe; color: #6d28d9; }
+  .sc-chk .ck small { font-weight: 600; opacity: .75; }
   .sc-dck.err { background: #dc2626; } .sc-dck.warn { background: #f59e0b; } .sc-dck.ok { background: #16a34a; } .sc-dck.na { background: #94a3b8; }
   .chart-panel {
     background: var(--surface); border: 1px solid var(--border);
@@ -19282,8 +19396,12 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
 <section class="spec-strip">
   <div class="chart-panel spec-panel">
     <div class="chart-head">
-      <div><span class="chart-title">📐 부자재 규격</span><span class="chart-sub">규격 = Monday 부자재 규격 보드 · 단가 = 아마란스 최근 발주가 › 구매팀 확인 › 매입단가 › 구매팀 단가표</span></div>
-      <div id="spec-count" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
+      <div><span class="chart-title">📐 부자재 규격</span><span class="chart-sub">규격 = Monday 부자재 규격 보드 · 점검 = 시안 표시사항 무료 점검 결과</span></div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <span id="dck-all-st" style="font-size:11px;color:var(--text-2);font-weight:600"></span>
+        <button id="dck-all-btn" class="dsg-chk-btn" type="button" onclick="dsgChkAll()" title="모든 시안을 윈도우 글자 인식으로 차례로 점검 (회사 PC 대시보드에서만 · 시안당 10초 안팎 · 끝난 건은 점검 칸에 바로 표시)">🔍 전체 무료 점검</button>
+        <div id="spec-count" style="font-size:11px;color:var(--text-3);font-weight:600"></div>
+      </div>
     </div>
     <input id="spec-search" type="text" placeholder="품번/품명/재질/업체/구분 검색…" oninput="renderSpecList()"
            style="width:100%;padding:6px 10px;margin-bottom:6px;font-size:11.5px;border:1px solid var(--border-2);border-radius:6px;outline:none">
@@ -26448,6 +26566,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       _specItems = d.items || [];
       renderSpecList();
       loadDsgChkSummary();   // 시안 표시사항 점검 결과 점 (2026-11-20)
+      dsgChkAllPoll();   // 전체 무료 점검 진행 중이면 이어서 표시
     } catch (e) {
       document.getElementById('spec-list').innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>';
     }
@@ -28343,7 +28462,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       + '<div>품번</div><div>품명</div><div>구분</div><div>사이즈</div><div>재질</div>'
       + '<div class="h-design" title="Monday 시안 파일 — 아이콘을 누르면 보기">시안</div>'
       + '<div class="h-check" title="단가 계산기 연동">↑</div>'
-      + '<div class="h-moq">MOQ</div><div class="h-price" title="아마란스 기준 — 최근 발주가 › 구매팀 확인 단가 › 품목 매입단가 › 없으면 구매팀 단가표. Monday 규격표 단가는 마우스를 올리면 참고로 보입니다">단가</div><div>업체</div>'
+      + '<div class="h-moq">MOQ</div><div class="h-price" style="text-align:center" title="시안 표시사항 무료 점검 결과 — ❌ 위반 의심 · ⚠ 확인 필요 · ✓ 통과. 누르면 시안과 점검 결과가 열림">점검</div><div>업체</div>'
       + '</div>';
     html += items.map(it => {
       const catCls = it.category === '파우치' ? 'sc-cat-pouch' : (it.category === '단상자' ? 'sc-cat-단상자' : (it.category && it.category.indexOf('RRP') >= 0 ? 'sc-cat-rrp' : ''));
@@ -28370,13 +28489,13 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         + '<span class="sc-size" title="' + escapeHtml(it.size || '') + '">' + escapeHtml(it.size || '-') + '</span>'
         + '<span class="sc-mat" title="' + escapeHtml(it.material) + '">' + escapeHtml(it.material) + '</span>'
         + '<span class="sc-design">' + (it.design && it.item_id
-            ? '<button class="sc-design-btn" title="시안 보기' + (it.design > 1 ? ' (' + it.design + '개)' : '') + '" onclick="event.stopPropagation();openDesign(\\'' + escapeHtml(it.item_id) + '\\',\\'' + escapeHtml(it.code) + '\\')">' + dsgIcon() + (it.design > 1 ? '<span class="n">' + it.design + '</span>' : '') + dsgChkDot(it.item_id) + '</button>'
+            ? '<button class="sc-design-btn" title="시안 보기' + (it.design > 1 ? ' (' + it.design + '개)' : '') + '" onclick="event.stopPropagation();openDesign(\\'' + escapeHtml(it.item_id) + '\\',\\'' + escapeHtml(it.code) + '\\')">' + dsgIcon() + (it.design > 1 ? '<span class="n">' + it.design + '</span>' : '') + '</button>'   // 결과 점은 뺌(2026-11-20 — 옆 '점검' 칸에 같은 내용)
             : '-') + '</span>'
         + '<span class="sc-check" onclick="event.stopPropagation()">'
         + '<input type="checkbox" class="spec-calc-cb" ' + cbAttrs + ' onchange="specLinkToCalc(this)" title="단가 계산기에 연동">'
         + '</span>'
         + '<span class="sc-moq">' + (it.moq ? fmtNum(it.moq) : '-') + '</span>'
-        + specPriceCell(it)
+        + dsgChkCell(it)   // 2026-11-20 단가 칸 → 시안 점검 결과 칸 (사용자 요청, 단가는 계산기 연동 체크박스에 그대로 실림)
         + '<span class="sc-vendor ' + catCls + '" title="' + escapeHtml(it.vendor) + '">' + escapeHtml(it.vendor || '-') + '</span>'
         + '</div>';
     }).join('');
@@ -28528,7 +28647,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   async function dsgChkLoad() {   // 지금 파일의 저장된 결과·진행 상태
     const f = dsgChkFile();
     clearTimeout(_dsgChkTimer);
-    if (!f) { _dsgChkAsset = ''; dsgChkBtn(null); dsgChkClose(); return; }
+    if (!f) { _dsgChkAsset = ''; _dsgChkAutoOpen = false; dsgChkBtn(null); dsgChkClose(); return; }
+    if (_dsgChkAutoOpen && !document.getElementById('dsg-chk').classList.contains('show')) {   // 목록 '점검' 칸에서 열었으면 점검 칸까지
+      _dsgChkAutoOpen = false; dsgChkToggle(); return;
+    }
     const asset = f.id; _dsgChkAsset = asset;
     let d = null;
     try { d = await (await fetch('/api/design_check/' + _dsgItemId + '/' + asset)).json(); } catch (e) { d = { state: 'error', error: e.message }; }
@@ -28647,6 +28769,63 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const cls = !ap.length ? 'na' : err ? 'err' : warn ? 'warn' : 'ok';
     const tip = '표시사항 점검 — ' + a.map(x => x.file + ': ' + (x.applicable ? '위반 의심 ' + x.error + ' · 확인 ' + x.warn : '대상 아님') + ' (' + x.at + ')').join(' / ');
     return '<i class="sc-dck ' + cls + '" title="' + escapeHtml(tip) + '"></i>';
+  }
+  // 규격 목록 '점검' 칸 — 품목의 시안 점검 결과(가장 나쁜 것). 누르면 시안 창 + 점검 칸이 바로 열림 (2026-11-20)
+  let _dsgChkAutoOpen = false, _dsgAll = null, _dsgAllTimer = null;
+  function dsgChkCell(it) {
+    if (!it.design || !it.item_id) return '<span class="sc-chk" style="color:#cbd5e1">-</span>';
+    const a = _dsgChkSum[it.item_id] || [];
+    const open = 'onclick="event.stopPropagation();dsgChkOpenItem(&quot;' + escapeHtml(it.item_id) + '&quot;,&quot;' + escapeHtml(it.code) + '&quot;)"';
+    const running = _dsgAll && _dsgAll.state === 'running' && (_dsgAll.cur_item === it.item_id);
+    if (running) return '<span class="sc-chk"><span class="ck run" ' + open + '>점검 중…</span></span>';
+    if (!a.length) return '<span class="sc-chk"><span class="ck todo" ' + open + ' title="아직 점검 안 함 — 누르면 시안과 점검 칸이 열림">점검 전</span></span>';
+    const ap = a.filter(x => x.applicable), err = ap.reduce((s, x) => s + x.error, 0), warn = ap.reduce((s, x) => s + x.warn, 0);
+    const part = a.length < (it.design || 0) ? ' <small>' + a.length + '/' + it.design + '</small>' : '';
+    const tip = a.map(x => x.file + ': ' + (x.applicable ? '위반 의심 ' + x.error + ' · 확인 ' + x.warn : '표시사항 없음') + ' (' + x.at + ')').join(' / ');
+    const body = !ap.length ? '<span class="ck na" ' + open + '>대상 아님' + part + '</span>'
+      : err ? '<span class="ck err" ' + open + '>❌ ' + err + (warn ? ' ⚠ ' + warn : '') + part + '</span>'
+      : warn ? '<span class="ck warn" ' + open + '>⚠ ' + warn + part + '</span>'
+      : '<span class="ck ok" ' + open + '>✓ 통과' + part + '</span>';
+    return '<span class="sc-chk" title="' + escapeHtml(tip) + '">' + body + '</span>';
+  }
+  function dsgChkOpenItem(itemId, code) { _dsgChkAutoOpen = true; openDesign(itemId, code); }
+  // 전체 무료 점검 — 시작·멈춤·진행 표시
+  async function dsgChkAll() {
+    const running = _dsgAll && _dsgAll.state === 'running';
+    if (running) {
+      if (!confirm('전체 점검을 멈출까요? 지금 하던 시안까지만 하고 멈춥니다.')) return;
+      await fetch('/api/design_check_batch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stop: true }) });
+      return dsgChkAllPoll();
+    }
+    const redo = confirm('이미 무료 점검한 시안도 다시 점검할까요? — [확인] 전부 다시 점검 · [취소] 아직 안 한 시안만');
+    try {
+      const d = await (await fetch('/api/design_check_batch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ redo: redo }) })).json();
+      if (!d.ok) throw new Error(d.error || '시작 실패');
+    } catch (e) { alert('전체 점검을 시작하지 못했습니다: ' + e.message); return; }
+    dsgChkAllPoll();
+  }
+  async function dsgChkAllPoll() {
+    clearTimeout(_dsgAllTimer);
+    let d = null;
+    try { d = await (await fetch('/api/design_check_batch')).json(); } catch (e) { return; }
+    const prevDone = _dsgAll ? _dsgAll.done : -1;
+    _dsgAll = d;
+    const st = document.getElementById('dck-all-st'), btn = document.getElementById('dck-all-btn');
+    if (!st || !btn) return;
+    if (d.free_ok === false) { btn.disabled = true; btn.style.opacity = '.45'; btn.title = '전체 무료 점검은 회사 PC 대시보드에서만 할 수 있어요'; }
+    if (d.state === 'running') {
+      const pct = d.total ? Math.round(d.done / d.total * 100) : 0;
+      st.innerHTML = '점검 중 <b>' + d.done + '/' + (d.total || '?') + '</b> (' + pct + '%)' + (d.fail ? ' · 실패 ' + d.fail : '')
+        + ' <span style="color:#94a3b8;font-weight:500">' + escapeHtml(String(d.cur || '').slice(0, 28)) + '</span>';
+      btn.textContent = '■ 멈추기';
+      if (d.done !== prevDone) loadDsgChkSummary();
+      _dsgAllTimer = setTimeout(dsgChkAllPoll, 5000);
+    } else {
+      btn.textContent = '🔍 전체 무료 점검';
+      st.innerHTML = d.state === 'done' && d.total ? '끝: ' + d.ok + '건 점검' + (d.fail ? ' · 실패 ' + d.fail + '(썸네일뿐인 AI 등)' : '')
+        : (d.state === 'error' ? '<span style="color:#b91c1c">전체 점검 오류: ' + escapeHtml(d.cur || '') + '</span>' : '');
+      if (prevDone >= 0 && d.done !== prevDone) loadDsgChkSummary();
+    }
   }
   async function loadDsgChkSummary() {
     try { const d = await (await fetch('/api/design_check_summary')).json(); _dsgChkSum = d.items || {}; if (_specItems.length) renderSpecList(); } catch (e) {}
