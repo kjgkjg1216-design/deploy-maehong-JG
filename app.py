@@ -23,6 +23,13 @@ import firebase_admin
 from firebase_admin import credentials, firestore as fs_admin, auth as fb_auth
 from dotenv import load_dotenv
 
+# 로그 출력에 cp949로 못 쓰는 글자('—' 등)가 섞여도 print가 예외를 내지 않게 (2026-11-20 — 시안 점검 기록에서 점검이 실패로 보이던 문제)
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(errors='replace')
+    except Exception:
+        pass
+
 # 경로 베이스 (로컬 기본값=현재 Windows 경로 / 클라우드는 환경변수로 override)
 BASE_DIR = os.environ.get('APP_BASE_DIR', 'C:/Users/jgkim/maehong-JG')
 DATA_DIR = os.environ.get('DATA_DIR', BASE_DIR + '/data')
@@ -7348,6 +7355,875 @@ def api_spec_design_preview(item_id, asset_id):
     if not os.path.exists(jpg):
         return jsonify({'ok': False, 'error': f'{page}쪽 미리보기 없음'}), 404
     return send_file(jpg, mimetype='image/jpeg', max_age=30 * 86400)
+
+
+# ────────────────────────────────────────────
+# 시안 표시사항 점검 (2026-11-20 사용자 "시안을 법적표기사항 등 문제가 되는 여부를 판단할 수 있는 장치 — 영양정보 순서, 오타 등")
+#   ① AI(OpenAI 비전)가 시안 그림(쪽 전체 + 고해상도 확대 조각)을 읽어 표시사항을 옮겨 적고 문제를 짚음
+#   ② 코드가 읽은 값으로 영양정보 순서·1일 기준치 비율·열량 합·소비기한 용어·알레르기 별도표시·1399 문구·내용량을 다시 계산
+#   결과는 Firestore 'design_checks'(문서 id = asset id) — 호스트·GCP가 같이 봄. 같은 시안은 [다시 점검] 때만 새로 물음(비용).
+#   키 = .env OPENAI_API_KEY (점검 때마다 .env를 다시 읽어 키만 바꿔도 바로 적용). 모델 = DESIGN_CHECK_MODEL(기본 gpt-4o)
+# ────────────────────────────────────────────
+_DSGCHK_JOBS = {}                        # asset_id → {'state': 'running'|'error', 'msg', 'at'}
+_DSGCHK_RES = {}                         # asset_id → 결과 (Firestore 사본)
+_DSGCHK_GUARD = threading.Lock()
+_DSGCHK_SEM = threading.Semaphore(2)     # 동시 점검 2건 (GCP 1GB — 6000px 그림 한 장을 펼치면 ≈75MB)
+_DSGCHK_SUM = {'at': 0.0, 'items': {}}  # 목록 점 표시용 요약 (60초)
+
+# 식품등의 표시기준 — 영양성분 표시 순서(열량은 머리 줄)·1일 영양성분 기준치
+_NUT_ORDER = ['나트륨', '탄수화물', '당류', '지방', '트랜스지방', '포화지방', '콜레스테롤', '단백질']
+_NUT_DV = {'나트륨': 2000, '탄수화물': 324, '당류': 100, '지방': 54, '포화지방': 15, '콜레스테롤': 300, '단백질': 55}
+_ALLERGEN_22 = ['알류', '우유', '메밀', '땅콩', '대두', '밀', '고등어', '게', '새우', '돼지고기', '복숭아', '토마토',
+                '아황산류', '호두', '닭고기', '쇠고기', '오징어', '조개류', '잣']
+
+_DSGCHK_SYS = """너는 한국 식품 포장 표시사항 검수 담당자다. 식품등의 표시·광고에 관한 법률과 식약처 「식품등의 표시기준」으로 포장 시안을 검토한다.
+그림은 [쪽 전체] 1장과, 작은 글씨를 읽기 위한 [확대 조각]들(행·열 번호와 쪽 안의 위치 %)이다. 조각은 조금씩 겹친다.
+
+할 일
+1) 시안의 한글 표시사항을 그림에 적힌 그대로 옮겨 적는다. 읽을 수 없거나 잘린 글자는 추측하지 말고 '?'로 둔다. 없는 항목은 빈 문자열.
+2) 아래 기준으로 문제를 찾는다.
+- 필수 표시: 제품명, 식품유형, 품목보고번호, 내용량(과 열량), 원재료명(제품명에 쓴 원재료는 함량 %), 소비기한, 보관방법, 제조원(영업소 명칭·소재지), 영양정보, 알레르기 유발물질, 부정·불량식품 신고 '국번없이 1399', 반품·교환 안내, 분리배출 표시.
+- 영양정보: 순서는 열량(머리 줄) → 나트륨 → 탄수화물 → 당류 → 지방 → 트랜스지방 → 포화지방 → 콜레스테롤 → 단백질. 단위 열량 kcal, 나트륨·콜레스테롤 mg, 나머지 g. 1일 영양성분 기준치 비율(%)은 나트륨·탄수화물·당류·지방·포화지방·콜레스테롤·단백질에 쓰고 열량·트랜스지방엔 쓰지 않는다. 표 아래 '1일 영양성분 기준치에 대한 비율(%)은 2,000kcal 기준이므로 개인의 필요 열량에 따라 다를 수 있습니다.' 문구. 머리 줄의 기준(총 내용량 OOg / 100g당 / 단위내용량당)과 내용량이 맞는지.
+- 소비기한: 2023년부터 '유통기한'이 아니라 '소비기한'으로 표시한다(유통기한 표기는 위반).
+- 알레르기: 22종(알류(가금류), 우유, 메밀, 땅콩, 대두, 밀, 고등어, 게, 새우, 돼지고기, 복숭아, 토마토, 아황산류, 호두, 닭고기, 쇠고기, 오징어, 조개류(굴·전복·홍합 포함), 잣)이 원재료에 있으면 원재료명 근처 별도 표시란에 'OO 함유'로 표시. 같은 시설 혼입 가능성 문구.
+- 오타·표기: 맞춤법·띄어쓰기 오류, 법정 문구의 오자, 단위 오기(㎎/mg 혼용 포함), 같은 정보가 서로 다른 곳(예: 내용량 vs 영양정보 총 내용량, 제품명 vs 앞면)에서 다르게 적힌 것.
+- 광고 표현: 질병 예방·치료, 과장 표현('다이어트', '면역력 강화' 등 효능 단정)은 표시·광고 위반 소지.
+- 소비자용 표시사항이 아예 없는 시안(물류용 외박스, 앞면만 있는 면 등)은 applicable=false로 두고 issues는 비운다.
+3) level: error = 기준 위반이 분명함 / warn = 확인이 필요함(읽기 애매, 위반 가능성) / info = 참고.
+그림에 있는 글자만 근거로 판단한다. 시안 밖의 사실을 지어내지 않는다.
+
+아래 모양의 JSON 하나만 출력한다(설명 문장 없이).
+{"applicable": true, "panel": "개별 포장|단상자|외박스|라벨|기타", "readable": "good|partial|poor",
+ "fields": {"제품명": "", "식품유형": "", "품목보고번호": "", "내용량": "", "소비기한": "", "보관방법": "", "제조원": "", "판매원": "",
+            "원재료명": "", "알레르기표시": "", "혼입문구": "", "반품교환": "", "신고문구": "", "주의사항": ""},
+ "allergens_in_ingredients": ["원재료명에서 보이는 22종 이름"], "allergens_marked": ["알레르기 별도 표시란에 적힌 22종 이름"],
+ "recycle_marks": ["분리배출 마크 안 글자(예: 비닐류 OTHER)"],
+ "nutrition": {"present": true, "basis": "총 내용량 60g 같은 머리 줄 기준", "kcal": "열량 숫자", "items": [{"name": "나트륨", "amount": "120", "unit": "mg", "pct": "6"}],
+               "dv_statement": "표 아래 문구 그대로"},
+ "typos": [{"text": "시안에 적힌 그대로", "fix": "바른 표기", "where": "어느 부분"}],
+ "issues": [{"level": "error|warn|info", "category": "영양정보|원재료·알레르기|소비기한|필수표시|분리배출|오타·표기|광고표현|기타", "title": "한 줄 요약", "detail": "근거와 시안에 적힌 글자", "where": "쪽·조각 위치"}]}
+영양정보 items는 시안에 인쇄된 순서 그대로(열량 제외), 숫자·단위·%는 적힌 그대로(없으면 빈 문자열)."""
+
+
+def _dsgchk_openai():
+    """점검용 OpenAI 클라이언트 — .env를 매번 다시 읽음(키만 바꿔도 재시작 없이 적용), 그림이 많아 시간 제한 넉넉히."""
+    from dotenv import dotenv_values
+    key = (dotenv_values(os.path.join(BASE_DIR, '.env')).get('OPENAI_API_KEY') or os.getenv('OPENAI_API_KEY') or '').strip()
+    if not key:
+        raise RuntimeError('OpenAI 키가 없습니다 (.env의 OPENAI_API_KEY)')
+    return OpenAI(api_key=key, http_client=httpx.Client(timeout=httpx.Timeout(300.0, connect=15.0), trust_env=False))
+
+
+def _dsgchk_spec_row(item_id):
+    """Monday 부자재 규격 행 (품번·품명·구분·사이즈·재질) — AI에 '이 시안이 무엇인지' 알려 주는 용도."""
+    if MONDAY_DF is None or MONDAY_DF.empty or '아이템ID' not in MONDAY_DF.columns:
+        return {}
+    m = MONDAY_DF[(MONDAY_DF['보드명'] == '부자재 규격') & (MONDAY_DF['아이템ID'].astype(str).str.strip() == str(item_id))]
+    if m.empty:
+        return {}
+    r = m.iloc[0]
+    g = lambda c: '' if str(r.get(c, '') or '').strip().lower() in ('', 'nan') else str(r.get(c, '')).strip()
+    return {'code': g('품번'), 'name': g('품명'), 'div': g('구분'), 'size': g('사이즈'), 'material': g('재질'), 'cat': g('그룹')}
+
+
+def _dsgchk_asset(asset_id):
+    """Monday 파일 정보 {name, ext, url(1시간 공개 주소), size}."""
+    import requests as _req
+    api_key = os.getenv('MONDAY_API_KEy')
+    if not api_key:
+        raise RuntimeError('Monday API 키 없음')
+    q = '{ assets(ids: [%s]) { id name file_extension public_url file_size } }' % asset_id
+    r = _req.post('https://api.monday.com/v2', json={'query': q},
+                  headers={'Authorization': api_key, 'API-Version': '2024-10'}, timeout=20)
+    a = ((r.json().get('data') or {}).get('assets') or [None])[0]
+    if not a:
+        raise RuntimeError('Monday에서 시안 파일을 찾지 못했습니다')
+    return {'name': a.get('name') or '', 'ext': (a.get('file_extension') or '').lower().lstrip('.'),
+            'url': a.get('public_url') or '', 'size': int(a.get('file_size') or 0)}
+
+
+def _dsgchk_images(item_id, asset_id, ext, url):
+    """AI에 보낼 그림 [(설명, JPEG bytes)]과 안내 문구 목록. 쪽마다 전체 1장(긴 변 1568px) + 확대 조각(고해상도를 약 1300px씩, 빈 조각 뺌).
+    .ai/.pdf는 미리보기(2400px)·확대본(6000px)을 쓰고 없으면 만듦. 그림 파일은 받아서 씀. 3쪽까지, 조각 합계 40장까지."""
+    import io as _io
+    import math as _math
+    try:
+        from PIL import Image as _Img
+    except ImportError:
+        _Img = None
+    notes, srcs = [], []   # srcs = [(쪽, 전체용 bytes, 확대용 bytes)]
+    if ext in ('ai', 'pdf'):
+        err = _design_preview_make(item_id, asset_id, hd=True)
+        m = _design_preview_meta(asset_id) or {}
+        if not m:
+            raise RuntimeError('시안 미리보기를 만들지 못했습니다: ' + str((err or ['?'])[0]))
+        if err:   # 기본 미리보기는 있는데 고해상도만 실패(GCP에서 아주 큰 .ai 등) → 기본 해상도로 점검
+            notes.append('고해상도를 만들지 못해 기본 해상도로 점검 — 작은 글씨를 덜 정확하게 읽을 수 있음')
+        if m.get('nopdf') and not m.get('conv'):
+            raise RuntimeError("'PDF 호환' 없이 저장된 AI라 그림이 작은 썸네일뿐이라 글자를 읽을 수 없습니다 — 디자인 업체에 PDF 호환으로 다시 저장 요청")
+        n = min(int(m.get('rendered') or 1), 3)
+        if int(m.get('rendered') or 1) > 3:
+            notes.append(f"{m.get('rendered')}쪽 중 앞 3쪽만 점검")
+        for p in range(1, n + 1):
+            std = _design_preview_paths(asset_id, p)[0]
+            hdp = _design_preview_paths(asset_id, p, True)[0]
+            if not os.path.exists(std):
+                continue
+            big = hdp if os.path.exists(hdp) else std
+            if big == std:
+                notes.append(f'{p}쪽 고해상도 없음 — 작은 글씨를 덜 정확하게 읽을 수 있음')
+            srcs.append((p, open(std, 'rb').read(), open(big, 'rb').read()))
+    elif ext in ('jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'):
+        import requests as _req
+        r = _req.get(url, timeout=120)
+        r.raise_for_status()
+        if len(r.content) > 60 * 1024 * 1024:
+            raise RuntimeError('그림 파일이 너무 큽니다(60MB 초과)')
+        srcs.append((1, r.content, r.content))
+    else:
+        raise RuntimeError(f'{ext or "이"} 파일은 점검할 수 없습니다 (AI·PDF·그림 파일만)')
+    if not srcs:
+        raise RuntimeError('점검할 그림이 없습니다')
+
+    out = []
+    if _Img is None:   # 그림 자르기 도구(Pillow)가 없는 서버 — 전체 그림만 보냄
+        notes.append('이 서버엔 그림 자르기 도구가 없어 확대 조각 없이 점검 — 작은 글씨를 못 읽을 수 있음')
+        for p, s, _b in srcs:
+            out.append((f'[{p}쪽 전체]', s))
+        return out, notes
+
+    def _jpg(im, q=82):
+        buf = _io.BytesIO()
+        im.save(buf, 'JPEG', quality=q, optimize=True)
+        return buf.getvalue()
+
+    budget = 40
+    per_page = max(6, budget // len(srcs))
+    for p, s, b in srcs:
+        im = _Img.open(_io.BytesIO(s)).convert('RGB')
+        im.thumbnail((1568, 1568))
+        out.append((f'[{p}쪽 전체]', _jpg(im, 80)))
+        big = _Img.open(_io.BytesIO(b)).convert('RGB')
+        W, H = big.size
+        tile = 1300 if max(W, H) > 3000 else 800
+        while _math.ceil(W / tile) * _math.ceil(H / tile) > per_page:
+            tile = int(tile * 1.2)
+        cols, rows = max(1, _math.ceil(W / tile)), max(1, _math.ceil(H / tile))
+        tw, th = _math.ceil(W / cols), _math.ceil(H / rows)
+        ov = int(min(tw, th) * 0.08)
+        if cols * rows == 1 and max(W, H) <= 1568:
+            continue   # 전체 그림으로 충분히 큼
+        for r_ in range(rows):
+            for c_ in range(cols):
+                x0, y0 = max(0, c_ * tw - ov), max(0, r_ * th - ov)
+                x1, y1 = min(W, (c_ + 1) * tw + ov), min(H, (r_ + 1) * th + ov)
+                crop = big.crop((x0, y0, x1, y1))
+                g = crop.convert('L').resize((64, 64))
+                ink = sum(1 for v in g.getdata() if v < 200) / 4096.0
+                if ink < 0.004:   # 빈 조각(여백) 뺌
+                    continue
+                out.append((f'[{p}쪽 확대 조각 {r_ + 1}행 {c_ + 1}열 · 가로 {round(x0 / W * 100)}~{round(x1 / W * 100)}% · '
+                            f'세로 {round(y0 / H * 100)}~{round(y1 / H * 100)}%]', _jpg(crop)))
+        big.close()
+        im.close()
+    return out, notes
+
+
+# ── 무료 점검 (2026-11-20 사용자 "무료 점검 기본으로") — 윈도우 내장 글자 인식(한국어, 호스트 PC만) + 같은 규칙 검사 ──
+#   AI 없이 글자를 읽어 항목을 뽑음. 글자 인식 오류('나트륨'→'나트름')는 한 글자 차이까지 같은 말로 봄. 오타·광고 표현은 못 봄(AI 정밀 점검).
+_WINOCR_PS = r'''param([string]$ListFile, [string]$OutFile)
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$null = [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
+$null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
+$null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics, ContentType = WindowsRuntime]
+$null = [Windows.Globalization.Language, Windows.Globalization, ContentType = WindowsRuntime]
+$asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+    $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+function Await($op, $type) { $t = $asTask.MakeGenericMethod($type).Invoke($null, @($op)); $t.Wait(-1) | Out-Null; $t.Result }
+function Num($v) { [double]($v | Select-Object -First 1) }
+$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage([Windows.Globalization.Language]::new('ko'))
+$res = New-Object System.Collections.ArrayList
+foreach ($p in (Get-Content -LiteralPath $ListFile -Encoding UTF8)) {
+    if (-not $p) { continue }
+    $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($p)) ([Windows.Storage.StorageFile])
+    $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+    $dec = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+    $bmp = Await ($dec.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+    $r = Await ($engine.RecognizeAsync($bmp)) ([Windows.Media.Ocr.OcrResult])
+    $lines = New-Object System.Collections.ArrayList
+    foreach ($ln in @($r.Lines)) {
+        $words = New-Object System.Collections.ArrayList
+        foreach ($w in @($ln.Words)) {
+            $b = $w.BoundingRect
+            [void]$words.Add([ordered]@{ t = [string]$w.Text; x = [int](Num $b.X); y = [int](Num $b.Y); w = [int](Num $b.Width); h = [int](Num $b.Height) })
+        }
+        [void]$lines.Add([ordered]@{ t = [string]$ln.Text; words = $words.ToArray() })
+    }
+    [void]$res.Add([ordered]@{ path = $p; w = [int]$bmp.PixelWidth; h = [int]$bmp.PixelHeight; lines = $lines.ToArray() })
+    $stream.Dispose()
+}
+$json = ConvertTo-Json -InputObject $res.ToArray() -Depth 6 -Compress
+[System.IO.File]::WriteAllText($OutFile, $json, (New-Object System.Text.UTF8Encoding $false))
+'''
+
+
+def _winocr(paths):
+    """윈도우 내장 OCR(한국어)로 그림들 읽기 → [{w, h, lines: [{t, words: [{t, x, y, w, h}]}]}]. 호스트 PC(윈도우)만."""
+    import subprocess as _sp
+    import tempfile as _tf
+    d = _tf.mkdtemp(prefix='mh_ocr_')
+    try:
+        ps1, lst, out = os.path.join(d, 'ocr.ps1'), os.path.join(d, 'list.txt'), os.path.join(d, 'out.json')
+        open(ps1, 'w', encoding='utf-8').write(_WINOCR_PS)
+        open(lst, 'w', encoding='utf-8').write('\n'.join(os.path.abspath(p) for p in paths))   # 윈도우 저장소 API는 '\' 절대 경로만 받음
+        r = _sp.run(['powershell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ps1, '-ListFile', lst, '-OutFile', out],
+                    capture_output=True, timeout=300, creationflags=getattr(_sp, 'CREATE_NO_WINDOW', 0))
+        if not os.path.exists(out):
+            raise RuntimeError('글자 인식 실패: ' + (r.stderr or r.stdout or b'').decode('cp949', 'replace')[-300:])
+        data = json.load(open(out, encoding='utf-8'))
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+    lst_ = lambda v: v if isinstance(v, list) else ([v] if v else [])   # PowerShell JSON은 한 개짜리 배열을 풀어 버림
+    out_ = []
+    for img in lst_(data):
+        lines = []
+        for ln in lst_(img.get('lines')):
+            lines.append({'t': str(ln.get('t') or ''), 'words': [w for w in lst_(ln.get('words')) if isinstance(w, dict)]})
+        out_.append({'w': img.get('w', 0), 'h': img.get('h', 0), 'lines': lines})
+    return out_
+
+
+def _dsgchk_free_paths(item_id, asset_id, ext, url, tmpdir):
+    """무료 점검용 그림 파일 경로들 + 안내. .ai/.pdf는 고해상도(6000px) 미리보기, 그림 파일은 받아서 저장.
+    긴 변이 5000px보다 작으면 6000px로 키움(작은 글씨 인식률↑), 10000px 넘으면 줄임(윈도우 OCR 한도)."""
+    from PIL import Image as _Img
+    notes, src = [], []
+    if ext in ('ai', 'pdf'):
+        err = _design_preview_make(item_id, asset_id, hd=True)
+        m = _design_preview_meta(asset_id) or {}
+        if not m:
+            raise RuntimeError('시안 미리보기를 만들지 못했습니다: ' + str((err or ['?'])[0]))
+        if m.get('nopdf') and not m.get('conv'):
+            raise RuntimeError("'PDF 호환' 없이 저장된 AI라 그림이 작은 썸네일뿐이라 글자를 읽을 수 없습니다 — 디자인 업체에 PDF 호환으로 다시 저장 요청")
+        n = min(int(m.get('rendered') or 1), 3)
+        if int(m.get('rendered') or 1) > 3:
+            notes.append(f"{m.get('rendered')}쪽 중 앞 3쪽만 점검")
+        for p in range(1, n + 1):
+            hdp, std = _design_preview_paths(asset_id, p, True)[0], _design_preview_paths(asset_id, p)[0]
+            if os.path.exists(hdp):
+                src.append(hdp)
+            elif os.path.exists(std):
+                src.append(std)
+                notes.append(f'{p}쪽 고해상도 없음 — 기본 미리보기를 키워서 읽음(작은 글씨 정확도↓)')
+    elif ext in ('jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'):
+        import requests as _req
+        r = _req.get(url, timeout=120)
+        r.raise_for_status()
+        if len(r.content) > 60 * 1024 * 1024:
+            raise RuntimeError('그림 파일이 너무 큽니다(60MB 초과)')
+        p0 = os.path.join(tmpdir, 'src.' + ext)
+        open(p0, 'wb').write(r.content)
+        src.append(p0)
+    else:
+        raise RuntimeError(f'{ext or "이"} 파일은 점검할 수 없습니다 (AI·PDF·그림 파일만)')
+    out = []
+    for i, p in enumerate(src):
+        im = _Img.open(p)
+        W, H = im.size
+        L = max(W, H)
+        if 5000 <= L <= 9800 and p.lower().endswith(('.jpg', '.jpeg', '.png')):
+            out.append(p)
+            continue
+        k = min(9800 / L, max(1.0, 6000 / L))
+        im = im.convert('RGB').resize((max(1, int(W * k)), max(1, int(H * k))), _Img.LANCZOS)
+        q = os.path.join(tmpdir, f'p{i + 1}.png')
+        im.save(q)
+        out.append(q)
+        if L < 2000:
+            notes.append(f'그림 해상도가 낮아(긴 변 {L}px) 작은 글씨를 못 읽을 수 있음')
+    return out, notes
+
+
+# 영양성분 이름 (글자 인식은 한 글자 차이까지 같은 말로 봄 — '나트름'·'콜레스테를' 등). 2글자(당류·지방)는 정확히 같을 때만
+_NUT_NAMES = ['열량', '나트륨', '탄수화물', '당류', '식이섬유', '지방', '트랜스지방', '포화지방', '콜레스테롤', '단백질']
+_ALG_PAT = {'우유': r'우유|탈지분유|전지분유|유청|유크림|버터|치즈|카제인', '대두': r'대두|두유|분리대두|콩단백',
+            '밀': r'밀가루|소맥|글루텐|(?<![가-힣])밀(?![가-힣])', '땅콩': r'땅콩', '호두': r'호두', '잣': r'(?<![가-힣])잣(?![가-힣])',
+            '메밀': r'메밀', '복숭아': r'복숭아', '토마토': r'토마토', '알류': r'계란|달걀|난백|난황|전란|알류',
+            '새우': r'새우', '게': r'게살|(?<![가-힣])게(?![가-힣])', '오징어': r'오징어', '고등어': r'고등어',
+            '조개류': r'조개|홍합|전복|(?<![가-힣])굴(?![가-힣])', '돼지고기': r'돼지고기|돈육', '쇠고기': r'쇠고기|소고기|우육',
+            '닭고기': r'닭고기|계육', '아황산류': r'아황산|이산화황'}
+_FREE_KEYS = [('제품명', r'제\s*품\s*명'), ('식품유형', r'식\s*품\s*(?:의\s*)?유\s*형'), ('품목보고번호', r'품\s*목\s*(?:제\s*조\s*)?보\s*고\s*번\s*호'),
+              ('내용량', r'(?<!총)(?<!총\s)내\s*용\s*량'), ('소비기한', r'소\s*비\s*기\s*한|유\s*통\s*기\s*한'), ('원재료명', r'원\s*재\s*료\s*명?'),
+              ('보관방법', r'보\s*관\s*방\s*법'), ('제조원', r'제\s*조\s*(?:원|사|업\s*소)'), ('판매원', r'판\s*매\s*원'),
+              ('반품교환', r'반\s*품\s*(?:및|[·ㆍ.,/])?\s*교\s*환'), ('주의사항', r'주\s*의\s*사\s*항'),
+              ('영양정보', r'영\s*양\s*정\s*보|총\s*내\s*용\s*량')]
+
+
+def _fuzzy_find(s, name):
+    """띄어쓰기 없앤 문자열 s에서 name 위치들 (3글자 이상은 한 글자 다른 것까지)."""
+    n, out, i = len(name), [], 0
+    while i + n <= len(s):
+        seg = s[i:i + n]
+        diff = sum(1 for a, b in zip(seg, name) if a != b)
+        if diff == 0 or (n >= 3 and diff <= 1 and seg[0] == name[0]):
+            out.append(i)
+            i += n
+        else:
+            i += 1
+    return out
+
+
+def _dsgchk_free_extract(pages):
+    """글자 인식 결과 → AI 점검과 같은 모양의 dict(fields·nutrition·allergens…) + 읽은 글자 전체."""
+    lines = []   # (쪽, 줄 글자, 단어들)
+    for pi, pg in enumerate(pages):
+        for ln in pg['lines']:
+            lines.append((pi + 1, ln['t'], ln['words']))
+    text = '\n'.join(t for _, t, _w in lines)
+    norm_text = re.sub(r'\s+', '', text)
+
+    # 필드: 열쇠말 뒤 ~ 다음 열쇠말 앞 (줄을 넘어 이어짐, 200자까지)
+    hits = []
+    for k, pat in _FREE_KEYS:
+        for m in re.finditer(pat, text):
+            hits.append((m.start(), m.end(), k))
+    hits.sort()
+    fields = {}
+    for i, (s0, e0, k) in enumerate(hits):
+        if k in fields or k == '영양정보':
+            continue
+        nxt = hits[i + 1][0] if i + 1 < len(hits) else len(text)
+        val = text[e0:min(nxt, e0 + (420 if k == '원재료명' else 200))]
+        val = re.sub(r'\s+', ' ', val).strip(' :：;·•-|')
+        if k == '소비기한':
+            val = text[s0:e0].replace(' ', '') + ' ' + val   # '유통기한'인지 보이게 열쇠말까지
+        if k == '품목보고번호' and '제조' in text[s0:e0]:
+            val = '(품목제조보고번호) ' + val
+        # 항목 이름 칸·값 칸이 따로인 표는 이름 바로 뒤에 값이 안 오므로 '이름만 읽힘'으로라도 있음 표시 (없음 오경고 방지)
+        fields[k] = val.strip() or '(항목 이름은 있음 — 값은 표 칸이라 못 읽음)'
+    if '내용량' not in fields:   # '60g(185kcal)'·'60g x 5개입' 같은 내용량 표기
+        mq = re.search(r'\d[\d,.]*\s*(?:kg|g)\s*(?:[xX×]\s*\d+\s*개입?)?\s*[\(（]\s*\d[\d,]*\s*kcal', text)
+        if mq:
+            fields['내용량'] = re.sub(r'\s+', ' ', mq.group(0))
+
+    # 영양정보: 영양성분 이름이 2개 이상 든 줄들 근처 = 영양 영역
+    def names_in(t):
+        s = re.sub(r'\s+', '', t)
+        found = []
+        taken = set()
+        for nm in sorted(_NUT_NAMES, key=len, reverse=True):   # 긴 이름 먼저 (트랜스지방 → 지방)
+            for p in _fuzzy_find(s, nm):
+                if any(p < e and p + len(nm) > b for b, e in taken):
+                    continue
+                taken.add((p, p + len(nm)))
+                found.append((p, nm))
+        return sorted(found), s
+    # 줄 상자 (쪽, x0, y0, x1, y1) — 글자 인식 줄 순서는 여러 단이 섞일 수 있어 영역은 위치로 잡음
+    def lbox(i):
+        p, _t, ws = lines[i]
+        if not ws:
+            return (p, 0, 0, 0, 0)
+        return (p, min(w['x'] for w in ws), min(w['y'] for w in ws), max(w['x'] + w['w'] for w in ws), max(w['y'] + w['h'] for w in ws))
+    boxes = [lbox(i) for i in range(len(lines))]
+    lh = sorted(b[4] - b[2] for b in boxes if b[4] > b[2])
+    lh = lh[len(lh) // 2] if lh else 20   # 보통 줄 높이
+    # 영양정보 영역 = 영양성분 이름이 든 줄들을 위치로 묶은 덩어리(같은 쪽, 위아래 4줄 높이 안, 가로로 겹침) 중 이름 종류가 가장 많은 것
+    #   (주의사항의 '지방'·'당류' 같은 말이 섞여도 표 영역을 벗어나지 않게)
+    nl = {i: {nm for _, nm in names_in(t)[0] if nm != '열량'} for i, (_p, t, _w) in enumerate(lines)}
+    clusters = []   # [박스, [줄]]
+    for i in sorted((i for i, v in nl.items() if v), key=lambda i: (boxes[i][0], boxes[i][2])):
+        p, x0, y0, x1, y1 = boxes[i]
+        for c in clusters:
+            cp, cx0, cy0, cx1, cy1 = c[0]
+            if cp == p and y0 <= cy1 + lh * 4 and y1 >= cy0 - lh * 4 and x0 <= cx1 + lh * 6 and x1 >= cx0 - lh * 6:
+                c[0] = (cp, min(cx0, x0), min(cy0, y0), max(cx1, x1), max(cy1, y1))
+                c[1].append(i)
+                break
+        else:
+            clusters.append([boxes[i], [i]])
+    items, kcal, basis, dv = [], '', '', ''
+    best_c = max(clusters, key=lambda c: len(set().union(*(nl[i] for i in c[1])))) if clusters else None
+    if best_c and len(set().union(*(nl[i] for i in best_c[1]))) >= 3:
+        cp, cx0, cy0, cx1, cy1 = best_c[0]
+        # 영양 영역 = 덩어리 위 5줄 높이(머리 줄 '총 내용량 OOg OOkcal') ~ 아래 4줄 높이(기준치 문구), 가로로 겹치는 줄
+        zone = sorted((i for i, b in enumerate(boxes) if b[0] == cp and b[2] >= cy0 - lh * 5 and b[4] <= cy1 + lh * 4
+                       and b[1] <= cx1 + lh * 2 and b[3] >= cx0 - lh * 2), key=lambda i: (boxes[i][2], boxes[i][1]))
+        ztext = '\n'.join(lines[i][1] for i in zone)
+        kcal = ''
+        for mk in re.finditer(r'(\d[\d,]*(?:\.\d+)?)\s*[kK]\s*[cC]\s*[aA]\s*[lI1|]?', ztext):
+            if mk.group(1).replace(',', '') != '2000':   # 표 아래 '2,000kcal 기준' 문구의 숫자는 열량이 아님
+                kcal = mk.group(1).replace(',', '')
+                break
+        mb = re.search(r'총\s*내\s*용\s*량[^\n]{0,14}', ztext)
+        basis = re.sub(r'\s+', ' ', mb.group(0)).strip() if mb else ''
+        # 표 아래 기준치 문구 — 표 머리('1일 영양성분 기준치에 대한 비율')와 헷갈리지 않게 '2,000'·'개인' 든 줄 › 맨 아래 '기준치' 줄
+        cand = [zi for zi, i in enumerate(zone) if '기준치' in lines[i][1].replace(' ', '')]
+        pick = next((zi for zi in cand if re.search(r'2\s*[,.]?\s*000|개\s*인', lines[zone[zi]][1] + (lines[zone[zi + 1]][1] if zi + 1 < len(zone) else ''))), None)
+        if pick is None and cand:
+            pick = cand[-1]
+        if pick is not None:
+            dv = lines[zone[pick]][1] + (' ' + lines[zone[pick + 1]][1] if pick + 1 < len(zone) else '')
+        # 이름마다 위치(x,y)·뒤따르는 값
+        occ = []
+        for i in zone:
+            _p, t, words = lines[i]
+            found, s = names_in(t)
+            if not found:
+                continue
+            # 띄어쓰기 없앤 위치 → 단어 → 좌표
+            starts, acc = [], 0
+            for w in words:
+                starts.append(acc)
+                acc += len(re.sub(r'\s+', '', w.get('t', '')))
+            for j, (pos, nm) in enumerate(found):
+                wi = max(k for k, st in enumerate(starts) if st <= pos) if starts else 0
+                w = words[wi] if words else {'x': 0, 'y': i * 10, 'h': 10}
+                seg = s[pos + len(nm): found[j + 1][0] if j + 1 < len(found) else len(s)]
+                occ.append({'name': nm, 'x': w.get('x', 0), 'y': w.get('y', 0), 'h': max(1, w.get('h', 10)), 'line': i, 'seg': seg})
+        seen = set()
+        occ = [o for o in occ if o['name'] != '열량' and not (o['name'] in seen or seen.add(o['name']))]
+        def parse(seg):
+            g = seg.replace('。', '.').replace('，', ',')
+            g = re.sub(r'(\d)0/[0oO6]', r'\1%', g)          # 글자 인식: '19 0/0'·'10/6' → '19%'·'1%'
+            g = re.sub(r'(?i)mg[lo|1]', 'mg', g)
+            am = re.search(r'(\d+(?:\.\d+)?)(mg|g)', g)
+            pc = re.search(r'(\d+(?:\.\d+)?)%', g[am.end():] if am else g)
+            a = am.group(1) if am else ''
+            if re.fullmatch(r'0\d', a):   # 글자 인식이 소수점을 빠뜨림: '07g' → 0.7g
+                a = a[0] + '.' + a[1:]
+            return (a, am.group(2) if am else '', pc.group(1) if pc else '')
+        for o in occ:
+            a, u, p = parse(o['seg'])
+            o.update(amount=a, unit=u, pct=p)
+        # 읽는 순서: 줄 순서(가로로 이어 쓴 표) / 칸 순서(두 칸 표 — 왼쪽 칸 위→아래 다음 오른쪽 칸). 기준 순서와 맞는 쪽을 씀
+        hh = sorted(o['h'] for o in occ)[len(occ) // 2] if occ else 10
+        rows_, cur = [], []   # 같은 높이(행)끼리 묶어 왼쪽→오른쪽
+        for o in sorted(occ, key=lambda o: o['y']):
+            if cur and abs(o['y'] - cur[0]['y']) > hh * 0.6:
+                rows_.append(cur)
+                cur = []
+            cur.append(o)
+        if cur:
+            rows_.append(cur)
+        row = [o for r_ in rows_ for o in sorted(r_, key=lambda o: o['x'])]
+        cols = []
+        for o in sorted(occ, key=lambda o: o['x']):
+            if cols and abs(o['x'] - cols[-1][0]) <= hh * 3:
+                cols[-1][1].append(o)
+            else:
+                cols.append([o['x'], [o]])
+        col = [o for _x, grp in cols for o in sorted(grp, key=lambda o: o['y'])]
+        key = lambda seq: [o['name'] for o in seq if o['name'] in _NUT_ORDER]
+        exp = lambda seq: [n for n in _NUT_ORDER if n in key(seq)]
+        best = row if key(row) == exp(row) else (col if key(col) == exp(col) else row)
+        items = [{'name': o['name'], 'amount': o['amount'], 'unit': o['unit'], 'pct': o['pct']} for o in best]
+    algs_in, algs_mk = [], []
+    ing = fields.get('원재료명', '')
+    for a, pat in _ALG_PAT.items():
+        if re.search(pat, ing):
+            algs_in.append(a)
+    for m in re.finditer(r'함\s*유', text):
+        win = text[max(0, m.start() - 60):m.start()].split('\n')[-1]
+        for a, pat in _ALG_PAT.items():
+            if re.search(pat, win) and a not in algs_mk:
+                algs_mk.append(a)
+    rec_marks = sorted(set(re.findall(r'OTHER|비닐류|플라스틱|종이팩|캔류|(?<![A-Za-z])(?:PET|PP|PE|PS)(?![A-Za-z])', text)))
+    core = sum(1 for k in ('원재료명', '품목보고번호', '소비기한', '제조원', '내용량') if fields.get(k)) + (1 if items else 0)
+    if '알레르기' not in fields and algs_mk:
+        fields['알레르기표시'] = ', '.join(algs_mk) + ' 함유'
+    return ({'applicable': core >= 2, 'panel': '', 'readable': 'good' if core >= 5 else ('partial' if core >= 2 else 'poor'),
+             'fields': fields, 'allergens_in_ingredients': algs_in, 'allergens_marked': algs_mk, 'recycle_marks': rec_marks,
+             'nutrition': {'present': bool(items), 'basis': basis, 'kcal': kcal, 'items': items, 'dv_statement': dv.strip()},
+             'typos': [], 'issues': []}, text)
+
+
+def _dsgchk_num(s):
+    """'1,200' '6%' '0.5' → float, 숫자 아니면 None ('1g 미만' 등)."""
+    m = re.fullmatch(r'\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:%|kcal|mg|g)?\s*', str(s or ''))
+    return float(m.group(1).replace(',', '')) if m else None
+
+
+def _dsgchk_rules(ai, spec, mode='ai', fulltext=None):
+    """읽은 값으로 다시 계산하는 규칙 검사 → (issues, passed). issue = {level, category, title, detail, src:'rule'}.
+    mode='free'(글자 인식): 글자를 못 읽어 생기는 '없음'은 낮춰서(확인 필요·참고) 알리고, % 칸이 비면 넘어감. fulltext = 읽은 글자 전체."""
+    free = mode == 'free'
+    miss_note = ' — 글자 인식으로 못 읽었을 수도 있음' if free else ''
+    issues, passed = [], []
+    add = lambda lv, cat, title, detail='': issues.append({'level': lv, 'category': cat, 'title': title, 'detail': detail, 'where': '', 'src': 'rule'})
+    f = ai.get('fields') or {}
+    nut = ai.get('nutrition') or {}
+    texts = [str(v or '') for v in f.values()] + [str(nut.get('dv_statement') or ''), str(nut.get('basis') or ''), str(fulltext or '')]
+    alltext = ' '.join(texts)
+    norm = lambda s: re.sub(r'\s+', '', str(s or ''))
+
+    # 소비기한 용어
+    if '유통기한' in norm(alltext):
+        add('error', '소비기한', "'유통기한'으로 표시됨 → '소비기한'으로 바꿔야 함", '2023년부터 소비기한 표시제(유통기한 표기는 위반). 읽은 글자: ' + (f.get('소비기한') or '유통기한 …'))
+    elif f.get('소비기한'):
+        passed.append('소비기한 용어 사용')
+    # 1399
+    if '1399' in norm(alltext):
+        passed.append("부정·불량식품 신고 '1399' 문구 있음")
+    else:
+        add('warn', '필수표시', "부정·불량식품 신고 '국번없이 1399' 문구를 찾지 못함", '다른 면에 있으면 무시하세요' + miss_note)
+    # 필수 항목
+    miss = [k for k in ('제품명', '식품유형', '품목보고번호', '내용량', '소비기한', '원재료명', '제조원') if not str(f.get(k) or '').strip()]
+    if miss:
+        add('warn', '필수표시', '찾지 못한 필수 표시: ' + ', '.join(miss), '시안의 다른 면·스티커·별도 인쇄에 있으면 무시하세요' + miss_note)
+    else:
+        passed.append('필수 표시 항목(제품명·식품유형·품목보고번호·내용량·소비기한·원재료명·제조원) 모두 있음')
+    if '품목제조보고번호' in norm(alltext):
+        add('info', '필수표시', "예전 용어 '품목제조보고번호'로 적혀 있음", "지금 기준 용어는 '품목보고번호' — 다음 시안 수정 때 함께 바꾸면 좋음")
+    # 알레르기 별도 표시
+    a_in = [a for a in (ai.get('allergens_in_ingredients') or []) if a]
+    a_mk = [a for a in (ai.get('allergens_marked') or []) if a]
+    if a_in and not (a_mk or str(f.get('알레르기표시') or '').strip()):
+        add('error', '원재료·알레르기', '알레르기 유발물질 별도 표시가 없음', '원재료에 ' + ', '.join(a_in) + ' 포함 → 원재료명 근처 별도 표시란에 표시해야 함')
+    elif a_in:
+        lack = [a for a in a_in if a not in a_mk]
+        if a_mk and lack:
+            add('warn', '원재료·알레르기', '알레르기 표시에서 빠진 것: ' + ', '.join(lack), '원재료에서 보임: ' + ', '.join(a_in) + ' / 표시란: ' + ', '.join(a_mk))
+        else:
+            passed.append('알레르기 유발물질 별도 표시 있음 (' + ', '.join(a_in) + ')')
+    # 분리배출
+    if ai.get('recycle_marks'):
+        passed.append('분리배출 표시 있음 (' + ', '.join(str(x) for x in ai.get('recycle_marks')[:3]) + ')')
+    else:   # 무료 점검은 마크(그림) 속 글자를 잘 못 읽어 '참고'로만
+        add('info' if free else 'warn', '분리배출', '분리배출 표시(재질 마크)를 찾지 못함',
+            '자원재활용법 — 포장재 재질 마크(예: 비닐류 OTHER). 다른 면에 있으면 무시하세요' + (' — 마크는 그림이라 글자 인식으로 못 읽는 경우가 많음' if free else ''))
+    # 내용량 vs 품명
+    def grams(s):
+        out = set()
+        for v, u in re.findall(r'([0-9]+(?:\.[0-9]+)?)\s*(kg|g)\b', str(s or ''), flags=re.I):
+            out.add(round(float(v) * (1000 if u.lower() == 'kg' else 1), 1))
+        return out
+    g_name, g_net = grams(spec.get('name')), grams(f.get('내용량'))
+    if g_name and g_net and not (g_name & g_net):
+        add('warn', '오타·표기', '내용량이 품명과 다름', f"시안 내용량 '{f.get('내용량')}' / 규격 품명 '{spec.get('name')}'")
+    elif g_name and g_net:
+        passed.append('내용량이 규격 품명과 같음 (' + str(f.get('내용량')) + ')')
+    # 영양정보
+    if nut.get('present') and nut.get('items'):
+        items = nut.get('items') or []
+        nm = lambda s: re.sub(r'\s+', '', str(s or ''))
+        seq = [nm(x.get('name')) for x in items if nm(x.get('name')) in _NUT_ORDER]
+        expect = [n for n in _NUT_ORDER if n in seq]
+        if seq != expect:
+            add('error', '영양정보', '영양정보 순서가 기준과 다름', '시안: ' + ' → '.join(seq) + ' / 기준: ' + ' → '.join(expect))
+        else:
+            passed.append('영양정보 순서 맞음 (' + ' → '.join(seq) + ')')
+        lack = [n for n in _NUT_ORDER if n not in seq]
+        if lack:
+            add('warn' if free else 'error', '영양정보', '빠진 필수 영양성분: ' + ', '.join(lack),
+                '9가지(열량·나트륨·탄수화물·당류·지방·트랜스지방·포화지방·콜레스테롤·단백질) 의무 표시' + miss_note)
+        if not _dsgchk_num(nut.get('kcal')):
+            add('warn', '영양정보', '열량(kcal)을 찾지 못함', '영양정보 머리 줄에 열량 표시' + miss_note)
+        val = {nm(x.get('name')): x for x in items}
+        bad, checked = [], 0
+        for n_, dv in _NUT_DV.items():
+            x = val.get(n_)
+            if not x:
+                continue
+            amt, pct = _dsgchk_num(x.get('amount')), _dsgchk_num(x.get('pct'))
+            if pct is None and str(x.get('pct') or '').strip() == '':
+                if not free:   # 글자 인식은 % 칸을 자주 놓쳐서 '없음'을 따지지 않음
+                    add('warn', '영양정보', f'{n_} 1일 기준치 비율(%) 없음', f'{n_}은 % 표시 대상')
+                continue
+            if amt is not None and pct is not None:
+                checked += 1
+                exp = amt / dv * 100
+                if free and (abs(pct / 10 - exp) <= 1 or abs(exp / 10 - pct) <= 1.5):   # 글자 인식: '4%'→'40%', '2.7g'→'27g'(소수점 빠짐)
+                    continue
+                if abs(exp - pct) > max(2.0, exp * 0.15):
+                    bad.append(f'{n_} {x.get("amount")}{x.get("unit") or ""} → 계산 {exp:.0f}% / 시안 {x.get("pct")}%')
+        if bad:
+            add('warn', '영양정보', '1일 기준치 비율(%) 계산이 맞지 않음', ' · '.join(bad) + ' (기준치: 나트륨 2,000mg·탄수화물 324g·당류 100g·지방 54g·포화지방 15g·콜레스테롤 300mg·단백질 55g)'
+                + (' — 글자 인식 값이라 숫자를 잘못 읽었을 수 있으니 원본 확인' if free else ''))
+        elif checked:
+            passed.append(f'1일 기준치 비율(%) 계산 맞음 ({checked}개 확인)')
+        tf = val.get('트랜스지방')
+        if tf and str(tf.get('pct') or '').strip() and not free:   # 글자 인식은 옆 칸 %를 끌어올 때가 많아 따지지 않음
+            add('warn', '영양정보', '트랜스지방에 비율(%)이 적혀 있음', '트랜스지방은 1일 기준치 비율 표시 대상이 아님')
+        kc = _dsgchk_num(nut.get('kcal'))
+        c_, p_, f_ = (_dsgchk_num((val.get(k) or {}).get('amount')) for k in ('탄수화물', '단백질', '지방'))
+        if kc and None not in (c_, p_, f_):
+            calc = c_ * 4 + p_ * 4 + f_ * 9
+            fits = lambda v: v and 0.8 <= v / kc <= 1.2
+            if free and not fits(calc):   # 글자 인식이 소수점을 빠뜨린 값('2.7g'→'27g') 하나쯤은 바로잡아 봄
+                for alt in ((c_ / 10, p_, f_), (c_, p_ / 10, f_), (c_, p_, f_ / 10)):
+                    if fits(alt[0] * 4 + alt[1] * 4 + alt[2] * 9):
+                        calc = alt[0] * 4 + alt[1] * 4 + alt[2] * 9
+                        break
+            if calc and not (0.8 <= calc / kc <= 1.2):
+                add('warn', '영양정보', '열량이 탄수화물·단백질·지방 합과 크게 다름', f'계산 {calc:.0f}kcal(탄수화물×4+단백질×4+지방×9) / 시안 {kc:.0f}kcal — 숫자 오기 확인')
+            elif calc:
+                passed.append(f'열량 합 맞음 (계산 {calc:.0f} / 시안 {kc:.0f}kcal)')
+        st = norm(nut.get('dv_statement'))
+        if not st:
+            add('warn', '영양정보', "표 아래 '1일 영양성분 기준치에 대한 비율(%)은 2,000kcal 기준…' 문구를 찾지 못함", miss_note.lstrip(' —'))
+        elif '2,000' not in st and '2000' not in st:
+            add('info' if free else 'warn', '영양정보', '기준치 문구에 2,000kcal가 없음',
+                '읽은 문구: ' + str(nut.get('dv_statement')) + (' — 글자 인식이 숫자를 못 읽었을 수 있음' if free else ''))
+        else:
+            passed.append("표 아래 '2,000kcal 기준' 문구 있음")
+        b_g, n_g = grams(nut.get('basis')), g_net
+        if '총' in str(nut.get('basis') or '') and b_g and n_g and not (b_g & n_g):
+            add('warn', '영양정보', '영양정보 총 내용량과 내용량이 다름', f"영양정보 '{nut.get('basis')}' / 내용량 '{f.get('내용량')}'")
+    elif ai.get('applicable'):
+        add('warn', '영양정보', '영양정보 표를 찾지 못함', '다른 면에 있으면 무시하세요' + miss_note)
+    return issues, passed
+
+
+def _dsgchk_ai(item_id, asset_id, a, spec):
+    """AI 정밀 점검(OpenAI 비전) → (읽은 내용 dict, 그림 수, 안내, 모델, 토큰)."""
+    import base64 as _b64
+    imgs, notes = _dsgchk_images(item_id, asset_id, a['ext'], a['url'])
+    intro = ('이 시안의 표시사항을 검토해 줘.\n'
+             f"Monday 규격: 품번 {spec.get('code', '?')} · 품명 {spec.get('name', '?')} · 납품처 {spec.get('div', '?')} · "
+             f"분류 {spec.get('cat', '?')} · 사이즈 {spec.get('size', '?')} · 재질 {spec.get('material', '?')}\n"
+             f"파일 {a['name']} · 그림 {len(imgs)}장")
+    content = [{'type': 'text', 'text': intro}]
+    for desc, b in imgs:
+        content.append({'type': 'text', 'text': desc})
+        content.append({'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,' + _b64.b64encode(b).decode(), 'detail': 'high'}})
+    model = os.environ.get('DESIGN_CHECK_MODEL', 'gpt-4o')
+    kw = ({'max_completion_tokens': 16000} if model.startswith(('gpt-5', 'o1', 'o3', 'o4'))
+          else {'temperature': 0, 'max_tokens': 6000})
+    resp = _dsgchk_openai().chat.completions.create(
+        model=model, response_format={'type': 'json_object'},
+        messages=[{'role': 'system', 'content': _DSGCHK_SYS}, {'role': 'user', 'content': content}], **kw)
+    txt = resp.choices[0].message.content or ''
+    try:
+        ai = json.loads(txt)
+    except ValueError:
+        mm = re.search(r'\{.*\}', txt, re.S)
+        ai = json.loads(mm.group(0)) if mm else {}
+    if not isinstance(ai, dict) or not ai:
+        raise RuntimeError('AI 응답을 읽지 못했습니다')
+    u = getattr(resp, 'usage', None)
+    return ai, len(imgs), notes, model, {'in': getattr(u, 'prompt_tokens', 0) or 0, 'out': getattr(u, 'completion_tokens', 0) or 0}
+
+
+_ZOOM_PX = 60.0   # 키운 뒤 글자 높이(px)
+_ZOOM_KEYS = ['원재료', '품목보고', '소비기한', '유통기한', '제조원', '보관방법', '식품유형', '내용량', '영양정보',
+              '나트륨', '탄수화물', '단백질', '콜레스테롤', '기준치', '1399', '반품', '알레르기']
+
+
+def _dsgchk_zoom_crops(paths, pages, tmpdir):
+    """1차 글자 인식에서 표시사항·영양정보 열쇠말이 나온 곳을 묶어 잘라 2~3배로 키운 그림들 (2026-11-20 사용자 "확대하면 잘 보이는데 왜 틀려?").
+    글자 높이를 약 45px로 맞춤(통째로 읽을 땐 20px 안팎이라 륨→름·2.7→27 같은 오인식). 못 찾으면 []."""
+    from PIL import Image as _Img
+    out = []
+    for path, pg in zip(paths, pages):
+        boxes = []
+        for ln in pg['lines']:
+            ws = ln.get('words') or []
+            if not ws:
+                continue
+            s = re.sub(r'\s+', '', ln['t'])
+            if any(_fuzzy_find(s, k) for k in _ZOOM_KEYS):
+                boxes.append([min(w['x'] for w in ws), min(w['y'] for w in ws),
+                              max(w['x'] + w['w'] for w in ws), max(w['y'] + w['h'] for w in ws)])
+        if not boxes:
+            continue
+        hs = sorted(b[3] - b[1] for b in boxes)
+        lh = max(8, hs[len(hs) // 2])
+        # 가까운 줄끼리 묶기 (사이 12줄 높이 이내)
+        groups = []
+        for b in sorted(boxes, key=lambda b: (b[1], b[0])):
+            for g_ in groups:
+                if b[0] <= g_[2] + lh * 12 and b[2] >= g_[0] - lh * 12 and b[1] <= g_[3] + lh * 12 and b[3] >= g_[1] - lh * 12:
+                    g_[:] = [min(g_[0], b[0]), min(g_[1], b[1]), max(g_[2], b[2]), max(g_[3], b[3])]
+                    break
+            else:
+                groups.append(list(b))
+        im = _Img.open(path)
+        W, H = im.size
+        k0 = max(1.0, min(4.0, _ZOOM_PX / lh))
+        for gi, (x0, y0, x1, y1) in enumerate(groups):
+            m = lh * 4   # 둘레 여유 (열쇠말 옆 값·표 머리 줄까지)
+            box = (max(0, int(x0 - m * 3)), max(0, int(y0 - m)), min(W, int(x1 + m * 3)), min(H, int(y1 + m)))
+            cw, ch = box[2] - box[0], box[3] - box[1]
+            if cw < lh * 4 or ch < lh * 2:
+                continue
+            k = min(k0, 9800.0 / max(cw, ch))
+            crop = im.crop(box).convert('RGB')
+            if k > 1.05:
+                crop = crop.resize((int(cw * k), int(ch * k)), _Img.LANCZOS)
+            q = os.path.join(tmpdir, f'zoom_{len(out) + 1}.png')
+            crop.save(q)
+            out.append(q)
+        im.close()
+    return out
+
+
+def _dsgchk_free(item_id, asset_id, a, spec, zoom=True):
+    """무료 점검(윈도우 글자 인식, 호스트 PC) → (읽은 내용 dict, 읽은 글자 전체, 그림 수, 안내).
+    1차로 통째로 읽어 표시사항 위치를 찾고, 그 부분만 잘라 키워서 2차로 읽은 글자로 판단(zoom=False면 1차만)."""
+    import tempfile as _tf
+    import shutil as _sh
+    d = _tf.mkdtemp(prefix='mh_dck_')
+    try:
+        paths, notes = _dsgchk_free_paths(item_id, asset_id, a['ext'], a['url'], d)
+        pages = _winocr(paths)
+        zpages = []
+        if zoom:
+            crops = _dsgchk_zoom_crops(paths, pages, d)
+            if crops:
+                zpages = _winocr(crops)
+                notes.append(f'표시사항 부분 {len(crops)}곳을 키워서 다시 읽음')
+    finally:
+        _sh.rmtree(d, ignore_errors=True)
+    ai, text = _dsgchk_free_extract(pages)
+    if zpages:   # 키워서 읽은 글자 우선(영양정보 값·항목 값), 잘라 낸 밖의 글자(1399 등)는 통째로 읽은 쪽에서
+        zai, ztext = _dsgchk_free_extract(zpages)
+        zn, n0 = zai['nutrition'], ai['nutrition']
+        if len(zn.get('items') or []) >= len(n0.get('items') or []) and zn.get('items'):
+            for k in ('basis', 'kcal', 'dv_statement'):
+                zn[k] = zn.get(k) or n0.get(k)
+            ai['nutrition'] = zn
+        for k, v in (zai.get('fields') or {}).items():
+            if v and not str(v).startswith('('):
+                ai['fields'][k] = v
+        for k in ('allergens_in_ingredients', 'allergens_marked', 'recycle_marks'):
+            ai[k] = sorted(set(ai.get(k) or []) | set(zai.get(k) or []))
+        ai['applicable'] = ai.get('applicable') or zai.get('applicable')
+        text = ztext + '\n\n[통째로 읽은 글자]\n' + text
+    if not text.strip():
+        notes.append('글자를 하나도 읽지 못함 — 글자가 아주 작거나 그림처럼 꾸민 글꼴일 수 있음')
+    return ai, text, len(paths), notes
+
+
+def _dsgchk_run(item_id, asset_id, mode='free'):
+    """점검 한 건 (뒤에서 실행) → 결과를 _DSGCHK_RES·Firestore에 저장. mode = 'free'(글자 인식) | 'ai'(OpenAI)."""
+    t0 = time.time()
+    with _DSGCHK_SEM:
+        try:
+            a = _dsgchk_asset(asset_id)
+            spec = _dsgchk_spec_row(item_id)
+            ocr = ''
+            if mode == 'free':
+                ai, ocr, n_img, notes = _dsgchk_free(item_id, asset_id, a, spec)
+                model, tokens = '윈도우 글자 인식(무료)', {'in': 0, 'out': 0}
+            else:
+                ai, n_img, notes, model, tokens = _dsgchk_ai(item_id, asset_id, a, spec)
+            lv_ok = ('error', 'warn', 'info')
+            issues = []
+            for x in ai.get('issues') or []:
+                if isinstance(x, dict) and x.get('title'):
+                    issues.append({'level': x.get('level') if x.get('level') in lv_ok else 'warn', 'category': str(x.get('category') or '기타'),
+                                   'title': str(x.get('title')), 'detail': str(x.get('detail') or ''), 'where': str(x.get('where') or ''), 'src': 'ai'})
+            for x in ai.get('typos') or []:
+                if isinstance(x, dict) and x.get('text'):
+                    issues.append({'level': 'warn', 'category': '오타·표기', 'title': f"오타 의심: '{x.get('text')}' → '{x.get('fix') or '?'}'",
+                                   'detail': '', 'where': str(x.get('where') or ''), 'src': 'ai'})
+            passed = []
+            if ai.get('applicable', True):
+                r_issues, passed = _dsgchk_rules(ai, spec, mode, ocr if mode == 'free' else None)
+                issues = r_issues + issues
+            else:
+                issues = []
+            if ai.get('readable') in ('partial', 'poor'):
+                notes.append(('글자 인식으로 표시사항을 ' if mode == 'free' else 'AI가 글자를 ')
+                             + ('일부만' if ai.get('readable') == 'partial' else '거의 못') + ' 읽음 — 원본으로 다시 확인')
+            order = {'error': 0, 'warn': 1, 'info': 2}
+            issues.sort(key=lambda x: (order.get(x['level'], 3), x['src'] != 'rule'))
+            rec = {'asset_id': str(asset_id), 'item_id': str(item_id), 'code': spec.get('code', ''), 'name': spec.get('name', ''),
+                   'file': a['name'], 'at': datetime.now(_KST).strftime('%Y-%m-%d %H:%M'), 'model': model, 'secs': int(time.time() - t0),
+                   'mode': mode, 'images': n_img, 'applicable': bool(ai.get('applicable', True)), 'panel': str(ai.get('panel') or ''),
+                   'readable': str(ai.get('readable') or ''), 'issues': issues, 'passed': passed, 'notes': notes,
+                   'summary': {k: sum(1 for x in issues if x['level'] == k) for k in ('error', 'warn', 'info')},
+                   'tokens': tokens, 'ocr': ocr[:20000],
+                   'ai': json.dumps(ai, ensure_ascii=False)}   # 읽은 표시사항 원문(JSON 문자열 — Firestore 중첩 배열 제한 피함)
+            try:
+                FIRESTORE_DB.collection('design_checks').document(str(asset_id)).set(rec)
+            except Exception as e:
+                rec['notes'].append(f'결과 저장 실패(이 서버에서만 보임): {e}'[:200])
+            with _DSGCHK_GUARD:
+                _DSGCHK_RES[str(asset_id)] = rec
+                _DSGCHK_JOBS.pop(str(asset_id), None)
+                _DSGCHK_SUM['at'] = 0.0
+            print(f"[시안 점검 {mode}] {spec.get('code', '')} {a['name']} — 오류 {rec['summary']['error']} · 확인 {rec['summary']['warn']} · {rec['secs']}초 · 그림 {n_img}장")
+        except Exception as e:
+            msg = str(e)
+            if 'Incorrect API key' in msg or 'invalid_api_key' in msg or '401' in msg[:40]:
+                msg = 'OpenAI 키가 맞지 않습니다 — .env의 OPENAI_API_KEY를 새 키로 바꿔 주세요'
+            with _DSGCHK_GUARD:
+                _DSGCHK_JOBS[str(asset_id)] = {'state': 'error', 'msg': msg[:400], 'at': time.time()}
+            print(f'[시안 점검] 실패 {asset_id}: {msg[:200]}')
+
+
+def _dsgchk_get(asset_id):
+    """저장된 점검 결과 (메모리 › Firestore) 또는 None."""
+    a = str(asset_id)
+    with _DSGCHK_GUARD:
+        if a in _DSGCHK_RES:
+            return _DSGCHK_RES[a]
+    try:
+        d = FIRESTORE_DB.collection('design_checks').document(a).get()
+        rec = d.to_dict() if d.exists else None
+    except Exception as e:
+        print(f'[시안 점검] 결과 읽기 실패: {e}')
+        return None
+    if rec:
+        with _DSGCHK_GUARD:
+            _DSGCHK_RES[a] = rec
+    return rec
+
+
+@app.route('/api/design_check/<item_id>/<asset_id>', methods=['GET', 'POST'])
+def api_design_check(item_id, asset_id):
+    """시안 표시사항 점검 — GET: 상태·결과 {state: none|running|done|error, result?, error?, free_ok} /
+    POST {mode: 'free'(기본, 윈도우 글자 인식 — 호스트 PC만) | 'ai'(OpenAI 정밀)}: 점검 시작(뒤에서)."""
+    if _HOST_ONLY_LOCK:
+        return jsonify({'ok': False, 'error': '호스트 PC에서만 볼 수 있습니다'}), 403
+    if not (str(item_id).isdigit() and str(asset_id).isdigit()):
+        return jsonify({'ok': False, 'error': '잘못된 요청'}), 400
+    a = str(asset_id)
+    if request.method == 'POST':
+        mode = str((request.get_json(silent=True) or {}).get('mode') or request.args.get('mode') or 'free')
+        if mode not in ('free', 'ai'):
+            return jsonify({'ok': False, 'error': '잘못된 점검 방식'}), 400
+        if mode == 'free' and not _IS_HOST_PC:
+            return jsonify({'ok': False, 'error': '무료 점검(윈도우 글자 인식)은 회사 PC 대시보드에서만 할 수 있어요. 결과는 여기서도 보입니다'}), 400
+        with _DSGCHK_GUARD:
+            j = _DSGCHK_JOBS.get(a)
+            if j and j.get('state') == 'running':
+                return jsonify({'ok': True, 'state': 'running', 'mode': j.get('mode', ''), 'since': int(time.time() - j['at'])})
+            _DSGCHK_JOBS[a] = {'state': 'running', 'mode': mode, 'at': time.time()}
+        threading.Thread(target=_dsgchk_run, args=(str(item_id), a, mode), daemon=True, name='design-check').start()
+        return jsonify({'ok': True, 'state': 'running', 'mode': mode, 'since': 0})
+    with _DSGCHK_GUARD:
+        j = dict(_DSGCHK_JOBS.get(a) or {})
+    if j.get('state') == 'running':
+        return jsonify({'ok': True, 'state': 'running', 'mode': j.get('mode', ''), 'since': int(time.time() - j['at']),
+                        'result': _dsgchk_get(a), 'free_ok': _IS_HOST_PC})
+    rec = _dsgchk_get(a)
+    if j.get('state') == 'error':
+        return jsonify({'ok': True, 'state': 'error', 'error': j.get('msg', ''), 'result': rec, 'free_ok': _IS_HOST_PC})
+    return jsonify({'ok': True, 'state': 'done' if rec else 'none', 'result': rec, 'free_ok': _IS_HOST_PC})
+
+
+@app.route('/api/design_check_summary', methods=['GET'])
+def api_design_check_summary():
+    """점검한 시안 요약 {item_id: [{asset_id, file, error, warn, applicable, at}]} — 규격 목록 시안 아이콘 옆 점 (60초 캐시)."""
+    if _HOST_ONLY_LOCK:
+        return jsonify({'ok': False, 'items': {}})
+    if time.time() - _DSGCHK_SUM['at'] > 60:
+        items = {}
+        try:
+            for d in FIRESTORE_DB.collection('design_checks').select(['item_id', 'file', 'summary', 'applicable', 'at']).stream():
+                x = d.to_dict() or {}
+                s = x.get('summary') or {}
+                items.setdefault(str(x.get('item_id') or ''), []).append({
+                    'asset_id': d.id, 'file': x.get('file', ''), 'error': int(s.get('error') or 0), 'warn': int(s.get('warn') or 0),
+                    'applicable': bool(x.get('applicable', True)), 'at': x.get('at', '')})
+        except Exception as e:
+            print(f'[시안 점검] 요약 읽기 실패: {e}')
+        _DSGCHK_SUM.update(at=time.time(), items=items)
+    return jsonify({'ok': True, 'items': _DSGCHK_SUM['items']})
 
 
 @app.route('/api/monday-item/<item_id>', methods=['GET'])
@@ -16774,6 +17650,59 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     font-size: 12px; font-weight: 700; color: #fff; background: #7c3aed; padding: 7px 14px;
     border-radius: 8px; text-decoration: none; white-space: nowrap;
   }
+  /* 시안 표시사항 점검 (2026-11-20) — 시안 보기 창 오른쪽 칸 */
+  .dsg-chk-btn {
+    font-size: 12px; font-weight: 700; color: #4c1d95; background: #f5f3ff; border: 1px solid #ddd6fe;
+    padding: 6px 12px; border-radius: 8px; cursor: pointer; white-space: nowrap; display: inline-flex; align-items: center; gap: 5px;
+  }
+  .dsg-chk-btn:hover { background: #ede9fe; }
+  .dsg-chk-btn.on { background: #4c1d95; color: #fff; border-color: #4c1d95; }
+  .dck-mini { font-size: 10.5px; font-weight: 800; padding: 1px 6px; border-radius: 6px; background: #fff; }
+  .dck-mini.err { color: #b91c1c; } .dck-mini.warn { color: #b45309; } .dck-mini.ok { color: #15803d; }
+  .dck-mini.na, .dck-mini.run { color: #64748b; }
+  .dsg-chk {
+    position: absolute; right: 10px; bottom: 10px; width: min(460px, calc(100% - 20px)); z-index: 5;
+    background: #fff; border: 1px solid #ddd6fe; border-radius: 12px; box-shadow: 0 10px 32px rgba(76,29,149,.18);
+    display: none; flex-direction: column; overflow: hidden;
+  }
+  .dsg-chk.show { display: flex; }
+  .dsg-chk-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid #ede9fe; background: #faf5ff; }
+  .dsg-chk-head b { font-size: 13.5px; color: #4c1d95; flex: 1; }
+  .dsg-chk-head button { border: 0; background: none; font-size: 20px; line-height: 1; color: #64748b; cursor: pointer; padding: 0 4px; }
+  .dsg-chk-body { overflow-y: auto; padding: 12px 14px 14px; font-size: 12.5px; line-height: 1.55; color: var(--text); }
+  .dck-intro { color: var(--text-2); }
+  .dck-intro ul { margin: 6px 0 10px 18px; padding: 0; }
+  .dck-go { margin-top: 6px; padding: 9px 16px; border: 0; border-radius: 9px; background: #4c1d95; color: #fff; font-weight: 800; font-size: 13px; cursor: pointer; }
+  .dck-go:hover { background: #5b21b6; }
+  .dck-go.ghost { background: #fff; color: #4c1d95; border: 1px solid #c4b5fd; padding: 6px 12px; font-size: 12px; }
+  .dck-run { display: flex; align-items: center; gap: 10px; padding: 18px 4px; color: var(--text-2); }
+  .dck-run::before { content: ''; width: 18px; height: 18px; border-radius: 50%; border: 3px solid #ddd6fe; border-top-color: #7c3aed; animation: dckspin 0.9s linear infinite; flex: none; }
+  @keyframes dckspin { to { transform: rotate(360deg); } }
+  .dck-err { background: #fef2f2; color: #b91c1c; border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; font-weight: 600; }
+  .dck-sum { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+  .dck-sum span { font-weight: 800; font-size: 12px; padding: 4px 10px; border-radius: 8px; }
+  .dck-sum .e { background: #fee2e2; color: #b91c1c; } .dck-sum .w { background: #fef3c7; color: #92400e; } .dck-sum .p { background: #dcfce7; color: #15803d; }
+  .dck-sec { font-size: 11.5px; font-weight: 800; color: #6b7280; margin: 12px 0 6px; letter-spacing: -0.01em; }
+  .dck-it { border: 1px solid #e5e7eb; border-left: 4px solid #cbd5e1; border-radius: 8px; padding: 7px 10px; margin-bottom: 6px; }
+  .dck-it.error { border-left-color: #dc2626; background: #fffafa; } .dck-it.warn { border-left-color: #f59e0b; } .dck-it.info { border-left-color: #94a3b8; }
+  .dck-it .t { font-weight: 700; }
+  .dck-it .c { display: inline-block; font-size: 10.5px; font-weight: 700; color: #6d28d9; background: #f5f3ff; border-radius: 5px; padding: 0 5px; margin-right: 5px; }
+  .dck-it .d { color: var(--text-2); font-size: 12px; margin-top: 2px; word-break: break-word; }
+  .dck-it .s { font-size: 10.5px; color: #94a3b8; margin-top: 2px; }
+  .dck-nut { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .dck-nut td, .dck-nut th { border-bottom: 1px solid #f1f5f9; padding: 3px 6px; text-align: left; }
+  .dck-nut th { color: #6b7280; font-size: 11px; font-weight: 700; }
+  .dck-nut td.n { text-align: right; font-variant-numeric: tabular-nums; }
+  .dck-nut tr.bad td { background: #fef2f2; color: #b91c1c; font-weight: 700; }
+  .dck-ok { color: #15803d; font-size: 12px; margin: 2px 0; }
+  .dck-fields { margin-top: 8px; }
+  .dck-fields summary { cursor: pointer; font-weight: 700; color: #4c1d95; font-size: 12px; }
+  .dck-fields dl { margin: 6px 0 0; display: grid; grid-template-columns: 84px 1fr; gap: 3px 8px; font-size: 11.5px; }
+  .dck-fields dt { color: #6b7280; font-weight: 700; } .dck-fields dd { margin: 0; word-break: break-word; }
+  .dck-foot { margin-top: 12px; padding-top: 8px; border-top: 1px dashed #e5e7eb; font-size: 11px; color: #94a3b8; line-height: 1.5; }
+  /* 규격 목록 시안 아이콘 옆 점검 결과 점 */
+  .sc-dck { position: absolute; bottom: -4px; right: -4px; width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid #fff; }   /* 위 오른쪽은 시안 수 배지 자리 */
+  .sc-dck.err { background: #dc2626; } .sc-dck.warn { background: #f59e0b; } .sc-dck.ok { background: #16a34a; } .sc-dck.na { background: #94a3b8; }
   .chart-panel {
     background: var(--surface); border: 1px solid var(--border);
     border-radius: 12px; padding: 12px 16px 10px;
@@ -19013,6 +19942,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         <div id="dsg-sub" style="color:var(--text-2);margin-top:4px"></div>
       </div>
       <div style="display:flex;align-items:center;gap:8px">
+        <button id="dsg-chk-btn" class="dsg-chk-btn" type="button" onclick="dsgChkToggle()" style="display:none"
+                title="AI가 이 시안의 법정 표시사항(영양정보 순서·필수 표시·알레르기·소비기한)과 오타를 확인">🔍 표시사항 점검</button>
         <a id="dsg-dl" class="dsg-dl" href="#" rel="noopener" style="display:none">⬇ 원본 받기</a>
         <button class="modal-close" onclick="closeDesign()">&times;</button>
       </div>
@@ -19020,6 +19951,12 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     <div class="dsg-stage" id="dsg-stage"></div>
     <div class="dsg-badge" id="dsg-badge" style="display:none"></div>
     <div class="dsg-thumbs" id="dsg-thumbs"></div>
+    <!-- 시안 표시사항 점검 칸 (2026-11-20) -->
+    <div class="dsg-chk" id="dsg-chk">
+      <div class="dsg-chk-head"><b>🔍 표시사항 점검 <span style="font-weight:600;color:#7c6aa8;font-size:11.5px">AI 1차 확인</span></b>
+        <button type="button" onclick="dsgChkClose()" title="닫기">&times;</button></div>
+      <div class="dsg-chk-body" id="dsg-chk-body"></div>
+    </div>
   </div>
 </div>
 
@@ -25479,6 +26416,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       }
       _specItems = d.items || [];
       renderSpecList();
+      loadDsgChkSummary();   // 시안 표시사항 점검 결과 점 (2026-11-20)
     } catch (e) {
       document.getElementById('spec-list').innerHTML = '<div class="alert-empty" style="color:#ef4444">오류: ' + escapeHtml(e.message) + '</div>';
     }
@@ -27401,7 +28339,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         + '<span class="sc-size" title="' + escapeHtml(it.size || '') + '">' + escapeHtml(it.size || '-') + '</span>'
         + '<span class="sc-mat" title="' + escapeHtml(it.material) + '">' + escapeHtml(it.material) + '</span>'
         + '<span class="sc-design">' + (it.design && it.item_id
-            ? '<button class="sc-design-btn" title="시안 보기' + (it.design > 1 ? ' (' + it.design + '개)' : '') + '" onclick="event.stopPropagation();openDesign(\\'' + escapeHtml(it.item_id) + '\\',\\'' + escapeHtml(it.code) + '\\')">' + dsgIcon() + (it.design > 1 ? '<span class="n">' + it.design + '</span>' : '') + '</button>'
+            ? '<button class="sc-design-btn" title="시안 보기' + (it.design > 1 ? ' (' + it.design + '개)' : '') + '" onclick="event.stopPropagation();openDesign(\\'' + escapeHtml(it.item_id) + '\\',\\'' + escapeHtml(it.code) + '\\')">' + dsgIcon() + (it.design > 1 ? '<span class="n">' + it.design + '</span>' : '') + dsgChkDot(it.item_id) + '</button>'
             : '-') + '</span>'
         + '<span class="sc-check" onclick="event.stopPropagation()">'
         + '<input type="checkbox" class="spec-calc-cb" ' + cbAttrs + ' onchange="specLinkToCalc(this)" title="단가 계산기에 연동">'
@@ -27421,6 +28359,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   async function openDesign(itemId, code) {
     const it = (_specItems || []).find(x => x.item_id === itemId) || {};
     const modal = document.getElementById('design-modal');
+    _dsgItemId = itemId; dsgChkClose(); document.getElementById('dsg-chk-btn').style.display = 'none';   // 표시사항 점검 칸은 시안마다 닫고 시작
     _dsgRot = 0;   // 회전은 창을 열 때마다 처음 방향으로 (같은 시안의 다음 쪽으로 넘길 땐 유지)
     document.getElementById('dsg-title').textContent = (code || '') + (it.name ? ' · ' + it.name : '');
     const sub = document.getElementById('dsg-sub');
@@ -27527,11 +28466,159 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     dl.href = o.url; dl.target = o.kind === 'link' ? '_blank' : '_self';
     dl.textContent = o.kind === 'link' ? '↗ 링크 열기' : '⬇ 원본 받기' + (o.size ? ' (' + (o.ext || '').toUpperCase() + ' ' + _dsgMB(o.size) + ')' : '');
     dl.style.display = '';
+    if (!f.id || f.id !== _dsgChkAsset || !document.getElementById('dsg-chk').classList.contains('show')) dsgChkLoad();   // 같은 파일의 다른 쪽이면 그대로
   }
   function closeDesign() {
     document.getElementById('design-modal').classList.remove('show');
     document.getElementById('dsg-stage').innerHTML = '';
     _dsgFiles = []; _dsgSeq++;
+    clearTimeout(_dsgChkTimer); _dsgChkAsset = ''; dsgChkClose();
+  }
+
+  // ───── 시안 표시사항 점검 (2026-11-20, 사용자 "시안을 법적표기사항 등 문제 여부를 판단하는 장치 — 영양정보 순서, 오타 등") ─────
+  // AI가 시안(쪽 전체 + 확대 조각)을 읽고, 서버 규칙이 영양정보 순서·비율·열량·소비기한·알레르기·1399 등을 다시 계산. 결과는 시안 파일마다 저장
+  let _dsgItemId = '', _dsgChkAsset = '', _dsgChkTimer = null, _dsgChkSum = {};
+  const _dsgChkLv = { error: '❌', warn: '⚠', info: 'ℹ' };
+  function dsgChkFile() {   // 점검할 수 있는 지금 파일 (링크·안내문뿐인 .ai는 안 됨)
+    const f = _dsgFiles[_dsgIdx];
+    return f && f.id && f.kind !== 'link' && !dsgStub(f) ? f : null;
+  }
+  function dsgChkBtn(d) {
+    const b = document.getElementById('dsg-chk-btn'), f = dsgChkFile();
+    b.style.display = f ? '' : 'none';
+    const rec = d && d.result, s = (rec && rec.summary) || {};
+    let tag = '';
+    if (d && d.state === 'running') tag = '<span class="dck-mini run">점검 중</span>';
+    else if (rec && rec.applicable === false) tag = '<span class="dck-mini na">대상 아님</span>';
+    else if (rec) tag = s.error ? '<span class="dck-mini err">❌ ' + s.error + '</span>' : (s.warn ? '<span class="dck-mini warn">⚠ ' + s.warn + '</span>' : '<span class="dck-mini ok">✓ 통과</span>');
+    b.innerHTML = '🔍 표시사항 점검' + tag;
+    b.classList.toggle('on', document.getElementById('dsg-chk').classList.contains('show'));
+  }
+  async function dsgChkLoad() {   // 지금 파일의 저장된 결과·진행 상태
+    const f = dsgChkFile();
+    clearTimeout(_dsgChkTimer);
+    if (!f) { _dsgChkAsset = ''; dsgChkBtn(null); dsgChkClose(); return; }
+    const asset = f.id; _dsgChkAsset = asset;
+    let d = null;
+    try { d = await (await fetch('/api/design_check/' + _dsgItemId + '/' + asset)).json(); } catch (e) { d = { state: 'error', error: e.message }; }
+    if (_dsgChkAsset !== asset) return;   // 그사이 다른 파일로 넘김
+    dsgChkBtn(d);
+    if (document.getElementById('dsg-chk').classList.contains('show')) dsgChkRender(d, f);
+    if (d && d.state === 'running') _dsgChkTimer = setTimeout(dsgChkLoad, d.mode === 'ai' ? 4000 : 2500);
+    else if (d && d.result) dsgChkSumPut(d.result);
+  }
+  function dsgChkToggle() {
+    const p = document.getElementById('dsg-chk');
+    if (p.classList.contains('show')) { dsgChkClose(); return; }
+    const head = document.querySelector('#design-modal .modal-header');
+    p.style.top = ((head ? head.offsetHeight : 70) + 8) + 'px';
+    p.classList.add('show');
+    document.getElementById('dsg-chk-btn').classList.add('on');
+    document.getElementById('dsg-chk-body').innerHTML = '<div class="dck-run">불러오는 중…</div>';
+    dsgChkLoad();
+  }
+  function dsgChkClose() {
+    document.getElementById('dsg-chk').classList.remove('show');
+    const b = document.getElementById('dsg-chk-btn'); if (b) b.classList.remove('on');
+  }
+  async function dsgChkStart(mode) {
+    const f = dsgChkFile(); if (!f) return;
+    document.getElementById('dsg-chk-body').innerHTML = '<div class="dck-run">점검을 시작합니다…</div>';
+    try {
+      const d = await (await fetch('/api/design_check/' + _dsgItemId + '/' + f.id,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: mode || 'free' }) })).json();
+      if (!d.ok) throw new Error(d.error || '시작 실패');
+    } catch (e) {
+      document.getElementById('dsg-chk-body').innerHTML = '<div class="dck-err">점검을 시작하지 못했습니다: ' + escapeHtml(e.message) + '</div>';
+      setTimeout(dsgChkLoad, 2500);   // 안내를 잠깐 보여 준 뒤 원래 화면으로
+      return;
+    }
+    dsgChkLoad();
+  }
+  // 점검 버튼 두 개 — 무료(윈도우 글자 인식, 회사 PC만) / AI 정밀(오타·광고 표현까지, OpenAI 키·비용)
+  function dsgChkBtns(d, again) {
+    const freeOk = !d || d.free_ok !== false;
+    return '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">'
+      + '<button class="dck-go' + (again ? ' ghost' : '') + '" type="button" onclick="dsgChkStart(&quot;free&quot;)"' + (freeOk ? '' : ' disabled style="opacity:.45;cursor:not-allowed"')
+      + ' title="' + (freeOk ? '윈도우 내장 글자 인식으로 읽고 규칙 검사 · 비용 없음 · 10초 안팎' : '무료 점검은 회사 PC 대시보드에서만 할 수 있어요') + '">' + (again ? '↻ 무료로 다시 점검' : '무료 점검 시작') + '</button>'
+      + '<button class="dck-go ghost" type="button" onclick="dsgChkStart(&quot;ai&quot;)" title="AI가 오타·광고 표현까지 확인 · OpenAI 키 필요 · 1건 100원 안팎 · 1~2분">AI 정밀 점검</button>'
+      + '</div>' + (freeOk ? '' : '<div class="dck-foot" style="border:0;margin-top:6px;padding:0">무료 점검은 회사 PC 대시보드에서만 할 수 있어요(윈도우 글자 인식). 결과는 여기서도 보입니다.</div>');
+  }
+  function dsgChkRender(d, f) {
+    const body = document.getElementById('dsg-chk-body'), rec = d && d.result;
+    if (d && d.state === 'running') {
+      body.innerHTML = '<div class="dck-run">' + (d.mode === 'ai' ? 'AI가 시안을 읽고 있습니다… ' + (d.since || 0) + '초<br>보통 1~2분 걸립니다.' : '시안 글자를 읽고 있습니다… ' + (d.since || 0) + '초<br>보통 10초 안팎입니다.')
+        + ' 창을 닫아도 계속 진행돼요.</div>'
+        + (rec ? '<div class="dck-sec">지난 결과 (' + escapeHtml(rec.at || '') + ')</div>' + dsgChkResultHtml(rec) : '');
+      return;
+    }
+    const h = d && d.state === 'error' ? '<div class="dck-err">점검 실패: ' + escapeHtml(d.error || '') + '</div>' : '';
+    if (!rec) {
+      body.innerHTML = h + '<div class="dck-intro"><b>' + escapeHtml(f.name || '') + '</b> 시안의 표시사항을 확인합니다.<ul>'
+        + '<li>영양정보 순서·빠진 성분·1일 기준치 비율(%)·열량 합</li><li>필수 표시(제품명·식품유형·품목보고번호·내용량·소비기한·원재료·제조원)</li>'
+        + '<li>알레르기 ‘함유’ 표시 · 소비기한 용어 · 1399 · 2,000kcal 문구 · 내용량과 품명</li></ul>'
+        + '<b>무료 점검</b>은 윈도우 글자 인식으로 읽어서 비용이 없고 10초 안팎이면 끝나요. 오타·광고 표현은 <b>AI 정밀 점검</b>(OpenAI 키·1건 100원 안팎)에서만 봅니다. 결과는 저장돼서 다음부터 바로 보여요.</div>'
+        + dsgChkBtns(d, false);
+      return;
+    }
+    body.innerHTML = h + dsgChkResultHtml(rec) + dsgChkBtns(d, true);
+  }
+  function dsgChkResultHtml(rec) {
+    const s = rec.summary || {}, iss = rec.issues || [], ok = rec.passed || [], free = rec.mode === 'free';
+    let ai = {}; try { ai = JSON.parse(rec.ai || '{}'); } catch (e) { ai = {}; }
+    let h = '<div style="margin-bottom:8px"><span class="dck-mini ' + (free ? 'na' : 'ok') + '" style="border:1px solid #e5e7eb">' + (free ? '무료 점검 · 글자 인식' : 'AI 정밀 점검') + '</span>'
+      + (free ? ' <span style="font-size:11px;color:#94a3b8">오타·광고 표현은 확인 안 함</span>' : '') + '</div>';
+    if (rec.applicable === false) {
+      h += free
+        ? '<div class="dck-intro">표시사항(원재료·품목보고번호·소비기한·영양정보 등) 글자를 거의 찾지 못했습니다. 표시란이 없는 시안(외박스·앞면)이거나 글자가 작아 못 읽었을 수 있어요 — 필요하면 AI 정밀 점검으로 확인하세요.</div>'
+        : '<div class="dck-intro">소비자용 표시사항(뒷면 표시란·영양정보)이 없는 시안으로 보여 점검 대상이 아닙니다' + (rec.panel ? ' (' + escapeHtml(rec.panel) + ')' : '') + '.</div>';
+    } else {
+      h += '<div class="dck-sum"><span class="e">❌ 위반 의심 ' + (s.error || 0) + '</span><span class="w">⚠ 확인 필요 ' + (s.warn || 0) + '</span><span class="p">✓ 통과 ' + ok.length + '</span></div>';
+      h += iss.map(x => '<div class="dck-it ' + escapeHtml(x.level) + '"><div class="t">' + (_dsgChkLv[x.level] || '') + ' <span class="c">' + escapeHtml(x.category || '') + '</span>' + escapeHtml(x.title || '') + '</div>'
+        + (x.detail ? '<div class="d">' + escapeHtml(x.detail) + '</div>' : '')
+        + '<div class="s">' + (x.src === 'rule' ? (free ? '규칙 계산(글자 인식 값 기준)' : '규칙 계산(AI가 읽은 값 기준)') : 'AI 판단') + (x.where ? ' · ' + escapeHtml(x.where) : '') + '</div></div>').join('');
+      const nut = ai.nutrition || {}, items = nut.items || [];
+      if (nut.present && items.length) {
+        const ORD = ['나트륨', '탄수화물', '당류', '지방', '트랜스지방', '포화지방', '콜레스테롤', '단백질'];
+        const nm = v => String(v || '').replace(/ /g, '');
+        let last = -1;
+        h += '<div class="dck-sec">영양정보 (' + (free ? '글자 인식 값' : 'AI가 읽은 값') + ') · ' + escapeHtml(nut.basis || '') + (nut.kcal ? ' · ' + escapeHtml(nut.kcal) + 'kcal' : '') + '</div>'
+          + '<table class="dck-nut"><tr><th>순서</th><th>성분</th><th class="n">함량</th><th class="n">%</th></tr>'
+          + items.map((x, i) => {
+              const k = ORD.indexOf(nm(x.name)), bad = k >= 0 && k < last;
+              if (k >= 0) last = Math.max(last, k);
+              return '<tr' + (bad ? ' class="bad" title="기준 순서보다 앞에 와야 함"' : '') + '><td>' + (i + 1) + '</td><td>' + escapeHtml(x.name || '') + '</td><td class="n">'
+                + escapeHtml((x.amount || '') + (x.unit || '')) + '</td><td class="n">' + escapeHtml(x.pct ? x.pct + '%' : '') + '</td></tr>';
+            }).join('') + '</table>';
+      }
+      if (ok.length) h += '<div class="dck-sec">통과</div>' + ok.map(t => '<div class="dck-ok">✓ ' + escapeHtml(t) + '</div>').join('');
+      const fl = ai.fields || {}, keys = Object.keys(fl).filter(k => String(fl[k] || '').trim());
+      if (keys.length) h += '<details class="dck-fields"><summary>' + (free ? '글자 인식으로 찾은' : 'AI가 읽은') + ' 표시사항 ' + keys.length + '개 보기</summary><dl>'
+        + keys.map(k => '<dt>' + escapeHtml(k) + '</dt><dd>' + escapeHtml(fl[k]) + '</dd>').join('') + '</dl></details>';
+    }
+    if (free && rec.ocr) h += '<details class="dck-fields"><summary>읽은 글자 전체 보기 (글자 인식 원문)</summary>'
+      + '<div style="white-space:pre-wrap;font-size:11px;color:#475569;margin-top:6px;max-height:240px;overflow:auto;background:#f8fafc;border-radius:6px;padding:6px 8px">' + escapeHtml(rec.ocr) + '</div></details>';
+    h += '<div class="dck-foot">' + (rec.notes || []).map(n => '※ ' + escapeHtml(n) + '<br>').join('')
+      + escapeHtml(rec.at || '') + ' 점검 · ' + escapeHtml(rec.model || '') + ' · 그림 ' + (rec.images || 0) + '장 · ' + (rec.secs || 0) + '초<br>'
+      + 'AI가 그림을 읽은 결과라 틀릴 수 있어요. 최종 판단은 원본 시안과 「식품등의 표시기준」으로 확인하세요.</div>';
+    return h;
+  }
+  // 규격 목록 시안 아이콘 옆 점 — 품목에서 점검한 시안 중 가장 나쁜 결과 (빨강 위반 의심 · 주황 확인 필요 · 초록 통과 · 회색 대상 아님)
+  function dsgChkSumPut(rec) {
+    const a = (_dsgChkSum[rec.item_id] || []).filter(x => x.asset_id !== rec.asset_id);
+    a.push({ asset_id: rec.asset_id, file: rec.file, error: (rec.summary || {}).error || 0, warn: (rec.summary || {}).warn || 0, applicable: rec.applicable !== false, at: rec.at });
+    _dsgChkSum[rec.item_id] = a;
+    if (_specItems.length) renderSpecList();
+  }
+  function dsgChkDot(itemId) {
+    const a = _dsgChkSum[itemId]; if (!a || !a.length) return '';
+    const ap = a.filter(x => x.applicable), err = ap.reduce((s, x) => s + x.error, 0), warn = ap.reduce((s, x) => s + x.warn, 0);
+    const cls = !ap.length ? 'na' : err ? 'err' : warn ? 'warn' : 'ok';
+    const tip = '표시사항 점검 — ' + a.map(x => x.file + ': ' + (x.applicable ? '위반 의심 ' + x.error + ' · 확인 ' + x.warn : '대상 아님') + ' (' + x.at + ')').join(' / ');
+    return '<i class="sc-dck ' + cls + '" title="' + escapeHtml(tip) + '"></i>';
+  }
+  async function loadDsgChkSummary() {
+    try { const d = await (await fetch('/api/design_check_summary')).json(); _dsgChkSum = d.items || {}; if (_specItems.length) renderSpecList(); } catch (e) {}
   }
   document.getElementById('design-modal').addEventListener('click', e => { if (e.target.id === 'design-modal') closeDesign(); });
   // 시안 확대·축소 (2026-10-29) — 휠은 커서 위치를 기준으로 확대, 확대 중엔 끌어서 이동, 클릭은 크게 보기 ↔ 맞춤
