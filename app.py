@@ -7667,7 +7667,8 @@ def _fuzzy_find(s, name):
     while i + n <= len(s):
         seg = s[i:i + n]
         diff = sum(1 for a, b in zip(seg, name) if a != b)
-        if diff == 0 or (n >= 3 and diff <= 1 and seg[0] == name[0]):
+        # 3글자는 첫 글자가 같을 때만, 4글자 이상은 첫 글자가 달라도(‘E랜스지방’→트랜스지방) 한 글자 차이까지
+        if diff == 0 or (n >= 3 and diff <= 1 and (seg[0] == name[0] or n >= 4)):
             out.append(i)
             i += n
         else:
@@ -7777,25 +7778,55 @@ def _dsgchk_free_extract(pages):
             for w in words:
                 starts.append(acc)
                 acc += len(re.sub(r'\s+', '', w.get('t', '')))
+            # 띄어쓰기 없앤 위치 → 원래 줄 글자 위치 (값은 띄어쓰기를 살려 나눠야 '78 24%'가 '7824%'로 붙지 않음)
+            omap = [k for k, ch in enumerate(t) if not ch.isspace()]
             for j, (pos, nm) in enumerate(found):
                 wi = max(k for k, st in enumerate(starts) if st <= pos) if starts else 0
                 w = words[wi] if words else {'x': 0, 'y': i * 10, 'h': 10}
-                seg = s[pos + len(nm): found[j + 1][0] if j + 1 < len(found) else len(s)]
+                e0 = pos + len(nm)
+                o0 = omap[e0] if e0 < len(omap) else len(t)
+                nx = found[j + 1][0] if j + 1 < len(found) else None
+                o1 = omap[nx] if nx is not None and nx < len(omap) else len(t)
+                seg = t[o0:o1]
                 occ.append({'name': nm, 'x': w.get('x', 0), 'y': w.get('y', 0), 'h': max(1, w.get('h', 10)), 'line': i, 'seg': seg})
         seen = set()
         occ = [o for o in occ if o['name'] != '열량' and not (o['name'] in seen or seen.add(o['name']))]
-        def parse(seg):
+        def parse(seg, nm):
+            """띄어쓰기를 살린 값 → (함량, 단위, %). '%'가 붙은 숫자 = 비율, 그 앞 첫 숫자 = 함량.
+            글자 인식이 띄어 쓴 'g'·'mg'를 빠뜨리면(‘78 24%’·‘0m’) 성분별 기본 단위로 채움(2026-11-20)."""
             g = seg.replace('。', '.').replace('，', ',')
-            g = re.sub(r'(\d)0/[0oO6]', r'\1%', g)          # 글자 인식: '19 0/0'·'10/6' → '19%'·'1%'
-            g = re.sub(r'(?i)mg[lo|1]', 'mg', g)
-            am = re.search(r'(\d+(?:\.\d+)?)(mg|g)', g)
-            pc = re.search(r'(\d+(?:\.\d+)?)%', g[am.end():] if am else g)
-            a = am.group(1) if am else ''
-            if re.fullmatch(r'0\d', a):   # 글자 인식이 소수점을 빠뜨림: '07g' → 0.7g
+            g = re.sub(r'(\d)\s*0\s*/\s*[0oO6]', r'\1%', g)    # '19 0/0'·'10/6' → '19%'·'1%'
+            g = re.sub(r'(?i)mg[lo|1]', 'mg ', g)
+            toks = re.findall(r'\d+(?:\.\d+)?|%|mg|m|g', g)
+            a = u = p = ''
+            for k, tk in enumerate(toks):
+                if not re.match(r'\d', tk):
+                    continue
+                nxt = toks[k + 1] if k + 1 < len(toks) else ''
+                if nxt == '%':
+                    if not p:
+                        p = tk
+                    if a:
+                        break
+                elif not a and not p:
+                    a = tk
+                    u = 'mg' if nxt in ('mg', 'm') else ('g' if nxt == 'g' else '')
+            if a and not u:
+                u = 'mg' if nm in ('나트륨', '콜레스테롤') else 'g'
+                # 'g'를 '9'로 읽음('단백질 29'=2g, '09'=0g) — %가 있으면 %에 더 맞는 쪽, 없으면 '09'만 0으로
+                if re.fullmatch(r'\d+9', a) and u == 'g':
+                    c = a[:-1]
+                    if p and nm in _NUT_DV:
+                        dv_ = _NUT_DV[nm]
+                        if abs(float(c) / dv_ * 100 - float(p)) < abs(float(a) / dv_ * 100 - float(p)):
+                            a = c
+                    elif a == '09':
+                        a = '0'
+            if re.fullmatch(r'0\d', a):   # 소수점 빠짐: '07g' → 0.7g
                 a = a[0] + '.' + a[1:]
-            return (a, am.group(2) if am else '', pc.group(1) if pc else '')
+            return a, u, p
         for o in occ:
-            a, u, p = parse(o['seg'])
+            a, u, p = parse(o['seg'], o['name'])
             o.update(amount=a, unit=u, pct=p)
         # 읽는 순서: 줄 순서(가로로 이어 쓴 표) / 칸 순서(두 칸 표 — 왼쪽 칸 위→아래 다음 오른쪽 칸). 기준 순서와 맞는 쪽을 씀
         hh = sorted(o['h'] for o in occ)[len(occ) // 2] if occ else 10
