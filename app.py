@@ -1745,6 +1745,7 @@ def _refresh_monday_once():
                 message=tail[0] if tail else '완료',
             )
             print(f'[Monday 자동갱신] 완료 ({len(MONDAY_DF) if MONDAY_DF is not None else 0}행)')
+            _cloud_sync_now('Monday 수집 끝')   # 새 자료를 바로 GCP로 (2026-11-23)
         else:
             err = (result.stderr or '')[-300:]
             MONDAY_REFRESH_STATUS.update(
@@ -2073,6 +2074,39 @@ def _refresh_aramanth_once():
         print(f'[아마란스 자동갱신] 예외: {e}')
     finally:
         ARAMANTH_REFRESH_LOCK.release()
+    _cloud_sync_now('아마란스 수집 끝')   # 새 자료를 바로 GCP로 (2026-11-23)
+
+
+_CLOUD_SYNC = {'at': 0.0, 'busy': False}
+
+
+def _cloud_sync_now(reason):
+    """회사 PC가 새 자료를 받으면 바로 GCP로 보냄 (2026-11-23 사용자 "켜지자마자 GCP로 바로 보내게") — 30분 예약 동기화를 기다리지 않음.
+    update_cloud.ps1을 창 없이 실행. 이미 동기화 중(락 파일)이면 1분씩 기다렸다가(최대 15분) 이어서 한 번 더. 3분 안에 다시 부르면 건너뜀."""
+    if not _IS_HOST_PC:
+        return
+    if _CLOUD_SYNC['busy'] or time.time() - _CLOUD_SYNC['at'] < 180:
+        return
+    _CLOUD_SYNC['busy'] = True
+
+    def run():
+        try:
+            lock = os.path.join(BASE_DIR, '.update_cloud.lock')
+            for _ in range(15):
+                if os.path.exists(lock) and time.time() - os.path.getmtime(lock) < 20 * 60:
+                    threading.Event().wait(60)
+                    continue
+                break
+            _CLOUD_SYNC['at'] = time.time()
+            print(f'[GCP 즉시 동기화] {reason}')
+            subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
+                            os.path.join(BASE_DIR, 'update_cloud.ps1')],
+                           capture_output=True, timeout=1500, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        except Exception as e:
+            print(f'[GCP 즉시 동기화] 실패: {e}')
+        finally:
+            _CLOUD_SYNC['busy'] = False
+    threading.Thread(target=run, daemon=True, name='cloud-sync-now').start()
 
 
 def _aramanth_data_is_today():
@@ -2088,6 +2122,7 @@ def _aramanth_refresh_scheduler():
     # 시작 시: 오늘자 데이터 있으면 첫 fetch 건너뛰고 바로 60분 대기
     if _aramanth_data_is_today():
         print('[아마란스 자동갱신] 오늘자 데이터 존재 → 시작시 fetch 생략')
+        threading.Timer(90, _cloud_sync_now, args=('PC 켜짐(오늘자 자료 있음)',)).start()   # 켜지자마자 GCP도 맞춤 (2026-11-23)
         ARAMANTH_REFRESH_STATUS.update(
             last_run=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             last_status='success',
@@ -10445,6 +10480,34 @@ def _vendor_file_days(vendor):
             out.append(_date(y, mon, d))
         except ValueError:
             pass
+    if out:
+        return out
+    # 이번 달 파일에 아직 값이 없으면 지난 달 마감 파일(data/inv_month)에서 찾음 — 10월 마감에 10/31까지 적혀 있어도
+    # 11월 파일이 비어 있으면 포털 입력(9/30)만 보던 버그 (2026-11-23 사용자 "10월 마감 파일에 10월 말까지 입력돼 있는데")
+    yy, mm = y, mon
+    for _ in range(3):
+        yy, mm = (yy - 1, 12) if mm == 1 else (yy, mm - 1)
+        try:
+            mdf, _name = _month_inv_df(f'{yy}{mm:02d}')
+        except Exception:
+            mdf = None
+        if mdf is None or getattr(mdf, 'empty', True):
+            continue
+        mcols, mmon = _daily_col_map(mdf)
+        if not mcols or mmon != mm:
+            continue
+        mdays = set()
+        for r, _c, _s, _rk in _vendor_row_list(vendor, full=mdf):
+            for d, c in mcols.items():
+                if d not in mdays and _xnum(r.get(c, 0)):
+                    mdays.add(d)
+        if mdays:
+            for d in sorted(mdays):
+                try:
+                    out.append(_date(yy, mm, d))
+                except ValueError:
+                    pass
+            return out
     return out
 
 
@@ -10478,7 +10541,7 @@ def _vendor_record_status(vendor, ents=None, now=None):
     fdays = _vendor_file_days(vendor)
     file_last = fdays[-1] if fdays else None
     if file_last and (ent_last is None or file_last >= ent_last):
-        last, src = file_last, '재고 파일'
+        last, src = file_last, ('재고 파일' if file_last.month == today.month else f'{file_last.month}월 마감 파일')
     else:
         last, src = ent_last, ent_src
     md = lambda d: f'{d.month}/{d.day}'
