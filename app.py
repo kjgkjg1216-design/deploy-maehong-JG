@@ -8375,6 +8375,181 @@ def api_design_check_batch():
     return jsonify({'ok': True, 'free_ok': _IS_HOST_PC, **B})
 
 
+# ── 입수 테스트 3D에 시안 입히기 (2026-11-23 사용자 "각 품번에 맞는 디자인 시안이 자세하진 않아도 입혀서") ──
+#   시안 미리보기(전개도)에서 앞면 영역을 잘라 1024px JPG로 줌. 앞면 = 사람이 지정한 영역(Firestore design_tex_crop) › 자동 추정
+#   (여백을 뺀 그림 영역에서 파우치는 왼쪽 절반, 상자는 전체). 결과는 메모리 캐시.
+_DTEX = {'asset': {}, 'img': {}}
+
+
+def _dtex_source(item_id):
+    """품목의 시안 그림 (asset_id, PIL 이미지) — .ai/.pdf는 미리보기 1쪽, 그림 파일은 받아서 data/design_preview/<asset>-src.jpg로 보관."""
+    from PIL import Image as _Img
+    hit = _DTEX['asset'].get(item_id)
+    if not hit or time.time() - hit[0] > 3600:
+        files = _design_assets_bulk([item_id]).get(str(item_id), [])
+        pick = next((f for f in files if f['ext'] in ('ai', 'pdf') and _design_preview_meta(f['id'])
+                     and not ((_design_preview_meta(f['id']) or {}).get('nopdf') and not (_design_preview_meta(f['id']) or {}).get('conv'))), None) \
+            or next((f for f in files if f['ext'] in ('jpg', 'jpeg', 'png')), None) \
+            or next((f for f in files if f['ext'] in ('ai', 'pdf')), None)
+        hit = (time.time(), pick)
+        _DTEX['asset'][item_id] = hit
+    f = hit[1]
+    if not f:
+        return None, None
+    if f['ext'] in ('ai', 'pdf'):
+        if not _design_preview_meta(f['id']):
+            _design_preview_make(item_id, f['id'])
+        p = _design_preview_paths(f['id'])[0]
+        if not os.path.exists(p):
+            return f['id'], None
+    else:
+        p = f'{DATA_DIR}/design_preview/{f["id"]}-src.jpg'
+        if not os.path.exists(p):
+            import requests as _req
+            a = _dsgchk_asset(f['id'])
+            r = _req.get(a['url'], timeout=120)
+            r.raise_for_status()
+            im = _Img.open(__import__('io').BytesIO(r.content)).convert('RGB')
+            im.thumbnail((2400, 2400))
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            im.save(p, 'JPEG', quality=85)
+    return f['id'], _Img.open(p).convert('RGB')
+
+
+def _dtex_auto_box(im, kind):
+    """전개도에서 앞면 추정 → (x0, y0, x1, y1) 0~1 비율.
+    색이 꽉 찬 덩어리(칼선·치수선 같은 가는 선은 지움)를 찾아, 큰 덩어리(가장 큰 것의 60% 이상) 중 왼쪽 위 것 = 보통 앞면.
+    가로세로 비가 너무 긴 띠(롤 칼선·색 막대)는 뺌. 못 찾으면 여백을 뺀 전체."""
+    W = 240
+    H = max(1, int(W * im.height / im.width))
+    s = im.convert('RGB').resize((W, H))
+    px = s.load()
+    ink = [[0] * W for _ in range(H)]
+    for y in range(H):
+        for x in range(W):
+            r, g, b = px[x, y]
+            ink[y][x] = 1 if (max(r, g, b) - min(r, g, b) > 35 or max(r, g, b) < 170) else 0
+    # 가는 선 지우기: 5×5 안에 잉크가 18칸 이상인 곳만
+    sat = [[0] * (W + 1) for _ in range(H + 1)]
+    for y in range(H):
+        row = 0
+        for x in range(W):
+            row += ink[y][x]
+            sat[y + 1][x + 1] = sat[y][x + 1] + row
+    def cnt(x0, y0, x1, y1):
+        x0, y0, x1, y1 = max(0, x0), max(0, y0), min(W, x1), min(H, y1)
+        return sat[y1][x1] - sat[y0][x1] - sat[y1][x0] + sat[y0][x0]
+    m = [[1 if ink[y][x] and cnt(x - 2, y - 2, x + 3, y + 3) >= 18 else 0 for x in range(W)] for y in range(H)]
+    seen = [[0] * W for _ in range(H)]
+    comps = []
+    for y in range(H):
+        for x in range(W):
+            if m[y][x] and not seen[y][x]:
+                st = [(x, y)]; seen[y][x] = 1; n = 0; bx0 = bx1 = x; by0 = by1 = y
+                while st:
+                    cx, cy = st.pop(); n += 1
+                    bx0, bx1, by0, by1 = min(bx0, cx), max(bx1, cx), min(by0, cy), max(by1, cy)
+                    for nx, ny in ((cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)):
+                        if 0 <= nx < W and 0 <= ny < H and m[ny][nx] and not seen[ny][nx]:
+                            seen[ny][nx] = 1; st.append((nx, ny))
+                bw, bh = bx1 - bx0 + 1, by1 - by0 + 1
+                if n >= 60 and 0.3 <= bw / bh <= 3.0 and n / (bw * bh) >= 0.45:
+                    comps.append((n, bx0, by0, bx1 + 1, by1 + 1))
+    if comps:
+        lum = [[(px[x, y][0] * 3 + px[x, y][1] * 6 + px[x, y][2]) // 10 for x in range(W)] for y in range(H)]
+        def detail(c):   # 무늬·글자 정도 = 이웃 픽셀 밝기 차이 평균 (단색 바탕 덩어리는 낮음)
+            _n, x0, y0, x1, y1 = c
+            t = k = 0
+            for yy in range(y0, y1 - 1):
+                for xx in range(x0, x1 - 1):
+                    t += abs(lum[yy][xx] - lum[yy][xx + 1]) + abs(lum[yy][xx] - lum[yy + 1][xx]); k += 1
+            return t / max(1, k)
+        big = max(c[0] for c in comps)
+        cand = [c for c in comps if c[0] >= big * 0.5]
+        dmax = max(detail(c) for c in cand)
+        cand = [c for c in cand if detail(c) >= dmax * 0.5] or cand
+        c = min(cand, key=lambda c: (round(c[2] / max(1, H) * 4), c[1]))   # 위쪽 줄 먼저, 그다음 왼쪽
+        return (c[1] / W, c[2] / H, c[3] / W, c[4] / H)
+    return (0.0, 0.0, 1.0, 1.0)
+
+
+def _dtex_crop_get(item_id):
+    try:
+        d = FIRESTORE_DB.collection('design_tex_crop').document(str(item_id)).get()
+        return d.to_dict() if d.exists else None
+    except Exception:
+        return None
+
+
+@app.route('/api/design_tex/<item_id>', methods=['GET'])
+def api_design_tex(item_id):
+    """품목 시안의 앞면 그림 JPG (긴 변 1024px). ?kind=pouch|box, ?full=1이면 영역 지정용 전체 그림."""
+    from flask import send_file
+    import io as _io
+    if _HOST_ONLY_LOCK or not str(item_id).isdigit():
+        return jsonify({'ok': False}), 404
+    kind = 'box' if request.args.get('kind') == 'box' else 'pouch'
+    full = request.args.get('full') == '1'
+    crop = None if full else _dtex_crop_get(item_id)
+    key = (item_id, kind, full, json.dumps(crop, sort_keys=True) if crop else '')
+    hit = _DTEX['img'].get(key)
+    if not hit or time.time() - hit[0] > 3600:
+        try:
+            aid, im = _dtex_source(item_id)
+        except Exception as e:
+            return jsonify({'ok': False, 'error': str(e)[:200]}), 502
+        if im is None:
+            return jsonify({'ok': False, 'error': '시안 그림 없음'}), 404
+        if not full:
+            b = (crop['x0'], crop['y0'], crop['x1'], crop['y1']) if crop and crop.get('asset') == aid else _dtex_auto_box(im, kind)
+            W, H = im.size
+            im = im.crop((int(b[0] * W), int(b[1] * H), max(int(b[0] * W) + 2, int(b[2] * W)), max(int(b[1] * H) + 2, int(b[3] * H))))
+        im.thumbnail((1024 if not full else 1600, 1024 if not full else 1600))
+        buf = _io.BytesIO()
+        im.save(buf, 'JPEG', quality=82)
+        hit = (time.time(), buf.getvalue())
+        _DTEX['img'][key] = hit
+        if len(_DTEX['img']) > 200:
+            _DTEX['img'].clear()
+    r = send_file(_io.BytesIO(hit[1]), mimetype='image/jpeg', max_age=600)
+    return r
+
+
+@app.route('/api/design_tex_crop/<item_id>', methods=['GET', 'POST'])
+def api_design_tex_crop(item_id):
+    """앞면 영역 지정 — GET {crop, auto} / POST {x0,y0,x1,y1} 저장 · {reset: true} 자동으로 되돌림."""
+    if _HOST_ONLY_LOCK or not str(item_id).isdigit():
+        return jsonify({'ok': False}), 404
+    kind = 'box' if request.args.get('kind') == 'box' else 'pouch'
+    if request.method == 'POST':
+        d = request.get_json(silent=True) or {}
+        ref = FIRESTORE_DB.collection('design_tex_crop').document(str(item_id))
+        if d.get('reset'):
+            ref.delete()
+        else:
+            try:
+                b = [max(0.0, min(1.0, float(d[k]))) for k in ('x0', 'y0', 'x1', 'y1')]
+            except (KeyError, TypeError, ValueError):
+                return jsonify({'ok': False, 'error': '영역 값이 올바르지 않습니다'}), 400
+            if b[2] - b[0] < 0.02 or b[3] - b[1] < 0.02:
+                return jsonify({'ok': False, 'error': '영역이 너무 작습니다'}), 400
+            aid, _im = _dtex_source(item_id)
+            ref.set({'x0': b[0], 'y0': b[1], 'x1': b[2], 'y1': b[3], 'asset': aid, 'at': datetime.now().strftime('%Y-%m-%d %H:%M')})
+        for k in [k for k in _DTEX['img'] if k[0] == item_id]:
+            _DTEX['img'].pop(k, None)
+        return jsonify({'ok': True})
+    crop = _dtex_crop_get(item_id)
+    try:
+        aid, im = _dtex_source(item_id)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 502
+    if im is None:
+        return jsonify({'ok': False, 'error': '시안 그림 없음'})
+    auto = _dtex_auto_box(im, kind)
+    return jsonify({'ok': True, 'crop': crop if crop and crop.get('asset') == aid else None,
+                    'auto': {'x0': auto[0], 'y0': auto[1], 'x1': auto[2], 'y1': auto[3]}})
+
+
 @app.route('/api/design_check_summary', methods=['GET'])
 def api_design_check_summary():
     """점검한 시안 요약 {item_id: [{asset_id, file, error, warn, applicable, at}]} — 규격 목록 시안 아이콘 옆 점 (60초 캐시)."""
@@ -15875,6 +16050,8 @@ def _ipsu_specs_list():
             'price': price,                            # 단가(원) — 포장재비 계산용 (아마란스 기준)
             'price_src': ama['label'] if ama else '',  # 단가 출처 — 포장재비 줄에 마우스 올리면 보임
             'dim': dim,                                # None이면 수동 입력 필요
+            'item_id': str(r.get('아이템ID', '')).strip(),           # 시안 입히기(2026-11-23)용 Monday 아이템
+            'design': 1 if 'http' in str(r.get('시안', '') or '') else 0,
         })
     specs.sort(key=lambda x: x['code'])
     return specs
@@ -17900,6 +18077,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   .dck-foot { margin-top: 12px; padding-top: 8px; border-top: 1px dashed #e5e7eb; font-size: 11px; color: #94a3b8; line-height: 1.5; }
   /* 규격 목록 시안 아이콘 옆 점검 결과 점 */
   .sc-dck { position: absolute; bottom: -4px; right: -4px; width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid #fff; }   /* 위 오른쪽은 시안 수 배지 자리 */
+  .ipsu-dsg-btn { margin-left: 6px; font-size: 10.5px; font-weight: 700; padding: 1px 7px; border-radius: 6px; border: 1px solid #ddd6fe;
+                  background: #f5f3ff; color: #5b21b6; cursor: pointer; vertical-align: 1px; }
+  .ipsu-dsg-btn:hover { background: #ede9fe; }
   /* 규격 목록 '점검' 칸 (2026-11-20, 옛 단가 칸 자리) */
   .spec-row .sc-chk { display: flex; justify-content: center; }
   .sc-chk .ck { display: inline-flex; gap: 3px; align-items: center; font-size: 10.5px; font-weight: 800; padding: 2px 7px; border-radius: 7px;
@@ -26636,7 +26816,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   }
   // ═══════════════ 입수 테스트 (3D) ═══════════════
   let _ipsuSpecs = [], _ipsuBoxes = [], _ipsuV1 = null, _ipsuV2 = null,
-      _ipsuSelA = null, _ipsuSelB = null, _ipsuV3 = null, _ipsuThinMul = 1,
+      _ipsuSelA = null, _ipsuSelB = null, _ipsuSelO = null, _ipsuV3 = null, _ipsuThinMul = 1,
       _ipsuProducts = [], _ipsuOuters = [], _ipsuSelP = null;
   // 적재율/여백 배지 문자열
   function ipsuStats(lay, cont, count) {
@@ -26812,7 +26992,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       document.getElementById(none ? 'ipsu-n2' : 'ipsu-n1').value = s.ipsu;
     }
     document.getElementById('ipsu-' + who + '-sel').innerHTML =
-      `<b>${escapeHtml(s.code)}</b> ${escapeHtml(s.size)}${s.tier ? ' · ' + s.tier : ''}${s.ipsu ? ' · ' + s.ipsu + '입' : ''}`;
+      `<b>${escapeHtml(s.code)}</b> ${escapeHtml(s.size)}${s.tier ? ' · ' + s.tier : ''}${s.ipsu ? ' · ' + s.ipsu + '입' : ''}` + ipsuDsgBtn(who, s);
     document.getElementById('ipsu-' + who + '-q').value = s.code + ' ' + s.name.slice(0, 20);
     _ipsuPicked[who] = true;
     if (who === 'a') {   // 1차 파우치 규격명의 내용물 중량·제품군 → 중량 기준 입수 예상 (2026-11-05)
@@ -26832,7 +27012,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     document.getElementById('ipsu-o-q').value = s.code + ' ' + s.name.slice(0, 16);
     document.getElementById('ipsu-o-sel').innerHTML =
       `<b>${escapeHtml(s.code)}</b> ${escapeHtml(s.size)}`;
-    _ipsuPicked.o = true;
+    _ipsuPicked.o = true; _ipsuSelO = s;
+    document.getElementById('ipsu-o-sel').innerHTML += ipsuDsgBtn('o', s);
     ipsuSyncOuter();
   }
   // ⓪ 완제품 — BOM 전개 결과로 ①②③ 일괄 적용
@@ -27596,6 +27777,12 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
           m2 = new THREE.MeshPhysicalMaterial({ map: tex, color: 0xbb8a6e, roughness: 0.66, metalness: 0,
             clearcoat: 0.3, clearcoatRoughness: 0.42, side: THREE.DoubleSide });
         }
+        // 시안 입히기 (2026-11-23) — 고른 품번의 시안 앞면 그림이 있으면 기본 색 대신
+        if (opt.tex) {
+          if (isBox) m1 = m2 = new THREE.MeshStandardMaterial({ map: opt.tex, color: 0xffffff, roughness: 0.7, metalness: 0 });
+          else m1 = m2 = new THREE.MeshPhysicalMaterial({ map: opt.tex, color: 0xffffff, roughness: 0.62, metalness: 0,
+            clearcoat: 0.3, clearcoatRoughness: 0.42, side: THREE.DoubleSide });
+        }
         const edgeG = {};
         for (const it of lay.items) {
           const gk = it.gk || (it.flip ? 'f' : 'n');
@@ -27940,7 +28127,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const useH = layers * bh;
     _ipsuV3.render({ W: area.W, H: Math.max(area.H, useH), D: area.D },
       { items, geoms, geom: geoms.n, isBox: true, outer: true }, null, 150,   // 팔레트 위는 외박스(크래프트)
-      { loadH: useH, limitH: P.H, legend: [{ c: IPSU_SW.kraft, t: '외박스' }, { c: IPSU_SW.olive, t: '팔레트' }, { k: 'limit', t: '최대 적재높이' }] });
+      { loadH: useH, limitH: P.H, tex: ipsuDsgTex(_ipsuSelO, 'box'), legend: [{ c: IPSU_SW.kraft, t: '외박스' }, { c: IPSU_SW.olive, t: '팔레트' }, { k: 'limit', t: '최대 적재높이' }] });
 
     document.getElementById('ipsu-s3cnt').textContent = total;
     const mix = blocks.length > 1
@@ -27989,6 +28176,92 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     document.getElementById('ipsu-g2').style.display = grid ? 'contents' : 'none';
     document.getElementById('ipsu-c2').style.display = grid ? 'none' : 'contents';
     ipsuCalc();
+  }
+  // ───── 시안 입히기 (2026-11-23, 사용자 "각 품번에 맞는 디자인 시안이 자세하진 않아도 입혀서") ─────
+  // 서버가 시안 전개도에서 앞면만 잘라 줌(/api/design_tex) → 파우치는 둘레 텍스처의 앞(u 0.25)·뒤(u 0.75)에, 상자는 면마다 그대로
+  const _ipsuDT = {};
+  let _ipsuDtVer = 0;
+  function ipsuDsgTex(sel, kind) {
+    if (!sel || !sel.item_id || !sel.design || typeof THREE === 'undefined') return null;
+    const key = sel.item_id + ':' + kind + ':' + _ipsuDtVer;
+    if (_ipsuDT[key]) return _ipsuDT[key].tex;
+    _ipsuDT[key] = { tex: null };
+    const img = new Image();
+    img.onload = () => {
+      let tex;
+      if (kind === 'pouch') {
+        const CW = 1024, CH = 512, cv = document.createElement('canvas'); cv.width = CW; cv.height = CH;
+        const cx = cv.getContext('2d');
+        // 옆면·밑면은 시안 테두리 평균 색으로
+        let fill = '#e9e4dc';
+        try {
+          const t = document.createElement('canvas'); t.width = 16; t.height = 16;
+          const tc = t.getContext('2d'); tc.drawImage(img, 0, 0, 16, 16);
+          const d = tc.getImageData(0, 0, 16, 16).data; let r = 0, g = 0, b = 0, n = 0;
+          for (let i = 0; i < d.length; i += 4) { const x = (i / 4) % 16, y = Math.floor(i / 64); if (x === 0 || x === 15 || y === 0 || y === 15) { r += d[i]; g += d[i + 1]; b += d[i + 2]; n++; } }
+          fill = 'rgb(' + Math.round(r / n) + ',' + Math.round(g / n) + ',' + Math.round(b / n) + ')';
+        } catch (e) {}
+        cx.fillStyle = fill; cx.fillRect(0, 0, CW, CH);
+        const draw = uc => { cx.save(); cx.translate(CW * uc, 0); cx.scale(-1, 1); cx.drawImage(img, -CW * 0.125, 0, CW * 0.25, CH); cx.restore(); };
+        draw(0.25); draw(0.75);   // 앞·뒤 (텍스처 u가 화면 왼쪽으로 진행 → 좌우반전해야 바로 읽힘)
+        tex = new THREE.CanvasTexture(cv);
+      } else {
+        tex = new THREE.Texture(img); tex.needsUpdate = true;
+      }
+      tex.encoding = THREE.sRGBEncoding; tex.anisotropy = 4;
+      _ipsuDT[key].tex = tex;
+      if (typeof ipsuCalc === 'function') ipsuCalc();
+    };
+    img.src = '/api/design_tex/' + sel.item_id + '?kind=' + kind + '&v=' + _ipsuDtVer;
+    return null;
+  }
+  function ipsuDsgKind(who, s) { return who === 'a' ? 'pouch' : (who === 'o' || (s && s.dim && s.dim.form === '상자') ? 'box' : 'pouch'); }
+  function ipsuDsgBtn(who, s) {
+    if (!s || !s.item_id || !s.design) return '';
+    return ' <button type="button" class="ipsu-dsg-btn" onclick="ipsuDsgCrop(&quot;' + who + '&quot;)" title="3D에 입힐 시안 앞면 영역 지정 (자동으로 잡은 영역이 틀렸을 때)">🎨 시안 영역</button>';
+  }
+  // 앞면 영역 지정 창 — 시안 전체 그림 위에서 끌어서 사각형을 그림
+  async function ipsuDsgCrop(who) {
+    const s = who === 'a' ? _ipsuSelA : (who === 'b' ? _ipsuSelB : _ipsuSelO); if (!s) return;
+    const kind = ipsuDsgKind(who, s);
+    let info = null;
+    try { info = await (await fetch('/api/design_tex_crop/' + s.item_id + '?kind=' + kind)).json(); } catch (e) {}
+    if (!info || !info.ok) { alert('시안 그림을 불러오지 못했습니다' + (info && info.error ? ': ' + info.error : '')); return; }
+    let box = Object.assign({}, info.crop || info.auto);
+    const ov = document.createElement('div');
+    ov.style.cssText = 'position:fixed;inset:0;background:rgba(15,23,42,.6);z-index:300;display:flex;align-items:center;justify-content:center;padding:16px';
+    ov.innerHTML = '<div style="background:#fff;border-radius:12px;padding:14px;max-width:min(1100px,96vw);max-height:94vh;display:flex;flex-direction:column;gap:8px">'
+      + '<div style="font-weight:800">🎨 ' + escapeHtml(s.code) + ' 시안 앞면 영역 <span style="font-weight:500;color:#64748b;font-size:12px">— 그림 위를 끌어서 3D에 입힐 부분(상품 앞면)을 고르세요' + (info.crop ? ' · 지정한 영역' : ' · 자동으로 잡은 영역') + '</span></div>'
+      + '<div id="dsgc-wrap" style="position:relative;overflow:auto;cursor:crosshair;user-select:none"><img id="dsgc-img" draggable="false" style="display:block;max-width:100%;max-height:74vh">'
+      + '<div id="dsgc-box" style="position:absolute;border:2px solid #7c3aed;background:rgba(124,58,237,.12);pointer-events:none"></div></div>'
+      + '<div style="display:flex;gap:8px;justify-content:flex-end"><button type="button" class="dck-go ghost" id="dsgc-auto">자동으로 되돌리기</button>'
+      + '<button type="button" class="dck-go ghost" id="dsgc-x">닫기</button><button type="button" class="dck-go" id="dsgc-save">이 영역 저장</button></div></div>';
+    document.body.appendChild(ov);
+    const img = ov.querySelector('#dsgc-img'), bx = ov.querySelector('#dsgc-box'), wrap = ov.querySelector('#dsgc-wrap');
+    const paint = () => { bx.style.left = (box.x0 * img.clientWidth) + 'px'; bx.style.top = (box.y0 * img.clientHeight) + 'px';
+      bx.style.width = ((box.x1 - box.x0) * img.clientWidth) + 'px'; bx.style.height = ((box.y1 - box.y0) * img.clientHeight) + 'px'; };
+    img.onload = paint;
+    img.src = '/api/design_tex/' + s.item_id + '?full=1';
+    let st = null;
+    const pos = e => { const r = img.getBoundingClientRect(); return [Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)), Math.max(0, Math.min(1, (e.clientY - r.top) / r.height))]; };
+    wrap.addEventListener('mousedown', e => { st = pos(e); e.preventDefault(); });
+    window.addEventListener('mousemove', function mv(e) {
+      if (!document.body.contains(ov)) { window.removeEventListener('mousemove', mv); return; }
+      if (!st) return; const p = pos(e);
+      box = { x0: Math.min(st[0], p[0]), y0: Math.min(st[1], p[1]), x1: Math.max(st[0], p[0]), y1: Math.max(st[1], p[1]) }; paint();
+    });
+    window.addEventListener('mouseup', () => { st = null; }, { once: false });
+    const done = () => { ov.remove(); _ipsuDtVer++; if (typeof ipsuCalc === 'function') ipsuCalc(); };
+    ov.querySelector('#dsgc-x').onclick = () => ov.remove();
+    ov.querySelector('#dsgc-auto').onclick = async () => {
+      await fetch('/api/design_tex_crop/' + s.item_id, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reset: true }) });
+      done();
+    };
+    ov.querySelector('#dsgc-save').onclick = async () => {
+      const r = await (await fetch('/api/design_tex_crop/' + s.item_id, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(box) })).json();
+      if (!r.ok) { alert(r.error || '저장 실패'); return; }
+      done();
+    };
   }
   function ipsuIsGrid() { return document.getElementById('ipsu-mode').value === 'grid'; }
   // ③ 입력 → ⑤ 팔레트용 외치수에 그대로 반영
@@ -28246,7 +28519,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       }
       ipsuShowEst(estInfo);
       const compTagD = compD > 0 ? ` · 눌림 ${Math.round(compD * 100)}%` + (compD > comp ? '(자동)' : '') : '';
-      _ipsuV2.render(C, layD, null, 0, { wall: IPSU_WALL,
+      _ipsuV2.render(C, layD, null, 0, { wall: IPSU_WALL, tex: ipsuDsgTex(_ipsuSelA, 'pouch'),
         legend: [{ c: IPSU_SW.amber, t: '1차파우치' }, { c: IPSU_SW.kraft, t: '외박스' }] });
       document.getElementById('ipsu-s2cnt').textContent = n2v;
       ipsuBadge('ipsu-s2badge', layD.label + tag + compTagD + ipsuStats(layD, C, n2v));
@@ -28338,10 +28611,10 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       }
     }
 
-    _ipsuV1.render(Binner, lay1, Bshell, 0, { legend: Bshell
+    _ipsuV1.render(Binner, lay1, Bshell, 0, { tex: ipsuDsgTex(_ipsuSelA, 'pouch'), legend: Bshell
       ? [{ c: IPSU_SW.amber, t: '1차파우치' }, { k: 'film', t: '2차파우치(투명)' }]
       : [{ c: IPSU_SW.amber, t: '1차파우치' }, { k: 'board', t: '단상자 내부' }] });
-    _ipsuV2.render(C, lay2, null, 0, { wall: IPSU_WALL,
+    _ipsuV2.render(C, lay2, null, 0, { wall: IPSU_WALL, tex: ipsuDsgTex(_ipsuSelB, bForm === '단상자' ? 'box' : 'pouch'),
       legend: [{ c: IPSU_SW.amber, t: bForm === '단상자' ? '단상자' : '2차파우치' }, { c: IPSU_SW.kraft, t: '외박스' }] });
     const c1 = n1v, c2 = n2v;
     document.getElementById('ipsu-s1cnt').textContent = c1;
