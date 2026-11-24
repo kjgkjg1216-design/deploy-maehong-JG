@@ -14004,6 +14004,26 @@ def api_channel_stock_detail():
     next_dl = (last_dl + pd.Timedelta(days=med_gap)).strftime('%Y-%m-%d') if (last_dl is not None and med_gap) else None
     sdate = pd.Timestamp(it['stock_date'])
     out_date = (sdate + pd.Timedelta(days=int(it['cover']))).strftime('%Y-%m-%d') if it['stock'] > 0 else it['stock_date']
+    # 우리 창고 위치별 재고 (2026-11-24 사용자 "3자물류센터 재고까지 같이 보여야 재고 있는지 알 수 있음") — 아마란스 현재고, 폐기·장기 창고는 납품 못 하는 재고로 따로
+    _al0 = _goods_aliases()
+    codes = {c for c in (it['code'], _al0.get(it['code'], it['code'])) if c}
+    wh, wh_ok, wh_in = [], 0.0, []
+    if codes and STOCK_DF is not None and not STOCK_DF.empty:
+        sd = STOCK_DF[STOCK_DF['품번'].astype(str).str.strip().str.upper().isin(codes)]
+        for (whn, lc), gg in sd.groupby(['창고명', '위치명']):
+            q = sum(_num(x) for x in gg['현재고'])
+            if q >= 0.5:
+                bad = any(k in str(lc) for k in ('폐기', '장기', '샘플'))
+                wh.append({'wh': whn, 'loc': lc, 'q': int(round(q)), 'ok': not bad})
+                if not bad:
+                    wh_ok += q
+        wh.sort(key=lambda x: (not x['ok'], -x['q']))
+    if codes and RCV_DF is not None and not RCV_DF.empty:
+        rr = RCV_DF[RCV_DF['품번'].astype(str).str.strip().str.upper().isin(codes)]
+        for _, x in rr.sort_values('입고일자').tail(3).iloc[::-1].iterrows():
+            wh_in.append({'date': str(x['입고일자']).replace('-', '')[:8], 'q': int(round(_num(x['입고수량']))), 'loc': str(x.get('입고장소', '') or ''), 'who': str(x.get('거래처명', '') or '')})
+    fac = float(g['f'].iloc[-1] or 1) if len(g) else 1.0
+    wh_sku = wh_ok / max(fac, 1.0)   # 채널 SKU 단위로
     # 최근 60일 + 앞으로 14일
     days = pd.date_range(end - pd.Timedelta(days=59), end + pd.Timedelta(days=14), freq='D')
     dq = g.groupby('_dt')['q'].sum()
@@ -14013,13 +14033,16 @@ def api_channel_stock_detail():
     for t in days:
         ds = t.strftime('%Y-%m-%d')
         fut = t > end
-        pj = None
+        pj = pa = None
         if t >= sdate and t <= end + pd.Timedelta(days=14):
             pj = max(0.0, it['stock'] - it['pos_d'] * (t - sdate).days)
+            if wh_sku > 0:
+                pa = max(0.0, it['stock'] + wh_sku - it['pos_d'] * (t - sdate).days)
         rows.append({'date': ds, 'd': t.strftime('%m/%d'), 'wd': '월화수목금토일'[t.dayofweek], 'future': bool(fut),
                      'dl': None if fut else int(round(float(dq.get(t, 0)))),
                      'pos': None if (fut or ds not in rep) else int(ps.get(ds, 0)),
-                     'stock': None if t not in sv.index else int(sv[t]), 'proj': None if pj is None else int(round(pj))})
+                     'stock': None if t not in sv.index else int(sv[t]), 'proj': None if pj is None else int(round(pj)),
+                     'proj_all': None if pa is None else int(round(pa))})
     pdays = sum(1 for t in rep if t > (end - pd.Timedelta(days=14)).strftime('%Y-%m-%d'))
     others = [{'name': x['channel_name'], 'sku': x['sku'], 'stock': x['stock'], 'pos_d': x['pos_d'], 'cover': x['cover'],
                'level': x['level'], 'stale': x['stale'], 'last_delivery': x['last_delivery']}
@@ -14028,7 +14051,7 @@ def api_channel_stock_detail():
     cc = _al.get(it['code'], it['code']) if it['code'] else ''
     sp = _call_json(api_supply_plan, '/api/supply_plan') if cc else {}
     p = next((x for x in sp.get('items', []) if x['code'] == cc), None)
-    return jsonify({'item': it, 'f': float(g['f'].iloc[-1] or 1) if len(g) else 1.0, 'days': rows, 'history': hist,
+    return jsonify({'item': it, 'f': fac, 'days': rows, 'history': hist, 'wh': wh, 'wh_ok': int(round(wh_ok)), 'wh_in': wh_in,
                     'med_gap': med_gap, 'avg_qty': avg_qty, 'next_dl': next_dl, 'out_date': out_date,
                     'since': int((end - last_dl).days) if last_dl is not None else None, 'pos_days14': pdays,
                     'others': others, 'supply': p, 'as_of': end.strftime('%Y-%m-%d')})
@@ -22439,9 +22462,11 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         { type: 'bar', label: '납품', data: r.map(x => x.dl), backgroundColor: '#64748b', borderRadius: 2, order: 3 },
         { type: 'line', label: '판매', data: r.map(x => x.pos), borderColor: '#16a34a', backgroundColor: '#16a34a', borderWidth: 1.5, pointRadius: 0, tension: 0.2, spanGaps: false, order: 2 },
         { type: 'line', label: '채널 재고', data: r.map(x => x.stock), yAxisID: 'y2', borderColor: '#f59e0b', backgroundColor: '#f59e0b', borderWidth: 2, pointRadius: 1.5, tension: 0.2, spanGaps: true, order: 1 },
-        { type: 'line', label: '예상 재고', data: r.map(x => x.proj), yAxisID: 'y2', borderColor: '#f59e0b', backgroundColor: '#fff', borderDash: [5, 4], borderWidth: 2, pointRadius: 0, order: 1 }],
-        { titles: r.map(x => x.date + '(' + x.wd + ')' + (x.future ? ' 예상' : '')), y2: '채널 재고',
-          note: '최근 60일 + 앞으로 14일 · 이 채널·SKU 단위 · 회색 막대: 납품 · 초록 선: 판매 · 주황 선: 채널 재고 · 점선: 지금 판매 속도(하루 ' + d.item.pos_d + '개)대로 줄어들 때' });
+        { type: 'line', label: '예상 재고', data: r.map(x => x.proj), yAxisID: 'y2', borderColor: '#f59e0b', backgroundColor: '#fff', borderDash: [5, 4], borderWidth: 2, pointRadius: 0, order: 1 }]
+        .concat(d.wh_ok > 0 ? [{ type: 'line', label: '우리 창고 포함', data: r.map(x => x.proj_all), yAxisID: 'y2', borderColor: '#2563eb', backgroundColor: '#fff', borderDash: [2, 3], borderWidth: 2, pointRadius: 0, order: 1 }] : []),
+        { titles: r.map(x => x.date + '(' + x.wd + ')' + (x.future ? ' 예상' : '')), y2: '재고',
+          note: '최근 60일 + 앞으로 14일 · 이 채널·SKU 단위 · 회색 막대: 납품 · 초록 선: 판매 · 주황 선: 채널 재고 · 주황 점선: 지금 판매 속도(하루 ' + d.item.pos_d + '개)대로 줄어들 때'
+            + (d.wh_ok > 0 ? ' · 파란 점선: 채널 재고 + 우리 창고(3자물류 등, 폐기·장기 제외) ' + fmtInt(d.wh_ok) + '개를 이 채널에 다 보낸다고 볼 때 (다른 채널과 나눠 쓰므로 실제로는 더 빨리 줄어듦)' : '') });
     }
   }
   // 수요 급변
@@ -22641,6 +22666,16 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       + _ld.kpi('평소 납품', d.med_gap ? d.med_gap + '일마다' : '-', d.med_gap ? fmtInt(d.avg_qty) + '개씩' : '')
       + _ld.kpi('우리 창고', s ? fmtInt(s.stock) : (x.ours != null ? fmtInt(x.ours) : '-'), s && s.cov_weeks != null ? s.cov_weeks + '주분' : '') + '</div>';
     h += _ld.chartBlock('채널 재고 · 판매 · 납품', '');
+    // 우리 창고 위치별 재고 (3자물류센터 등) — 채널 재고가 바닥이어도 납품할 물건이 어디 얼마나 있는지
+    if ((d.wh || []).length) {
+      const ymd = s => s && s.length === 8 ? s.slice(4, 6) + '/' + s.slice(6) : (s || '');
+      h += '<div class="npd-sec">우리 창고 재고 (아마란스 현재고) — 납품 가능 <b>' + fmtInt(d.wh_ok) + '개</b>' + (d.f > 1 ? ' <span style="font-weight:500;color:var(--text-3)">(낱개 · 이 SKU = 낱개 ' + d.f + '개)</span>' : '') + '</div>'
+        + '<table class="npd-tbl"><thead><tr><th>창고</th><th>위치</th><th>재고</th><th>비고</th></tr></thead><tbody>'
+        + d.wh.map(w => '<tr' + (w.ok ? '' : ' style="color:var(--text-3)"') + '><td>' + escapeHtml(w.wh) + '</td><td>' + escapeHtml(w.loc) + '</td><td><b>' + fmtInt(w.q) + '</b></td><td>'
+            + (w.ok ? (x.pos_d > 0 ? '이 채널 판매로 약 ' + Math.round(w.q / Math.max(d.f, 1) / x.pos_d) + '일분' : '') : '폐기·장기·샘플 — 납품 제외') + '</td></tr>').join('')
+        + '</tbody></table>'
+        + ((d.wh_in || []).length ? '<div class="npd-note" style="margin:4px 0 0">최근 입고: ' + d.wh_in.map(i => ymd(i.date) + ' ' + fmtInt(i.q) + '개 → ' + escapeHtml(i.loc) + (i.who ? ' (' + escapeHtml(i.who) + ')' : '')).join(' · ') + '</div>' : '');
+    }
     h += '<div class="npd-sec">납품 이력 (최근 180일, 최신순)</div><table class="npd-tbl"><thead><tr><th>납품일</th><th>수량</th><th>직전 납품과 간격</th></tr></thead><tbody>'
       + (d.history || []).slice().reverse().slice(0, 15).map(r => '<tr><td>' + escapeHtml(r.date) + '</td><td>' + fmtInt(r.qty) + '</td><td>' + (r.gap != null ? r.gap + '일' : '-') + '</td></tr>').join('')
       + (d.since != null ? '<tr class="part"><td>지금(' + md(d.as_of) + ')</td><td>-</td><td><b' + (late ? ' style="color:#dc2626"' : '') + '>' + d.since + '일째</b></td></tr>' : '')
