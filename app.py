@@ -17350,6 +17350,44 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>구매/외주 대시보드</title>
 <script>(function(){const f=window.fetch.bind(window);window.fetch=function(i,n){n=n||{};const h=new Headers(n.headers||{});if(!h.has('ngrok-skip-browser-warning'))h.set('ngrok-skip-browser-warning','true');n.headers=h;return f(i,n);};})();</script>
+<script>
+// 서버 준비 중 안내 + 자동 재시도 (2026-11-24 사용자) — 배포·재시작 직후 1~2분은 서버가 자료를 읽느라 응답이 비거나 502가 남.
+// 같은 주소의 GET 요청만, 502·503·504·연결 실패면 최대 3분 동안 2~5초 간격으로 다시 부름. 그동안 화면 위에 안내 띠.
+(function(){
+  const f = window.fetch.bind(window);
+  let bar = null, waiting = 0;
+  function show() {
+    if (!document.body) return;
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.style.cssText = 'position:fixed;top:10px;left:50%;transform:translateX(-50%);z-index:10000;background:#1e293b;color:#fff;padding:9px 16px;border-radius:10px;font-size:13px;font-weight:700;box-shadow:0 6px 20px rgba(0,0,0,.25)';
+      bar.textContent = '⏳ 서버 준비 중… (재시작 직후 1~2분) 자동으로 다시 불러옵니다';
+    }
+    if (!bar.isConnected) document.body.appendChild(bar);
+  }
+  // 응답이 하나라도 정상으로 오면 서버가 살아난 것 → 바로 띠를 내림 (느린 요청이 남아 있어도)
+  function done(ok) { waiting = ok ? 0 : Math.max(0, waiting - 1); if (!waiting && bar) bar.remove(); }
+  window.fetch = async function(i, n) {
+    const url = typeof i === 'string' ? i : ((i && i.url) || '');
+    const m = String((n && n.method) || (i && i.method) || 'GET').toUpperCase();
+    if (m !== 'GET' || !(url.startsWith('/') || url.startsWith(location.origin))) return f(i, n);
+    const t0 = Date.now();
+    for (let k = 0; ; k++) {
+      let r = null, err = null;
+      try { r = await f(i, n); } catch (e) { if (e && e.name === 'AbortError') { if (k) done(); throw e; } err = e; }
+      const bad = err || r.status === 502 || r.status === 503 || r.status === 504;
+      if (!bad || Date.now() - t0 > 180000) {
+        if (!bad) done(true); else if (k) done();
+        if (err) throw err;
+        return r;
+      }
+      if (k === 0) waiting++;
+      show();
+      await new Promise(s => setTimeout(s, Math.min(2000 + k * 1000, 5000)));
+    }
+  };
+})();
+</script>
 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet">
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
