@@ -28224,23 +28224,31 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   async function ipsuDsgCrop(who) {
     const s = who === 'a' ? _ipsuSelA : (who === 'b' ? _ipsuSelB : _ipsuSelO); if (!s) return;
     const kind = ipsuDsgKind(who, s);
-    let info = null;
-    try { info = await (await fetch('/api/design_tex_crop/' + s.item_id + '?kind=' + kind)).json(); } catch (e) {}
-    if (!info || !info.ok) { alert('시안 그림을 불러오지 못했습니다' + (info && info.error ? ': ' + info.error : '')); return; }
-    let box = Object.assign({}, info.crop || info.auto);
+    // 누르자마자 창부터 띄움 (서버가 느릴 때 안 눌린 것처럼 보이던 문제, 2026-11-24)
     const ov = document.createElement('div');
     ov.style.cssText = 'position:fixed;inset:0;background:rgba(15,23,42,.6);z-index:300;display:flex;align-items:center;justify-content:center;padding:16px';
+    ov.innerHTML = '<div style="background:#fff;border-radius:12px;padding:18px 22px;font-weight:700;color:#475569">🎨 ' + escapeHtml(s.code) + ' 시안 불러오는 중…</div>';
+    document.body.appendChild(ov);
+    let info = null;
+    try { info = await (await fetch('/api/design_tex_crop/' + s.item_id + '?kind=' + kind)).json(); } catch (e) {}
+    if (!document.body.contains(ov)) return;
+    if (!info || !info.ok) {
+      ov.firstChild.innerHTML = '시안 그림을 불러오지 못했습니다' + (info && info.error ? ': ' + escapeHtml(info.error) : ' (서버 응답 없음)') + ' <button type="button" class="dck-go ghost" style="margin-left:10px">닫기</button>';
+      ov.querySelector('button').onclick = () => ov.remove();
+      return;
+    }
+    let box = Object.assign({}, info.crop || info.auto);
     ov.innerHTML = '<div style="background:#fff;border-radius:12px;padding:14px;max-width:min(1100px,96vw);max-height:94vh;display:flex;flex-direction:column;gap:8px">'
       + '<div style="font-weight:800">🎨 ' + escapeHtml(s.code) + ' 시안 앞면 영역 <span style="font-weight:500;color:#64748b;font-size:12px">— 그림 위를 끌어서 3D에 입힐 부분(상품 앞면)을 고르세요' + (info.crop ? ' · 지정한 영역' : ' · 자동으로 잡은 영역') + '</span></div>'
       + '<div id="dsgc-wrap" style="position:relative;overflow:auto;cursor:crosshair;user-select:none"><img id="dsgc-img" draggable="false" style="display:block;max-width:100%;max-height:74vh">'
       + '<div id="dsgc-box" style="position:absolute;border:2px solid #7c3aed;background:rgba(124,58,237,.12);pointer-events:none"></div></div>'
       + '<div style="display:flex;gap:8px;justify-content:flex-end"><button type="button" class="dck-go ghost" id="dsgc-auto">자동으로 되돌리기</button>'
       + '<button type="button" class="dck-go ghost" id="dsgc-x">닫기</button><button type="button" class="dck-go" id="dsgc-save">이 영역 저장</button></div></div>';
-    document.body.appendChild(ov);
     const img = ov.querySelector('#dsgc-img'), bx = ov.querySelector('#dsgc-box'), wrap = ov.querySelector('#dsgc-wrap');
     const paint = () => { bx.style.left = (box.x0 * img.clientWidth) + 'px'; bx.style.top = (box.y0 * img.clientHeight) + 'px';
       bx.style.width = ((box.x1 - box.x0) * img.clientWidth) + 'px'; bx.style.height = ((box.y1 - box.y0) * img.clientHeight) + 'px'; };
     img.onload = paint;
+    img.onerror = () => { wrap.insertAdjacentHTML('afterbegin', '<div style="padding:20px;color:#b91c1c">시안 그림을 불러오지 못했습니다</div>'); };
     img.src = '/api/design_tex/' + s.item_id + '?full=1';
     let st = null;
     const pos = e => { const r = img.getBoundingClientRect(); return [Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)), Math.max(0, Math.min(1, (e.clientY - r.top) / r.height))]; };
