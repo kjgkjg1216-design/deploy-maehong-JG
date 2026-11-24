@@ -23714,11 +23714,27 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const tx = p.tx || [], KC = { '입고': '#0f766e', '이동 들어옴': '#0369a1', '이동 나감': '#b45309', '외주 출하': '#4f46e5' };
     const dd = s => s.length === 8 ? s.slice(4, 6) + '/' + s.slice(6) : s;
     if (tx.length) {
-      let run = w.e_open || 0;
-      h += '<div style="margin-top:10px;font-weight:800;font-size:12.5px">아마란스 건별 내역 <span style="font-weight:500;color:#64748b">(' + tx.length + '건 · ' + escapeHtml(p.loc || '') + ' 위치 · 올해)</span></div>'
-        + '<div style="max-height:280px;overflow:auto;margin-top:4px"><table class="npd-tbl"><thead><tr><th>날짜</th><th>구분</th><th>수량</th><th>누계 재고</th><th>상대 · 생산 제품</th><th>번호</th></tr></thead><tbody>'
-        + tx.map(t => { run += t.q; return '<tr><td>' + dd(t.d) + '</td><td style="color:' + (KC[t.k] || '#334155') + ';font-weight:700">' + t.k + '</td><td style="font-weight:700">' + _scSg(t.q) + '</td><td>' + f(run) + '</td><td>' + escapeHtml(t.who || '') + '</td><td style="color:#94a3b8">' + escapeHtml(t.no || '') + '</td></tr>'; }).join('')
-        + '</tbody></table></div>';
+      // 가독성 (2026-11-24 사용자 "너무 나열돼 보기 불편"): 같은 날·같은 번호는 한 줄로 합치고, 달별로 접어서 달 머리에 입고·출고 합계와 월말 재고만
+      const mg = [];
+      tx.forEach(t => { const l = mg[mg.length - 1]; if (l && l.d === t.d && l.k === t.k && l.no === t.no && l.who === t.who) { l.q += t.q; l.n++; } else mg.push(Object.assign({ n: 1 }, t)); });
+      const byM = []; let run = w.e_open || 0;
+      mg.forEach(t => { run += t.q; t.run = run; const ym = t.d.slice(0, 6); let m = byM[byM.length - 1]; if (!m || m.ym !== ym) byM.push(m = { ym, rows: [], inq: 0, outq: 0 }); m.rows.push(t); if (t.q > 0) m.inq += t.q; else m.outq -= t.q; m.end = run; });
+      const short = s => { s = s || ''; return s.length > 22 ? s.slice(0, 21) + '…' : s; };
+      const tag = k => '<span style="display:inline-block;min-width:58px;text-align:center;padding:1px 6px;border-radius:6px;font-size:11px;font-weight:700;color:' + (KC[k] || '#334155') + ';background:' + (KC[k] || '#334155') + '14">' + k + '</span>';
+      h += '<div style="margin-top:12px;font-weight:800;font-size:12.5px">아마란스 건별 내역 <span style="font-weight:500;color:#64748b">(' + mg.length + '건 · ' + escapeHtml(p.loc || '') + ' 위치 · 올해 · 달을 누르면 펼침)</span></div>'
+        + '<div style="max-width:720px;margin-top:6px;border:1px solid #e2e8f0;border-radius:10px;overflow:hidden">'
+        + byM.map((m, i) => '<details' + (i === byM.length - 1 ? ' open' : '') + ' style="border-top:' + (i ? '1px solid #f1f5f9' : '0') + '">'
+          + '<summary style="cursor:pointer;display:grid;grid-template-columns:56px 1fr 1fr 1fr 40px;gap:8px;align-items:center;padding:7px 12px;font-size:12px;background:#f8fafc">'
+          + '<b>' + mm(m.ym) + '</b>'
+          + '<span style="color:#0f766e">입고 <b>' + (m.inq ? '+' + f(m.inq) : '-') + '</b></span>'
+          + '<span style="color:#4f46e5">출고 <b>' + (m.outq ? '−' + f(m.outq) : '-') + '</b></span>'
+          + '<span style="color:#334155">월말 <b>' + f(m.end) + '</b></span>'
+          + '<span style="color:#94a3b8;text-align:right">' + m.rows.length + '건</span></summary>'
+          + '<div style="padding:2px 12px 8px">' + m.rows.map(t => '<div style="display:grid;grid-template-columns:44px 72px 84px 1fr;gap:8px;align-items:center;padding:4px 0;font-size:12px;border-bottom:1px dashed #f1f5f9" title="' + escapeHtml((t.who || '') + ' · ' + (t.no || '') + (t.n > 1 ? ' · ' + t.n + '줄 합침' : '') + ' · 누계 ' + f(t.run)) + '">'
+            + '<span style="color:#64748b">' + dd(t.d) + '</span>' + tag(t.k)
+            + '<b style="text-align:right;color:' + (t.q > 0 ? '#0f766e' : '#334155') + '">' + _scSg(t.q) + '</b>'
+            + '<span style="color:#475569;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + escapeHtml(short(t.who)) + '</span></div>').join('') + '</div></details>').join('')
+        + '</div>';
     } else if (p.loc) {
       h += '<div class="npd-note" style="margin-top:8px">아마란스 건별 기록(입고·창고 이동·외주 출하)이 올해 없어요.</div>';
     }
@@ -23727,7 +23743,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       h += '<div class="sc-exp-h" style="margin-top:8px;background:#fffbeb">⚠ 건별 자료 없는 양 — 입고 <b>' + _scSg(rs.in || 0) + '</b> · 출고 <b>' + _scSg(rs.out || 0) + '</b> (아마란스 현재고 누계와 건별 합의 차이). 받아오는 자료에 없는 <b>창고 간 재고 이동·재고 조정</b>일 가능성이 커요.'
         + ((p.others || []).length ? '<br>같은 품번 다른 위치: ' + p.others.map(o => '<b>' + escapeHtml(o.loc) + '</b> 입고 ' + f(o.in) + ' · 출고 ' + f(o.out) + ' · 현재 ' + f(o.cur)).join(' / ') + ' — 숫자가 비슷하면 그 위치와 이동한 것' : '') + '</div>';
     }
-    h += '<div class="npd-note" style="margin:6px 0 0">⚠ = 전월 말과 다른 기초 · 회색 줄 = 재고 파일에 없는 달 · 초록/보라 = 재고 파일 입고/사용과 다른 달 · 아마란스 입고 = 입고 + 이동 들어옴, 출고 = 외주 출하(생산 사용) + 이동 나감 · 누계 재고는 1월 기초에서 건별로 더한 값(건별 자료 없는 양은 빠짐)</div></div>';
+    h += '<div class="npd-note" style="margin:6px 0 0">⚠ = 전월 말과 다른 기초 · 회색 줄 = 재고 파일에 없는 달 · 초록/보라 = 재고 파일 입고/사용과 다른 달 · 아마란스 입고 = 입고 + 이동 들어옴, 출고 = 외주 출하(생산 사용) + 이동 나감 · 건별 내역의 월말 = 1월 기초에서 건별로 더한 값(건별 자료 없는 양은 빠짐) · 줄에 마우스를 올리면 상대·번호</div></div>';
     return h;
   }
   function renderStockCompare() {
