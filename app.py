@@ -13187,6 +13187,20 @@ def api_stock_compare_detail():
     while ym <= cur:
         yms.append(ym)
         ym = _ym_shift(ym, 1)
+    year = yms[0][:4]
+    # 아마란스 건별 (2026-11-24 사용자 "차이 원인 상세 내역") — 입고정보(입고장소) · 출고정보(창고 이동 from/to 위치) · 출하정보(외주처로 자재 출하 = 외주 생산 사용)
+    # 재고이동·재고조정은 받아오는 자료에 없어서 현재고 입고량/출고량과의 차이는 '건별 자료 없음'으로 따로 보여 줌
+    def _rows(df, cond_col, date_col):
+        if df is None or df.empty or cond_col not in df.columns or date_col not in df.columns:
+            return None
+        d = df[df['품번'].astype(str).str.strip().str.upper() == code]
+        return d[d[date_col].astype(str).str.replace('-', '').str[:4] == year]
+    rcv = _rows(RCV_DF, '입고장소', '입고일자')
+    iss = _rows(ISSUE_DF, 'tlcNm', '출고일자')
+    shp = _rows(SHIP_DF, '로케이션', '출하일자')
+    st_all = STOCK_DF[STOCK_DF['품번'].astype(str).str.strip().str.upper() == code] if STOCK_DF is not None and not STOCK_DF.empty else None
+    g = lambda r, k: str(r.get(k, '') or '').strip()
+    dt = lambda v: str(v).replace('-', '')[:8]
     parts = []
     for V in lst['vendors']:
         if only and V['vendor'] != only:
@@ -13194,17 +13208,48 @@ def api_stock_compare_detail():
         r = next((x for x in V['rows'] if x['code'] == code), None)
         if not r or not r.get('w'):
             continue
-        erp_in = {}
-        if V['loc'] and RCV_DF is not None and not RCV_DF.empty and '입고장소' in RCV_DF.columns:
-            s = RCV_DF[(RCV_DF['품번'].astype(str).str.strip().str.upper() == code) & (RCV_DF['입고장소'].astype(str).str.strip() == V['loc'])]
-            for d, q in zip(s['입고일자'].astype(str).str.replace('-', '').str[:6], s['입고수량']):
-                erp_in[d] = erp_in.get(d, 0.0) + _num(q)
+        loc = V['loc']
+        tx = []
+        if loc:
+            if rcv is not None:
+                for _, x in rcv[rcv['입고장소'].astype(str).str.strip() == loc].iterrows():
+                    tx.append({'d': dt(x['입고일자']), 'k': '입고', 'q': _num(x['입고수량']), 'who': g(x, '거래처명'), 'no': g(x, '입고번호')})
+            if iss is not None:
+                for _, x in iss[iss['tlcNm'].astype(str).str.strip() == loc].iterrows():
+                    tx.append({'d': dt(x['출고일자']), 'k': '이동 들어옴', 'q': _num(x['출고수량']), 'who': (g(x, '출고창고') + ' ' + g(x, 'flcNm')).strip(), 'no': g(x, '출고번호')})
+                for _, x in iss[iss['flcNm'].astype(str).str.strip() == loc].iterrows():
+                    tx.append({'d': dt(x['출고일자']), 'k': '이동 나감', 'q': -_num(x['출고수량']), 'who': (g(x, '입고창고') + ' ' + g(x, 'tlcNm')).strip(), 'no': g(x, '출고번호')})
+            if shp is not None:
+                for _, x in shp[shp['로케이션'].astype(str).str.strip() == loc].iterrows():
+                    tx.append({'d': dt(x['출하일자']), 'k': '외주 출하', 'q': -_num(x['출하수량']), 'who': g(x, '모품명') or g(x, '거래처명'), 'no': g(x, '출하번호')})
+        tx = [t for t in tx if abs(t['q']) >= 0.001]
+        tx.sort(key=lambda t: (t['d'], t['k']))
+        w = r['w']
+        t_in = sum(t['q'] for t in tx if t['q'] > 0)
+        t_out = -sum(t['q'] for t in tx if t['q'] < 0)
+        rest = {'in': round(w.get('e_in', 0) - t_in, 1), 'out': round(w.get('e_out', 0) - t_out, 1)}
+        # 같은 품번 다른 위치 입고·출고 — 건별 자료 없는 양이 창고 이동인지 짐작용
+        others = []
+        if loc and st_all is not None and (abs(rest['in']) >= 0.5 or abs(rest['out']) >= 0.5):
+            for lc, gg in st_all.groupby('위치명'):
+                if lc == loc:
+                    continue
+                a, b = sum(_num(x) for x in gg['입고량']), sum(_num(x) for x in gg['출고량'])
+                if a or b:
+                    others.append({'loc': lc, 'in': round(a, 1), 'out': round(b, 1), 'cur': round(sum(_num(x) for x in gg['현재고']), 1)})
+        e_in_m, e_out_m = {}, {}
+        for t in tx:
+            dst = e_in_m if t['q'] > 0 else e_out_m
+            dst[t['d'][:6]] = dst.get(t['d'][:6], 0.0) + abs(t['q'])
         months = []
         for y in yms:
             e = _month_flow(y)['mat'].get((V['vendor'], code))
-            if e:
-                months.append({'ym': y, 'open': round(e['open'], 1), 'inb': round(e['inb'], 1), 'use': round(e['use'], 1), 'cur': round(e['cur'], 1), 'erp_in': round(erp_in.get(y, 0.0), 1)})
-        parts.append({'vendor': V['vendor'], 'loc': V['loc'], 'diff': r['diff'], 'w': r['w'], 'months': months})
+            if e or y in e_in_m or y in e_out_m:
+                months.append({'ym': y, 'file': bool(e), 'open': round(e['open'], 1) if e else 0, 'inb': round(e['inb'], 1) if e else 0,
+                               'use': round(e['use'], 1) if e else 0, 'cur': round(e['cur'], 1) if e else 0,
+                               'erp_in': round(e_in_m.get(y, 0.0), 1), 'erp_out': round(e_out_m.get(y, 0.0), 1)})
+        parts.append({'vendor': V['vendor'], 'loc': loc, 'diff': r['diff'], 'w': w, 'months': months,
+                      'tx': [dict(t, q=round(t['q'], 1)) for t in tx], 'rest': rest, 'others': others})
     parts.sort(key=lambda x: -abs(x['diff']))
     return jsonify({'code': code, 'parts': parts})
 
@@ -23649,14 +23694,40 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       + '<table class="npd-tbl"><thead><tr><th>구분</th><th>재고 파일</th><th>아마란스</th><th>차이에 미친 양</th></tr></thead><tbody>'
       + lines.map(l => '<tr><td>' + l[0] + '</td><td>' + (l[1] == null ? '-' : f(l[1])) + '</td><td>' + (l[2] == null ? '-' : f(l[2])) + '</td><td>' + eff(l[3]) + '</td></tr>').join('')
       + '<tr style="font-weight:800"><td>현재고</td><td>' + f(w.f_cur) + '</td><td>' + f(w.e_cur) + '</td><td>' + _scSg(p.diff) + '</td></tr></tbody></table>';
-    h += '<table class="npd-tbl"><thead><tr><th>재고 파일</th><th>기초</th><th>입고</th><th>사용</th><th>월말</th><th>아마란스 입고</th></tr></thead><tbody>'
+    const dash = '<span style="color:#cbd5e1">-</span>';
+    h += '<table class="npd-tbl"><thead><tr><th>달</th><th>파일 기초</th><th>파일 입고</th><th>파일 사용</th><th>파일 월말</th><th>아마란스 입고</th><th>아마란스 출고</th></tr></thead><tbody>'
       + p.months.map((m, i) => {
-        const pv = p.months[i - 1], jump = pv && Number(m.ym) - Number(pv.ym) === (m.ym.slice(4) === '01' ? 89 : 1) && Math.abs(m.open - pv.cur) >= 0.5;
-        const inDiff = Math.abs(m.erp_in - m.inb) >= 0.5;
-        return '<tr><td>' + mm(m.ym) + '</td><td' + (jump ? ' style="color:#b45309;font-weight:800" title="전월 말 ' + f(pv.cur) + '과 다름 (' + _scSg(m.open - pv.cur) + ')"' : '') + '>' + f(m.open) + (jump ? ' ⚠' : '') + '</td>'
-          + '<td>' + f(m.inb) + '</td><td>' + f(m.use) + '</td><td>' + f(m.cur) + '</td><td' + (inDiff ? ' style="color:#0f766e;font-weight:700"' : '') + '>' + f(m.erp_in) + '</td></tr>';
-      }).join('') + '</tbody></table></div>'
-      + '<div class="npd-note" style="margin:0">⚠ = 전월 말 재고와 다른 기초 · 아마란스 입고 = 입고정보 중 입고장소가 이 외주처인 것(창고 이동은 빠짐), 재고 파일 입고와 다르면 초록 · 아마란스는 올해 누계(기초+입고−출고=현재고)</div></div>';
+        const pv = p.months[i - 1], jump = m.file && pv && pv.file && Number(m.ym) - Number(pv.ym) === (m.ym.slice(4) === '01' ? 89 : 1) && Math.abs(m.open - pv.cur) >= 0.5;
+        const inDiff = m.file && Math.abs(m.erp_in - m.inb) >= 0.5, outDiff = m.file && Math.abs(m.erp_out - m.use) >= 0.5;
+        const fc = v => m.file ? f(v) : dash;
+        return '<tr' + (m.file ? '' : ' style="color:#94a3b8"') + '><td>' + mm(m.ym) + '</td><td' + (jump ? ' style="color:#b45309;font-weight:800" title="전월 말 ' + f(pv.cur) + '과 다름 (' + _scSg(m.open - pv.cur) + ')"' : '') + '>' + fc(m.open) + (jump ? ' ⚠' : '') + '</td>'
+          + '<td>' + fc(m.inb) + '</td><td>' + fc(m.use) + '</td><td>' + fc(m.cur) + '</td>'
+          + '<td' + (inDiff ? ' style="color:#0f766e;font-weight:700"' : '') + '>' + (m.erp_in ? f(m.erp_in) : dash) + '</td>'
+          + '<td' + (outDiff ? ' style="color:#4f46e5;font-weight:700"' : '') + '>' + (m.erp_out ? f(m.erp_out) : dash) + '</td></tr>';
+      }).join('') + '</tbody></table></div>';
+    // 재고 파일이 늦게 시작한 품번 — 그 전 아마란스 움직임은 파일 첫 달 기초에 들어 있어야 함
+    const fm = p.months.filter(m => m.file), em = p.months.filter(m => !m.file && (m.erp_in || m.erp_out));
+    if (fm.length && em.length && em[0].ym < fm[0].ym) {
+      h += '<div class="sc-exp-h" style="margin-top:8px">📌 재고 파일은 <b>' + mm(fm[0].ym) + '</b>부터 기록돼 있어요 (첫 달 기초 <b>' + f(fm[0].open) + '</b>). 그 전 아마란스 입고·출고(' + em.map(m => mm(m.ym)).join('·') + ')는 재고 파일에 없어서 위 입고·사용 비교에 그대로 차이로 잡혀요 → <b>' + mm(fm[0].ym) + ' 기초</b>와 아래 건별 내역으로 맞춰 보세요.</div>';
+    }
+    // 아마란스 건별 내역
+    const tx = p.tx || [], KC = { '입고': '#0f766e', '이동 들어옴': '#0369a1', '이동 나감': '#b45309', '외주 출하': '#4f46e5' };
+    const dd = s => s.length === 8 ? s.slice(4, 6) + '/' + s.slice(6) : s;
+    if (tx.length) {
+      let run = w.e_open || 0;
+      h += '<div style="margin-top:10px;font-weight:800;font-size:12.5px">아마란스 건별 내역 <span style="font-weight:500;color:#64748b">(' + tx.length + '건 · ' + escapeHtml(p.loc || '') + ' 위치 · 올해)</span></div>'
+        + '<div style="max-height:280px;overflow:auto;margin-top:4px"><table class="npd-tbl"><thead><tr><th>날짜</th><th>구분</th><th>수량</th><th>누계 재고</th><th>상대 · 생산 제품</th><th>번호</th></tr></thead><tbody>'
+        + tx.map(t => { run += t.q; return '<tr><td>' + dd(t.d) + '</td><td style="color:' + (KC[t.k] || '#334155') + ';font-weight:700">' + t.k + '</td><td style="font-weight:700">' + _scSg(t.q) + '</td><td>' + f(run) + '</td><td>' + escapeHtml(t.who || '') + '</td><td style="color:#94a3b8">' + escapeHtml(t.no || '') + '</td></tr>'; }).join('')
+        + '</tbody></table></div>';
+    } else if (p.loc) {
+      h += '<div class="npd-note" style="margin-top:8px">아마란스 건별 기록(입고·창고 이동·외주 출하)이 올해 없어요.</div>';
+    }
+    const rs = p.rest || {};
+    if (Math.abs(rs.in || 0) >= 0.5 || Math.abs(rs.out || 0) >= 0.5) {
+      h += '<div class="sc-exp-h" style="margin-top:8px;background:#fffbeb">⚠ 건별 자료 없는 양 — 입고 <b>' + _scSg(rs.in || 0) + '</b> · 출고 <b>' + _scSg(rs.out || 0) + '</b> (아마란스 현재고 누계와 건별 합의 차이). 받아오는 자료에 없는 <b>창고 간 재고 이동·재고 조정</b>일 가능성이 커요.'
+        + ((p.others || []).length ? '<br>같은 품번 다른 위치: ' + p.others.map(o => '<b>' + escapeHtml(o.loc) + '</b> 입고 ' + f(o.in) + ' · 출고 ' + f(o.out) + ' · 현재 ' + f(o.cur)).join(' / ') + ' — 숫자가 비슷하면 그 위치와 이동한 것' : '') + '</div>';
+    }
+    h += '<div class="npd-note" style="margin:6px 0 0">⚠ = 전월 말과 다른 기초 · 회색 줄 = 재고 파일에 없는 달 · 초록/보라 = 재고 파일 입고/사용과 다른 달 · 아마란스 입고 = 입고 + 이동 들어옴, 출고 = 외주 출하(생산 사용) + 이동 나감 · 누계 재고는 1월 기초에서 건별로 더한 값(건별 자료 없는 양은 빠짐)</div></div>';
     return h;
   }
   function renderStockCompare() {
