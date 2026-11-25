@@ -10857,7 +10857,7 @@ def api_notify_test():
 
 
 # ────────────────────────────────────────────
-# 월간 리포트 — 매출·발주·입고·단가변동·재고마감·알림을 한 페이지로 (인쇄→PDF)
+# 월간 리포트 — 구매·외주 매입 증감·발주·입고·단가변동·재고마감·알림을 한 페이지로 (인쇄→PDF)
 #   /report/monthly?ym=YYYYMM (라이브 렌더) · /api/monthly_report (JSON)
 #   매월 1~5일 아침 점검 때 전월 리포트를 data/리포트/에 자동 저장 + 알림
 # ────────────────────────────────────────────
@@ -10879,15 +10879,6 @@ def _report_data(ym):
     def _find(rows, key):
         return next((r for r in rows if r.get('ym') == key), None) or {}
 
-    # 매출 — 온라인팀 판매 API 공급가 (2026-09-23: Monday 매출현황 대체). mon = 같은 자료의 월별 합계(추이용)
-    with app.test_request_context('/api/sales_summary'):
-        mon = api_sales_summary().get_json()
-    with app.test_request_context('/api/sales_qty'):
-        sq = api_sales_qty().get_json()
-    mon_cur, mon_prev = _find(mon.get('monthly', []), ymd), _find(mon.get('monthly', []), prevd)
-    sq_cur, sq_prev = _find(sq.get('monthly', []), ymd), _find(sq.get('monthly', []), prevd)
-    sq_cls = {k[:-4]: v for k, v in sq_cur.items() if k.endswith('_amt') and k != 'total_amt'}
-
     # 발주 / 입고 (아마란스)
     def _month_sum(df, dcol, acol, key):
         if df is None or df.empty or dcol not in df.columns or acol not in df.columns:
@@ -10908,9 +10899,26 @@ def _report_data(ym):
             po_item.setdefault(code, {'code': code, 'name': str(r.get('품명', '')).strip(), 'amt': 0, 'qty': 0})
             po_item[code]['amt'] += amt
             po_item[code]['qty'] += _num(r.get('발주수량', 0))
-    trend = [{'ym': _ym_dash(k), 'sales': _find(mon.get('monthly', []), _ym_dash(k)).get('amount', 0) or 0,
-              'po': _month_sum(ORDER_DF, '발주일자', '합계금액', k),
+    # 외주 매입 = 아마란스 외주발주 합계(totAm, VAT 포함 — 구매 발주 합계금액과 같은 기준) (2026-11-25 매출 대신)
+    wp_col = '합계금액' if WP_ORDER_DF is not None and '합계금액' in WP_ORDER_DF.columns else 'totAm'
+    wp_sum = lambda k: _month_sum(WP_ORDER_DF, '발주일자', wp_col, k)
+    trend = [{'ym': _ym_dash(k), 'po': _month_sum(ORDER_DF, '발주일자', '합계금액', k), 'wp': wp_sum(k),
               'rcv': _month_sum(RCV_DF, '입고일자', '합계금액', k)} for k in months]   # rcv: 2026-11-19 발주·입고 추이 그래프용
+
+    def _cmp3(fn):
+        """이달 vs 직전 3개월 평균 증감 + 최근 4개월 달마다 전월 대비 (2026-11-25 사용자 "구매금액 증감액, 증감률 (직전 3개월)")."""
+        v = {k: fn(k) for k in [_ym_shift(ym, -i) for i in range(5)]}
+        p3 = [v[_ym_shift(ym, -i)] for i in (1, 2, 3)]
+        avg = sum(p3) / 3
+        cur = v[ym]
+        rows = []
+        for i in (3, 2, 1, 0):
+            k, pk = _ym_shift(ym, -i), _ym_shift(ym, -i - 1)
+            rows.append({'ym': _ym_dash(k), 'amt': v[k], 'diff': v[k] - v[pk],
+                         'pct': round((v[k] - v[pk]) / v[pk] * 100, 1) if v[pk] else None})
+        return {'cur': cur, 'avg3': int(round(avg)), 'diff': int(round(cur - avg)),
+                'pct': round((cur - avg) / avg * 100, 1) if avg else None, 'months': rows}
+    buy3 = {'po': _cmp3(lambda k: _month_sum(ORDER_DF, '발주일자', '합계금액', k)), 'wp': _cmp3(wp_sum)}
 
     # 단가 변동 (해당 월에 바뀐 것)
     with app.test_request_context('/api/price_changes'):
@@ -10949,19 +10957,8 @@ def _report_data(ym):
     # 그달 기준: 제품 매출 TOP 10·채널별 매출(판매 API) / 발주·입고 거래처 TOP 5 + 주요 품목(대시보드 TOP 10 창과 같은 계산)
     #           / 입고 일정 준수(Monday 입고 완료 기록)
     # 생성 시점 기준: 재고·수급·거래처 현황 — 지난 달·이번 달 리포트에만(과거 월엔 그때 값이 남아 있지 않아 오해 소지)
-    extra = {'sales_top': [], 'sales_count': 0, 'ch_sales': [], 'po_vendor_top5': [], 'rcv_vendor_top5': [],
-             'receipts': {}, 'snap': None}
-    try:
-        sd = _call_json(api_sales_detail, f'/api/sales_detail?ym={ymd}')
-        extra['sales_top'], extra['sales_count'] = sd.get('items', []), sd.get('count', 0)
-        if SALES_DAILY_DF is not None and not SALES_DAILY_DF.empty:
-            sdf = SALES_DAILY_DF
-            sm = sdf[(sdf['date'].astype(str).str[:7] == ymd) & (sdf['amt'] > 0)]
-            if len(sm):
-                g = sm.groupby('channel_name')['amt'].sum().sort_values(ascending=False)
-                extra['ch_sales'] = [{'name': str(k), 'amt': int(v)} for k, v in g.items()]
-    except Exception as e:
-        print(f'[월간 리포트] 매출 상세 실패: {e}')
+    # 2026-11-25: 매출(판매 API) 장은 뺌 — 사용자 "월간 리포트에 매출 자료는 빠지고"
+    extra = {'po_vendor_top5': [], 'rcv_vendor_top5': [], 'receipts': {}, 'snap': None}
     try:
         od = _call_json(api_order_receipt_detail, f'/api/order_receipt_detail?ym={ym}')
         extra['po_vendor_top5'], extra['rcv_vendor_top5'] = od.get('order', [])[:5], od.get('receipt', [])[:5]
@@ -10979,12 +10976,7 @@ def _report_data(ym):
     return {
         **extra,
         'ym': ym, 'ymd': ymd, 'prev': prevd,
-        'sales_monday': {'cur': mon_cur.get('amount', 0) or 0, 'prev': mon_prev.get('amount', 0) or 0,
-                         'pct': _pct(mon_cur.get('amount', 0) or 0, mon_prev.get('amount', 0) or 0)},
-        'sales_csv': {'cur': sq_cur.get('total_amt', 0) or 0, 'prev': sq_prev.get('total_amt', 0) or 0,
-                      'pct': _pct(sq_cur.get('total_amt', 0) or 0, sq_prev.get('total_amt', 0) or 0),
-                      'qty': sq_cur.get('total', 0) or 0, 'is_current': bool(sq_cur.get('is_current')),
-                      'by_class': sq_cls},
+        'is_current': ym == datetime.now().strftime('%Y%m'), 'buy3': buy3,
         'po': {'cur': po_cur, 'prev': po_prev, 'pct': _pct(po_cur, po_prev)},
         'rcv': {'cur': rcv_cur, 'prev': rcv_prev, 'pct': _pct(rcv_cur, rcv_prev)},
         'po_vendor_top': [{'name': k, 'amt': int(v)} for k, v in po_vendor.most_common(5)],
@@ -11192,12 +11184,40 @@ def _fmt_won(v):
     return f'{v:,}'
 
 
+def _rp_delta3(b):
+    """KPI 칸 — 직전 3개월 평균 대비 증감액·증감률."""
+    if not b or not b.get('avg3'):
+        return '<span class="d flat">직전 3개월 자료 없음</span>'
+    p, df = b.get('pct'), b.get('diff', 0)
+    cls = 'up' if df > 0 else ('down' if df < 0 else 'flat')
+    ar = '▲' if df > 0 else ('▼' if df < 0 else '―')
+    ps = '' if p is None else f' ({abs(p)}%)'
+    return f'<span class="d {cls}">{ar} {_fmt_won(abs(df))}원{ps} <span class="flat" style="font-weight:600">3개월 평균 대비</span></span>'
+
+
 def _rp_delta(p):
     if p is None:
         return '<span class="d flat">전월 자료 없음</span>'
     cls = 'up' if p > 0 else ('down' if p < 0 else 'flat')
     ar = '▲' if p > 0 else ('▼' if p < 0 else '―')
     return f'<span class="d {cls}">{ar} {abs(p)}% <span class="flat" style="font-weight:600">전월 대비</span></span>'
+
+
+def _rp_signed(v):
+    """증감액 '+1.2억' / '−3,400만' / '0'."""
+    v = int(round(v or 0))
+    return ('+' if v > 0 else ('−' if v < 0 else '')) + _fmt_won(abs(v))
+
+
+def _rp_pct_txt(p):
+    return '' if p is None else f' ({"▲" if p > 0 else "▼" if p < 0 else "―"} {abs(p)}%)'
+
+
+def _rp_diff_cell(diff, pct):
+    """표 칸: 증감액·증감률 (오름 빨강·내림 파랑)."""
+    c = 'up' if diff > 0 else ('down' if diff < 0 else 'flat')
+    ps = '-' if pct is None else (('+' if pct > 0 else '') + f'{pct}%')
+    return f'<td class="num {c}">{_rp_signed(diff)}원</td><td class="num {c}"><b>{ps}</b></td>'
 
 
 def _rp_sec(no, title, desc=''):
@@ -11282,21 +11302,15 @@ def _rp_summary(d):
     esc = _rp_esc
     out = []
     pctx = lambda p: '' if p is None else (' (전월 대비 ' + ('▲' if p > 0 else '▼' if p < 0 else '―') + f' {abs(p)}%)')
-    s = d['sales_monday']
-    if s['cur']:
-        ch = (d.get('ch_sales') or [])[:1]
-        top = (d.get('sales_top') or [])[:1]
-        tot = sum(x['amt'] for x in d.get('ch_sales') or []) or 1
-        line = f'매출(판매 API 채널) <b>{_fmt_won(s["cur"])}원</b>{pctx(s["pct"])}'
-        if ch:
-            line += f' — 채널 1위 {esc(ch[0]["name"])} {_fmt_won(ch[0]["amt"])}원 ({ch[0]["amt"] / tot * 100:.0f}%)'
-        if top:
-            line += f', 제품 1위 {esc(_rp_cut(top[0].get("name"), 36))}'
-        out.append(line)
-    else:
-        out.append('매출(판매 API 채널) 자료 없음')
+    for k, nm in (('po', '구매'), ('wp', '외주 매입')):
+        b = (d.get('buy3') or {}).get(k) or {}
+        if not b.get('cur') and not b.get('avg3'):
+            out.append(f'{nm} 금액 자료 없음')
+            continue
+        out.append(f'{nm} <b>{_fmt_won(b["cur"])}원</b> — 직전 3개월 평균 {_fmt_won(b["avg3"])}원 대비 '
+                   f'<b>{_rp_signed(b["diff"])}원</b>{_rp_pct_txt(b["pct"])}')
     po, rc = d['po'], d['rcv']
-    line = f'발주 <b>{_fmt_won(po["cur"])}원</b>{pctx(po["pct"])} · 입고 <b>{_fmt_won(rc["cur"])}원</b>{pctx(rc["pct"])}'
+    line = f'입고 <b>{_fmt_won(rc["cur"])}원</b>{pctx(rc["pct"])}'
     v = (d.get('po_vendor_top5') or [])[:1]
     if v and po['cur']:
         it = (v[0].get('items') or [{}])[0]
@@ -11363,12 +11377,12 @@ def _rp_rate_bar(r):
 def _report_html(d):
     """월간 리포트 HTML (2026-11-19 보기 개편, 사용자 "자료가 너무 보기 불편 → 가독성"):
     표지 머리(달·생성 시각·자료 상태) → 이달 요약(문장) → 큰 숫자 4칸 → 번호 붙은 장
-    매출 · 구매·입고 · 입고 일정 · 단가 변동 · 재고·수급(생성 시점) · 거래처 평가(생성 시점) · 운영 기록.
+    구매·외주 매입 증감(11-25, 매출 장 대체) · 구매·입고 · 입고 일정 · 단가 변동 · 재고·수급(생성 시점) · 거래처 평가(생성 시점) · 운영 기록.
     12개월 추이는 SVG 막대(리포트 달 진하게 + 아래 금액 줄), 금액은 억·만으로 통일, 표는 숫자 오른쪽 정렬·줄무늬."""
     y, m = d['ym'][:4], int(d['ym'][4:6])
     esc = _rp_esc
     hc = {'ok': 'ok', 'warn': 'warn'}.get(d['health']['overall'], 'err')
-    cur_tag = ' <span class="badge warn">진행 중인 달</span>' if d['sales_csv']['is_current'] else ''
+    cur_tag = ' <span class="badge warn">진행 중인 달</span>' if d.get('is_current') else ''
     prev_ym, next_ym = _ym_shift(d['ym'], -1), _ym_shift(d['ym'], 1)
     h = [_REPORT_CSS, '<div class="page">',
          f'<div class="nav"><a href="/report/monthly?ym={prev_ym}">◀ 전월</a><a href="/report/monthly?ym={next_ym}">다음달 ▶</a>'
@@ -11379,7 +11393,8 @@ def _report_html(d):
     # 이달 요약
     h.append('<div class="summary"><h3>이달 요약</h3><ul>' + ''.join('<li>' + x + '</li>' for x in _rp_summary(d)) + '</ul></div>')
     # 큰 숫자 4칸
-    s, po, rc, rr = d['sales_monday'], d['po'], d['rcv'], d.get('receipts') or {}
+    po, rc, rr = d['po'], d['rcv'], d.get('receipts') or {}
+    b3 = d.get('buy3') or {}
 
     def kpi(label, val, delta, sub, color):
         if not val:
@@ -11396,59 +11411,39 @@ def _report_html(d):
     else:
         rate_val, rate_d = '', ''
     h.append('<div class="kpis">'
-             + kpi('매출 (판매 API 채널)', (_fmt_won(s['cur']) + '<small>원</small>') if s['cur'] else '', _rp_delta(s['pct']),
-                   f'전월 {_fmt_won(s["prev"])}원<br>판매 {int(d["sales_csv"]["qty"]):,}개', _RP_BLUE)
-             + kpi('구매 발주액', (_fmt_won(po['cur']) + '<small>원</small>') if po['cur'] else '', _rp_delta(po['pct']),
-                   f'전월 {_fmt_won(po["prev"])}원', _RP_INK2)
+             + ''.join(kpi(nm, (_fmt_won(b['cur']) + '<small>원</small>') if b.get('cur') else '', _rp_delta3(b), f'직전 3개월 평균 {_fmt_won(b.get("avg3", 0))}원', col)
+                       for b, nm, col in ((b3.get('po') or {}, '구매 금액', _RP_BLUE), (b3.get('wp') or {}, '외주 매입 금액', _RP_AQUA)))
              + kpi('입고액', (_fmt_won(rc['cur']) + '<small>원</small>') if rc['cur'] else '', _rp_delta(rc['pct']),
                    f'전월 {_fmt_won(rc["prev"])}원', _RP_ORANGE)
              + kpi('입고 요청일 준수', rate_val, rate_d,
                    f'Monday 입고 완료 {rr.get("total", 0)}건<br>요청일 있는 {rr.get("with_req", 0)}건 기준', rate_col)
              + '</div>')
     no = 0
-    # ── 매출 ──
+    # ── 구매·외주 매입 증감 (2026-11-25, 매출 장 대체) ──
     no += 1
-    h.append('<div class="sec">' + _rp_sec(no, '매출', '온라인팀 판매 API 11개 채널 공급가(VAT 제외) — 회사 전체 매출이 아님'))
-    h.append('<div class="chart"><div class="t"><span>최근 12개월 매출</span></div><div class="cv">'
-             + _rp_svg_cols(d['trend'], [('sales', '매출', _RP_BLUE)], d['ymd']) + '</div></div>')
-    cls = d['sales_csv']['by_class']
-    chs = d.get('ch_sales') or []
-    left = '<div class="sub-h">분류별</div>'
-    if cls:
-        tot = sum(cls.values()) or 1
-        items = sorted(cls.items(), key=lambda x: -x[1])
-        left += '<div class="stack">' + ''.join(f'<i style="width:{v / tot * 100:.2f}%;background:{_RP_CLS.get(k, _RP_GRAY)}"></i>' for k, v in items) + '</div>'
-        left += '<table><thead><tr><th>분류</th><th class="num">매출</th><th class="num">비중</th></tr></thead><tbody>'
-        for k, v in items:
-            left += (f'<tr><td><span class="sbar" style="width:9px;height:9px;background:{_RP_CLS.get(k, _RP_GRAY)};margin-right:6px"></span>{esc(k)}</td>'
-                     f'<td class="num">{_fmt_won(v)}원</td><td class="num">{v / tot * 100:.1f}%</td></tr>')
-        left += '</tbody></table>'
-    else:
-        left += '<div class="empty">분류 자료 없음</div>'
-    right = '<div class="sub-h">채널별</div>'
-    if chs:
-        tot = sum(x['amt'] for x in chs) or 1
-        mx = chs[0]['amt'] or 1
-        right += '<table><thead><tr><th>채널</th><th class="num">매출</th><th class="num">비중</th></tr></thead><tbody>'
-        for x in chs:
-            right += (f'<tr><td>{esc(x["name"])}</td><td class="num"><span class="sbar" style="width:{x["amt"] / mx * 56:.0f}px;background:{_RP_BLUE};margin-right:8px"></span>'
-                      f'{_fmt_won(x["amt"])}원</td><td class="num">{x["amt"] / tot * 100:.1f}%</td></tr>')
-        right += '</tbody></table>'
-    else:
-        right += '<div class="empty">채널 자료 없음</div>'
-    h.append(f'<div class="grid2"><div>{left}</div><div>{right}</div></div>')
-    top = d.get('sales_top') or []
-    if top:
-        tot = sum(x['amt'] for x in chs) or s['cur'] or 1
-        mx = top[0].get('amount', 0) or 1
-        h.append(f'<div class="sub-h">제품 매출 TOP 10 <span class="muted sm">· 판매 제품 {d.get("sales_count", 0)}종 중</span></div>'
-                 '<table><thead><tr><th class="rk">#</th><th>제품</th><th>판매 채널</th><th class="num">매출</th><th class="num">비중</th></tr></thead><tbody>')
-        for i, x in enumerate(top, 1):
-            a = x.get('amount', 0) or 0
-            h.append(f'<tr><td class="rk">{i}</td><td>{esc(_rp_cut(x.get("name"), 44))}</td><td class="muted sm">{esc(_rp_cut(x.get("div"), 30))}</td>'
-                     f'<td class="num"><span class="sbar" style="width:{a / mx * 50:.0f}px;background:{_RP_BLUE};margin-right:8px"></span>{_fmt_won(a)}원</td>'
-                     f'<td class="num">{a / tot * 100:.1f}%</td></tr>')
+    h.append('<div class="sec">' + _rp_sec(no, '구매 · 외주 매입 증감', '아마란스 구매발주·외주발주 합계금액(VAT 포함, 발주일 기준) — 이달 vs 직전 3개월'))
+    if b3:
+        h.append('<table><thead><tr><th>구분</th><th class="num">이달</th><th class="num">직전 3개월 평균</th><th class="num">증감액</th><th class="num">증감률</th></tr></thead><tbody>')
+        for k, nm, col in (('po', '구매', _RP_BLUE), ('wp', '외주 매입', _RP_AQUA)):
+            b = b3.get(k) or {}
+            h.append(f'<tr><td><span class="sbar" style="width:9px;height:9px;background:{col};margin-right:6px"></span><b>{nm}</b></td>'
+                     f'<td class="num"><b>{_fmt_won(b.get("cur", 0))}원</b></td><td class="num">{_fmt_won(b.get("avg3", 0))}원</td>'
+                     + _rp_diff_cell(b.get('diff', 0), b.get('pct')) + '</tr>')
         h.append('</tbody></table>')
+        h.append('<div class="sub-h">달별 흐름 · 전월 대비</div><table><thead><tr><th>달</th>'
+                 '<th class="num">구매</th><th class="num">증감액</th><th class="num">증감률</th>'
+                 '<th class="num">외주 매입</th><th class="num">증감액</th><th class="num">증감률</th></tr></thead><tbody>')
+        pm, wm = (b3.get('po') or {}).get('months', []), (b3.get('wp') or {}).get('months', [])
+        for x, y in zip(pm, wm):
+            hot = x['ym'] == d['ymd']
+            lab = f'{int(x["ym"][5:7])}월' + (' <span class="badge warn">이달</span>' if hot else '')
+            h.append(f'<tr><td>{"<b>" + lab + "</b>" if hot else lab}</td><td class="num">{"<b>" if hot else ""}{_fmt_won(x["amt"])}원{"</b>" if hot else ""}</td>'
+                     + _rp_diff_cell(x['diff'], x['pct'])
+                     + f'<td class="num">{"<b>" if hot else ""}{_fmt_won(y["amt"])}원{"</b>" if hot else ""}</td>' + _rp_diff_cell(y['diff'], y['pct']) + '</tr>')
+        h.append('</tbody></table><div class="muted sm" style="margin-top:5px">직전 3개월 평균 = 이달 바로 앞 3개월 합 ÷ 3 · 진행 중인 달은 오늘까지 발주분만</div>')
+    h.append('<div class="chart" style="margin-top:14px"><div class="t"><span>최근 12개월 구매 · 외주 매입</span><span class="legend">'
+             f'<span><i style="background:{_RP_BLUE}"></i>구매</span><span><i style="background:{_RP_AQUA}"></i>외주 매입</span></span></div><div class="cv">'
+             + _rp_svg_cols(d['trend'], [('po', '구매', _RP_BLUE), ('wp', '외주', _RP_AQUA)], d['ymd']) + '</div></div>')
     h.append('</div>')
     # ── 구매·입고 ──
     no += 1
