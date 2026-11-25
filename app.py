@@ -10544,7 +10544,52 @@ def _notify_snapshot():
         ch = [x for x in cs.get('items', []) if x['level'] in ('out', 'critical') and not x.get('stale')]
     except Exception as e:
         print(f'[알림] 채널 재고 스냅샷 오류: {e!r:.120}')
-    return {'out': out, 'now': now_items, 'health': health, 'ch': ch}
+    return {'out': out, 'now': now_items, 'health': health, 'ch': ch, 'late': _late_incoming_items()}
+
+
+_LATE_TYPE = {'po': '부자재', 'raw': '원료', 'import_raw': '수입 원료', 'os': '외주'}
+
+
+def _late_incoming_items():
+    """입고 예정일이 지났는데 아직 입고 완료로 안 넘어간 건 (2026-11-25 사용자 "원/부재료 입고, 외주입고 예정일에 입고가 안되면 알람").
+    원/부자재 = 예상입고일 패널(/api/po_pending: 부자재 발주 완료·원료 입고 일정·원재료 수입 현황), 외주 = 외주 입고 물량(/api/outsource_pending).
+    예정일 없는 건·확인 필요(보류)는 뺌. 예정일 다음 날부터 지연."""
+    from datetime import datetime as _d
+    today = _d.now().strftime('%Y-%m-%d')
+    out = []
+    for fn, path, src in ((api_po_pending, '/api/po_pending', 'po'), (api_outsource_pending, '/api/outsource_pending', 'os')):
+        try:
+            with app.test_request_context(path):
+                d = fn().get_json() or {}
+        except Exception as e:
+            print(f'[알림] 입고 지연 스냅샷 오류({src}): {e!r:.120}')
+            continue
+        for x in d.get('items', []):
+            eta = str(x.get('eta_sort', ''))
+            if not x.get('has_schedule') or x.get('is_hold') or not re.match(r'^\d{4}-\d{2}-\d{2}$', eta) or eta >= today:
+                continue
+            typ = 'os' if src == 'os' else x.get('type', 'po')
+            who = x.get('maker') if src == 'os' else (x.get('supplier_short') or x.get('supplier') or '')
+            out.append({'type': typ, 'code': str(x.get('code', '')).strip(), 'name': str(x.get('name', '')).strip(),
+                        'eta': eta, 'late': (_d.strptime(today, '%Y-%m-%d') - _d.strptime(eta, '%Y-%m-%d')).days,
+                        'qty': str(x.get('qty', '') or '').strip(), 'who': str(who or '').strip(),
+                        'contract': str(x.get('contract', '') or '').strip()})
+    out.sort(key=lambda x: (x['type'] == 'os', x['eta']))
+    return out
+
+
+def _late_line(x):
+    """알림 목록 한 줄 — 품번이 있으면 '· B0328 품명 — …'(클릭 = 품목 상세), 원료·수입은 '· 원료 품명 — …'."""
+    if re.match(r'^([A-Z]\d{4}|ZQ\d+)$', x['code']):
+        head = f"{x['code']} {x['name']}".strip()
+    else:
+        head = f"{_LATE_TYPE.get(x['type'], '')} {x['name'] or x['code']}".strip()
+    tail = [f"예정 {int(x['eta'][5:7])}/{int(x['eta'][8:10])} ({x['late']}일 지남)"]
+    if x['qty'] and x['qty'].lower() != 'nan':
+        tail.append(f"{int(float(x['qty'])):,}" if re.fullmatch(r'\d+(\.0+)?', x['qty']) else x['qty'])
+    if x['who']:
+        tail.append(x['who'])
+    return f"· {head[:40]} — " + ' · '.join(tail)
 
 
 def _notify_check(force_daily=False):
@@ -10554,6 +10599,7 @@ def _notify_check(force_daily=False):
         st = _notify_state_load()
         snap = _notify_snapshot()
         made = []
+        today_s = datetime.now().strftime('%Y-%m-%d')
         sc = lambda x: f"{x['scope'][0]}:{x['code']}"
 
         new_out = [x for x in snap['out'] if sc(x) not in set(st.get('out', []))]
@@ -10587,6 +10633,21 @@ def _notify_check(force_daily=False):
                 seen[chk(x)] = _today
         st['ch_seen'] = seen
 
+        # 입고 지연: 예정일이 지나도 입고 완료로 안 넘어간 건 — 같은 건·같은 예정일은 한 번만 (예정일이 바뀌어 또 지나면 다시)
+        lk = lambda x: f"l:{x['type']}:{x['code']}:{x['name'][:20]}:{x.get('contract', '')}:{x['eta']}"
+        late_seen = st.get('late_seen') or {}
+        new_late = [x for x in snap.get('late', []) if lk(x) not in late_seen]
+        if new_late:
+            po_l = [x for x in new_late if x['type'] != 'os']
+            os_l = [x for x in new_late if x['type'] == 'os']
+            body = ''
+            if po_l:
+                body += f'원/부자재 {len(po_l)}건\n' + '\n'.join(_late_line(x) for x in po_l[:15]) + '\n원/부자재 예상입고일 패널에서 일정 확인\n'
+            if os_l:
+                body += f'외주 {len(os_l)}건\n' + '\n'.join(_late_line(x) for x in os_l[:15]) + '\n외주 입고 물량 패널에서 일정 확인'
+            made.append(_notify('warn', 'late', f'⏰ 입고 지연 {len(new_late)}건 (예정일 지남)', body.strip(), st))
+        st['late_seen'] = {lk(x): late_seen.get(lk(x), today_s) for x in snap.get('late', [])}
+
         h = snap['health']
         bad = [x['label'] for x in h.get('items', []) if x['status'] in ('error', 'warn')]
         if bad and bad != st.get('health_bad', []):
@@ -10602,6 +10663,9 @@ def _notify_check(force_daily=False):
             body = (f"품절 {len(snap['out'])}건 · 지금 발주 {len(snap['now'])}건 · 데이터 {h['summary']}\n"
                     + ('\n'.join(f"· {x['code']} {x['name']}" for x in snap['out'][:8]) if snap['out'] else '품절 없음 👍'))
             _cho = sum(1 for x in snap.get('ch', []) if x['level'] == 'out')
+            if snap.get('late'):
+                _lo = sum(1 for x in snap['late'] if x['type'] == 'os')
+                body += f"\n입고 지연 {len(snap['late'])}건 (원/부자재 {len(snap['late']) - _lo} · 외주 {_lo}) — 예정일 지났는데 입고 완료 전"
             if snap.get('ch'):
                 body += f"\n채널 품절 {_cho}건 · 3일 내 {len(snap['ch']) - _cho}건 (쿠팡 센터·마트 매장)"
             # 거래처 기록 현황 (2026-09-17, 10-28 재고 파일 기록 포함): 요약에 한 줄 + 기록이 영업일 3일 이상 비면 별도 경고
@@ -11520,7 +11584,7 @@ def _report_html(d):
             left += f'<tr><td>{k}</td><td colspan=3 class="muted">마감 파일 없음 (해당 월 자동보관 전)</td></tr>'
     left += '</tbody></table>'
     names = {'out': '🔴 신규 품절', 'reorder': '🕐 지금 발주 진입', 'health': '⚠️ 데이터 이상', 'daily': '☀️ 아침 요약', 'report': '📊 월간 리포트',
-             'chstock': '🏪 채널 품절', 'vendor': '👥 거래처 기록 끊김', 'sales': '📥 판매 자료 반영', 'closing': '📗 마감 자동 반영'}
+             'chstock': '🏪 채널 품절', 'late': '⏰ 입고 지연', 'vendor': '👥 거래처 기록 끊김', 'sales': '📥 판매 자료 반영', 'closing': '📗 마감 자동 반영'}
     al = sorted(d['alerts'].items(), key=lambda x: -x[1])
     right = '<div class="sub-h">알림 이력</div><table><thead><tr><th>종류</th><th class="num">건수</th></tr></thead><tbody>'
     right += ''.join(f'<tr><td>{names.get(k, esc(k))}</td><td class="num">{v}건</td></tr>' for k, v in al) or '<tr><td colspan=2 class="muted">알림 없음</td></tr>'
@@ -24653,7 +24717,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     } catch (e) {}
   }
   // 알림 종류별 이름 (필터 칩·카드 꼬리표)
-  const NOTIFY_KIND = { out: '품절', reorder: '지금 발주', chstock: '채널 품절', vendor: '거래처 입력', daily: '아침 요약', health: '데이터',
+  const NOTIFY_KIND = { out: '품절', reorder: '지금 발주', chstock: '채널 품절', late: '입고 지연', vendor: '거래처 입력', daily: '아침 요약', health: '데이터',
                         sales: '판매 자료', closing: '마감', report: '월간 리포트', test: '테스트' };
   let _ntItems = [], _ntKind = 'all', _ntSeen = 0;
   async function openNotify() {
@@ -24771,6 +24835,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         // 안내 줄: 채널 품절 → 그 패널, 거래처 기록·외주재고 입력 → 입력 링크 창, 월간 리포트 → 리포트 열기 단추
         let go = '';
         if ((kind === 'chstock' && l.indexOf('채널 품절 경보 패널') >= 0) || (kind === 'daily' && l.indexOf('채널 품절') === 0)) go = 'ntPanel(&quot;.chstock-panel&quot;)';
+        else if ((kind === 'late' && l.indexOf('예상입고일 패널') >= 0) || (kind === 'daily' && l.indexOf('입고 지연') === 0)) go = 'ntPanel(&quot;.po-inline&quot;)';
+        else if (kind === 'late' && l.indexOf('외주 입고 물량 패널') >= 0) go = 'ntPanel(&quot;.os-inline&quot;)';
         else if (l.indexOf('외주재고 입력') >= 0 || (kind === 'daily' && l.indexOf('거래처 기록') === 0)) go = 'ntVendor()';
         const cls = (!seenList && !h) ? 'nt-lead' : 'nt-text';
         h += go ? '<div class="' + cls + ' nt-go" onclick="' + go + '" title="클릭 = 이동">' + escapeHtml(l) + ' ›</div>' : '<div class="' + cls + '">' + escapeHtml(l) + '</div>';
