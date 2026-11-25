@@ -16573,15 +16573,17 @@ def api_ipsu_bom():
         r = round(v)
         return r if abs(v - r) < 0.05 * max(r, 1) else None
 
-    # 다른 품목의 자품으로 쓰이는 코드는 중간 반제품 → 최상위(완제품)만 남김
+    # 다른 품목의 자품으로 쓰이는 코드는 중간 반제품 → 최상위(완제품)만 남김.
+    # 단 완제품 품번(G·H·I)은 번들·세트의 자품이어도 따로 팔리는 제품이라 남김 (2026-11-25 사용자 "전제품이 다 있어야")
     consumed = set(bom['_ja'])
+    is_fg = lambda c: bool(re.match(r'^[GHI]\d{4}$', str(c).upper()))
 
     products = []
     for mo in child_map:
-        if mo in consumed:
+        if mo in consumed and not is_fg(mo):
             continue
         parts = _expand(mo)
-        if not parts:
+        if not parts and not is_fg(mo):
             continue
         outer = inner_box = None
         pouches = []
@@ -16608,7 +16610,7 @@ def api_ipsu_bom():
                 b = s                           # 그 바깥 = 2차파우치
         b = inner_box or b                      # 단상자가 있으면 내부용기로 우선
         c = outer
-        if not (a or b or c):
+        if not (a or b or c) and not is_fg(mo):
             continue
         # BOM 소요량 비로 입수량 산출 — 외박스는 1 미만(0.111=9입)으로 들어감
         qa = qty.get(a['code']) if a else None
@@ -16628,6 +16630,21 @@ def api_ipsu_bom():
             'qa': round(qa, 6) if qa else None, 'qb': round(qb, 6) if qb else None, 'qc': round(qc, 6) if qc else None,
             'a': a, 'b': b, 'c': c,
         })
+    # BOM이 없는 완제품(상품매입 I코드·외주 완제품 등)도 목록에 — 현재고·생산실적·출하에 나온 G·H·I 품번 전부.
+    # 포장 부자재는 비어 있어 화면에서 직접 고름 (2026-11-25 사용자 "완제품 품번/품명에 안 나오는 제품이 많다 → 전제품")
+    have = {x['code'].upper() for x in products}
+    for df in (STOCK_DF, PROD_DF, SHIP_DF):
+        if df is None or df.empty or '품번' not in df.columns:
+            continue
+        for c, n in zip(df['품번'].astype(str).str.strip().str.upper(), df.get('품명', df['품번']).astype(str)):
+            if c in have or not is_fg(c):
+                continue
+            have.add(c)
+            bx = box_by.get(c, {})
+            products.append({'code': c, 'name': n.strip(), 'nobom': True,
+                             'ipsu': bx.get('ipsu'), 'pallet': bx.get('pallet'),
+                             'bomN1': None, 'bomN2': None, 'bomPer': None, 'qa': None, 'qb': None, 'qc': None,
+                             'a': None, 'b': None, 'c': None})
     products.sort(key=lambda x: x['code'])
     # PT적재량 보조 출처로 빈 곳 채우기 (2026-11-05) — Monday › 제품리스트 › 재고파악 '품번 등 데이터'
     # 제품리스트·재고파악은 OneDrive 엑셀이라 호스트 PC에서만 읽힘 → 호스트가 결과를 data/pallet_snapshot.csv로 남기고
@@ -16701,6 +16718,7 @@ def api_ipsu_bom():
                 p['pallet_alt'] = '같은 제품 다른 품번은 ' + '/'.join(map(str, others))
     full = sum(1 for p in products if p['a'] and p['b'] and p['c'])
     return jsonify({'products': products, 'total': len(products), 'full': full,
+                    'nobom': sum(1 for p in products if p.get('nobom')),
                     'withIpsu': sum(1 for p in products if p['ipsu']),
                     'withBomN2': sum(1 for p in products if p['bomN2']),
                     'withBomPer': sum(1 for p in products if p['bomPer']),
@@ -27065,15 +27083,15 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       _ipsuBoxes = d.boxes || [];
       // 외박스(RRP/전용박스) — 3차원 규격 중 단상자(B코드)를 뺀 것
       _ipsuOuters = _ipsuSpecs.filter(s => s.dim.form === '상자' && !/^B/i.test(s.code));
-      let pn = 0;
+      let pn = '0건';
       try {
         const bd = await (await fetch('/api/ipsu_bom')).json();
         _ipsuProducts = bd.products || [];
         _ipsuDens = null;   // 중량 기준 입수 예상 통계는 새 BOM 데이터로 다시 계산
-        pn = _ipsuProducts.length;
+        pn = _ipsuProducts.length + '건' + (bd.nobom ? ' (BOM 없음 ' + bd.nobom + ')' : '');
       } catch (e) { _ipsuProducts = []; }
       document.getElementById('ipsu-stat').textContent =
-        `완제품 ${pn}건 · 규격 ${_ipsuSpecs.length}건(외박스 ${_ipsuOuters.length}) · 박스입수 ${_ipsuBoxes.length}건`;
+        `완제품 ${pn} · 규격 ${_ipsuSpecs.length}건(외박스 ${_ipsuOuters.length}) · 박스입수 ${_ipsuBoxes.length}건`;
     } catch (e) {
       document.getElementById('ipsu-stat').textContent = '규격 로드 실패';
     }
@@ -27147,7 +27165,7 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     if (who === 'p') {
       list = _ipsuProducts.filter(p => (p.code + ' ' + p.name).toLowerCase().includes(q)).slice(0, 500);
       html = list.map(p => {
-        const tag = [p.a ? '①' : '', p.b ? '②' : '', p.c ? '③' : ''].join('') || '-';
+        const tag = [p.a ? '①' : '', p.b ? '②' : '', p.c ? '③' : ''].join('') || (p.nobom ? 'BOM 없음' : '부자재 없음');
         const per = p.bomPer || p.bomN2;   // 박스당 완제품 수 (Monday 박스입수와 같은 단위)
         const n = per ? ' · 박스 ' + per + '입'
                 : (p.ipsu ? ' · 박스 ' + p.ipsu + '입(Monday)' : '');
@@ -27296,7 +27314,8 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     const miss = [!p.a && '①', !p.c && '③'].filter(Boolean);
     document.getElementById('ipsu-p-sel').innerHTML =
       done.join('<br>') +
-      (miss.length ? `<br><span style="color:#b45309">⚠ BOM에 ${miss.join('')} 부자재 없음 — 직접 입력</span>` : '');
+      (p.nobom ? '<br><span style="color:#b45309">⚠ 아마란스 BOM 없는 제품(상품매입 등) — ① 1차파우치 · ② 내부용기 · ③ 외박스를 검색해 직접 고르세요</span>'
+       : miss.length ? `<br><span style="color:#b45309">⚠ BOM에 ${miss.join('')} 부자재 없음 — 직접 입력</span>` : '');
     ipsuCalc();
   }
   function ipsuPickBox(code) {
