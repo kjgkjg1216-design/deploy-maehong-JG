@@ -1538,6 +1538,135 @@ def _start_partner_sales_loop():
     print('[판매 API] 일자별 판매 수집 스케줄 시작 (09:10 이후·14:00 이후 하루 2회)')
 
 
+# ====== 완제품 실물 재고 — 온라인팀 파트너 API (2026-11-26, 구매팀_API_안내.md 7절) ======
+# 사용자 "팀장님께 받는 매출자료에 완제품 재고를 볼 수 있는 공간 → 불러올 수 있어?" → 팀장님 쪽에 /api/partner/purchasing/stock 추가됨.
+# 온라인팀 재고현황 화면의 실물 재고(자사 창고 랙 적치분 + 남양1P·남양3P·송림 3자물류)를 품목 × 보관 장소로 받음.
+# 호스트 PC가 1시간마다 fetch_partner_stock.fetch() → data/YYYYMMDD_완제품재고.csv(+완제품재고장소.csv) → GCP는 동기화본 리로드.
+# 품번·단위: 남양 쿠팡 SKU는 판매 자료와 같은 SKU매핑_확정.csv(확정품번 × 환산계수)로 맞춰 수급 플래너·채널 품절과 같은 낱개 단위로.
+# 아마란스 현재고(전표 기준)와 기준이 달라 수치가 다를 수 있음 → 화면엔 '실물 재고(온라인팀)'로 따로 보이고, 판정(level)은 아마란스 그대로.
+FG_STOCK_LOCS = []
+FG_LOC_LABEL = {'self': '자사 창고', 'namyang_1p': '남양 1P', 'namyang_3p': '남양 3P', 'songnim': '송림'}
+_FG_STOCK_STATUS = {'last_run': '', 'last_ok': '', 'message': ''}
+
+
+def load_fg_stock_data():
+    """최신 data/*_완제품재고.csv → DF(+code·f·qty·ea). 장소별 기준 시각은 FG_STOCK_LOCS에. 파일 없으면 None."""
+    files = sorted(glob.glob(f'{DATA_DIR}/*_완제품재고.csv'))
+    if not files:
+        globals()['FG_STOCK_LOCS'] = []
+        return None
+    d = pd.read_csv(files[-1], dtype=str, encoding='utf-8-sig').fillna('')
+    mp = pd.DataFrame(columns=['SKU', '확정품번', '환산계수'])
+    mfile = f'{BASE_DIR}/SKU매핑_확정.csv'
+    if os.path.exists(mfile):
+        mp = pd.read_csv(mfile, dtype=str, encoding='utf-8-sig').fillna('')
+    mp = mp.drop_duplicates('SKU').set_index('SKU')
+    sku = d['sku'].astype(str).str.strip()
+    mcode = sku.map(mp['확정품번']).fillna('').str.strip().str.upper()
+    selfc = d['self_code'].astype(str).str.strip().str.upper()
+    selfc = selfc.where(selfc.str.match(r'^[A-Z]\d{4}$'), '')
+    d['code'] = mcode.where(mcode != '', selfc)
+    f = pd.to_numeric(sku.map(mp['환산계수']), errors='coerce')
+    d['f'] = f.where(mcode != '', 1.0).fillna(1.0)
+    d['qty'] = pd.to_numeric(d['stock_qty'], errors='coerce').fillna(0.0)
+    d['ea'] = d['qty'] * d['f']
+    locs = []
+    lf = files[-1][:-len('_완제품재고.csv')] + '_완제품재고장소.csv'
+    if os.path.exists(lf):
+        try:
+            ld = pd.read_csv(lf, dtype=str, encoding='utf-8-sig').fillna('')
+            for _, r in ld.iterrows():
+                try:
+                    n = int(float(r.get('rows', '0') or 0))
+                except ValueError:
+                    n = 0
+                locs.append({'key': r['location_key'], 'name': FG_LOC_LABEL.get(r['location_key'], r['location']),
+                             'as_of': r['as_of'], 'missing': str(r.get('missing', '')) == '1', 'rows': n,
+                             'checked_at': r.get('checked_at', '')})
+        except Exception as e:
+            print(f'[완제품재고] 장소 파일 읽기 실패: {e!r:.120}')
+    globals()['FG_STOCK_LOCS'] = locs
+    print(f'[완제품재고 로드] {os.path.basename(files[-1])} - {len(d)}행, 품번 {d.loc[d["code"] != "", "code"].nunique()}개, '
+          f'품번 없는 행 {int((d["code"] == "").sum())}')
+    return d
+
+
+FG_STOCK_DF = load_fg_stock_data()
+
+
+def _fg_stock_by_code():
+    """품번(구품번→신품번 합침)별 실물 재고 {code: {'ea': 합(음수 행은 0으로), 'locs': {장소키: 낱개}, 'neg': 음수 행 있음}}.
+    완제품 재고 자료 자체가 없으면 {} — 자료는 있는데 품번 행이 없으면 실물 0(온라인팀 API: 행 없음 = 재고 없음)."""
+    d = FG_STOCK_DF
+    if d is None or d.empty:
+        return {}
+    al = _goods_aliases()
+    out = {}
+    for c, k, ea in zip(d['code'], d['location_key'], d['ea']):
+        if not c:
+            continue
+        c = al.get(c, c)
+        o = out.setdefault(c, {'ea': 0.0, 'locs': {}, 'neg': False})
+        ea = float(ea)
+        if ea < 0:
+            o['neg'] = True
+        o['ea'] += max(ea, 0.0)
+        o['locs'][k] = o['locs'].get(k, 0.0) + ea
+    return out
+
+
+def _fg_rows_for(codes, fac=1.0):
+    """그 품번들(구품번 포함)의 실물 재고 행 — 상세 화면용. q=원래 수량(unit 단위), ea=낱개, sq=이 채널 SKU 단위(ea÷fac)."""
+    d = FG_STOCK_DF
+    if d is None or d.empty or not codes:
+        return []
+    al = _goods_aliases()
+    order = {k: i for i, k in enumerate(FG_LOC_LABEL)}
+    fac = max(float(fac or 1.0), 1.0)
+    rows = []
+    for _, r in d[d['code'] != ''].iterrows():
+        if r['code'] not in codes and al.get(r['code'], r['code']) not in codes:
+            continue
+        ea = float(r['ea'])
+        rows.append({'key': r['location_key'], 'loc': FG_LOC_LABEL.get(r['location_key'], r['location']),
+                     'q': int(round(float(r['qty']))), 'unit': r['unit'], 'f': float(r['f']), 'ea': int(round(ea)),
+                     'sq': int(round(ea / fac)), 'sku': r['sku'], 'name': r['name'], 'code': r['code'], 'as_of': r['as_of']})
+    rows.sort(key=lambda x: (order.get(x['key'], 9), -x['ea']))
+    return rows
+
+
+def _fg_stock_fetch_once():
+    """fetch_partner_stock.fetch() → 성공 시 FG_STOCK_DF 다시 읽음 (API 캐시는 DF 지문이 바뀌어 자동 무효)."""
+    import fetch_partner_stock as _fpst
+    _FG_STOCK_STATUS['last_run'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+    try:
+        n, _path = _fpst.fetch()
+    except Exception as e:
+        _FG_STOCK_STATUS['message'] = f'실패: {e!r:.160}'
+        print(f'[완제품재고] 수집 실패: {e!r:.160}')
+        return False
+    globals()['FG_STOCK_DF'] = load_fg_stock_data()
+    _FG_STOCK_STATUS.update(last_ok=_FG_STOCK_STATUS['last_run'], message=f'{n}행')
+    return True
+
+
+def _fg_stock_loop():
+    """1시간마다 — 자사 창고는 실시간(온라인팀 서버가 10분마다 다시 읽음), 남양·송림은 하루 2번(아침·저녁 6시 반 전후) 바뀜."""
+    threading.Event().wait(30)
+    while True:
+        try:
+            _fg_stock_fetch_once()
+        except Exception as e:
+            print(f'[완제품재고] 오류: {e!r:.160}')
+        threading.Event().wait(60 * 60)
+
+
+def _start_fg_stock_loop():
+    t = threading.Thread(target=_fg_stock_loop, daemon=True, name='fg-stock')
+    t.start()
+    print('[완제품재고] 온라인팀 실물 재고 수집 시작 (1시간마다)')
+
+
 def _start_sales_drop_watcher():
     try:
         os.makedirs(SALES_DROP_DIR, exist_ok=True)
@@ -1650,7 +1779,7 @@ if _spec_m is not None:
 _API_CACHE = {}
 _API_CACHE_LOCK = threading.Lock()
 _API_CACHE_DFS = ('DF', 'PRICE_DF', 'SPEC_DF', 'JASA_DF', 'ORDER_DF', 'WP_ORDER_DF', 'PROD_DF', 'WO_DF',
-                  'SHIP_DF', 'ISSUE_DF', 'BOM_DF', 'RCV_DF', 'STOCK_DF', 'SALES_DF', 'MONDAY_DF')
+                  'SHIP_DF', 'ISSUE_DF', 'BOM_DF', 'RCV_DF', 'STOCK_DF', 'SALES_DF', 'MONDAY_DF', 'FG_STOCK_DF')
 
 
 def _df_fingerprint():
@@ -2000,6 +2129,7 @@ def _reload_aramanth_dfs():
     _step('판매데이터', _set_df('SALES_DF', load_sales_data))
     _step('판매단가',   _set_df('SALE_PRICE', load_sale_price_data))
     _step('매입단가',   _set_df('PURCH_PRICE', load_purchase_price_data))
+    _step('완제품재고', _set_df('FG_STOCK_DF', load_fg_stock_data))   # 온라인팀 실물 재고 (2026-11-26)
     # 단가 lookup은 발주정보·외주발주·매입단가가 모두 리로드된 뒤에 합성해야 함 (2026-09-11)
     _step('단가 lookup', lambda: globals().update(zip(('PRICE_BY_CODE', 'PRICE_BY_NAME'), _build_price_lookup())))
     _step('Monday',     _set_df('MONDAY_DF', load_monday_data))
@@ -11786,6 +11916,27 @@ def api_supply_plan():
                 x['ch_note'] = '채널 여유'
             elif x['level'] in ('ok', 'low') and cs['qty'] / weekly < 1:
                 x['ch_note'] = '채널 부족'
+    # 실물 재고 (2026-11-26): 온라인팀 재고현황(자사 창고 랙 적치분 + 남양·송림 3자물류). 참고 — 판정(level)은 아마란스 창고 그대로.
+    # phys_note: 아마란스는 0인데 실물이 있으면 '실물 있음', 아마란스는 있는데 실물이 거의 없으면 '실물 적음'(전표·실물 어긋남 확인용)
+    try:
+        fgs = _fg_stock_by_code()
+    except Exception as e:
+        print(f'[수급 플래너] 실물 재고 합치기 실패: {e!r:.120}')
+        fgs = {}
+    for x in items:
+        x['phys'] = x['cov_phys_weeks'] = None
+        x['phys_note'] = ''
+        if not fgs:
+            continue
+        weekly = x['monthly'] / 4.33 if x['monthly'] else 0
+        fg = fgs.get(x['code'])
+        pq = int(round(fg['ea'])) if fg else 0
+        x['phys'] = pq
+        x['cov_phys_weeks'] = round(pq / weekly, 1) if weekly else None
+        if x['stock'] <= 0 and pq > 0:
+            x['phys_note'] = '실물 있음'
+        elif x['stock'] > 0 and pq < x['stock'] * 0.3 and x['stock'] - pq >= max(weekly, 100):
+            x['phys_note'] = '실물 적음'
     # 매출 ABC 등급 (2026-09-23) — 최근 90일 매출 누적 80%=A. A부터 안전재고 우선
     try:
         abc = (_sales_abc() or {}).get('by', {})
@@ -14029,9 +14180,12 @@ def api_supply_plan_detail():
             k = (str(r.get('창고명', '') or '').strip(), str(r.get('위치명', '') or '').strip(), raw if raw != code else '')
             whs[k] = whs.get(k, 0) + _num(r.get('현재고', 0))
     wh_rows = sorted([{'wh': k[0], 'loc': k[1], 'code': k[2], 'qty': int(v)} for k, v in whs.items() if v], key=lambda x: -abs(x['qty']))
+    # 실물 재고 (온라인팀 재고현황, 2026-11-26) — 장소별 행 + 장소별 기준 시각
+    has_fg = FG_STOCK_DF is not None and not FG_STOCK_DF.empty
     return jsonify({'item': it, 'vel': vb, 'weekly': round(weekly, 1), 'weeks': weeks, 'channels': ch_rows,
                     'wo': wo_rows, 'wp': wp_rows[:15], 'proj': proj, 'out_date': out_date, 'out_plan': out_plan,
-                    'warehouses': wh_rows, 'today': today.strftime('%Y-%m-%d')})
+                    'warehouses': wh_rows, 'today': today.strftime('%Y-%m-%d'),
+                    'phys': _fg_rows_for({code}) if has_fg else [], 'phys_locs': FG_STOCK_LOCS if has_fg else None})
 
 
 @app.route('/api/channel_stock_detail', methods=['GET'])
@@ -14082,7 +14236,16 @@ def api_channel_stock_detail():
         for _, x in rr.sort_values('입고일자').tail(3).iloc[::-1].iterrows():
             wh_in.append({'date': str(x['입고일자']).replace('-', '')[:8], 'q': int(round(_num(x['입고수량']))), 'loc': str(x.get('입고장소', '') or ''), 'who': str(x.get('거래처명', '') or '')})
     fac = float(g['f'].iloc[-1] or 1) if len(g) else 1.0
-    wh_sku = wh_ok / max(fac, 1.0)   # 채널 SKU 단위로
+    # 실물 재고 (온라인팀 재고현황, 2026-11-26) — 자사 창고(랙 적치분)·남양 1P·3P·송림. 있으면 '포함' 예상선도 실물 기준(전표보다 정확)
+    has_fg = FG_STOCK_DF is not None and not FG_STOCK_DF.empty
+    phys = _fg_rows_for(codes, fac) if (has_fg and codes) else []
+    # 같은 묶음만 이 SKU로 바로 납품 가능 — 같은 SKU이거나 환산계수가 같은 행(예: 5개입 SKU 재고는 낱개 SKU 채널에 바로 못 보냄)
+    for p_ in phys:
+        p_['same'] = str(p_['sku']) == sku or abs(p_['f'] - fac) < 1e-6
+    phys_ok = float(sum(max(p['ea'], 0) for p in phys if p['same']))
+    phys_all = float(sum(max(p['ea'], 0) for p in phys))
+    proj_ok = phys_ok if has_fg else wh_ok
+    wh_sku = proj_ok / max(fac, 1.0)   # 채널 SKU 단위로
     # 최근 60일 + 앞으로 14일
     days = pd.date_range(end - pd.Timedelta(days=59), end + pd.Timedelta(days=14), freq='D')
     dq = g.groupby('_dt')['q'].sum()
@@ -14111,6 +14274,9 @@ def api_channel_stock_detail():
     sp = _call_json(api_supply_plan, '/api/supply_plan') if cc else {}
     p = next((x for x in sp.get('items', []) if x['code'] == cc), None)
     return jsonify({'item': it, 'f': fac, 'days': rows, 'history': hist, 'wh': wh, 'wh_ok': int(round(wh_ok)), 'wh_in': wh_in,
+                    'phys': phys, 'phys_ok': int(round(phys_ok)) if has_fg else None, 'phys_all': int(round(phys_all)) if has_fg else None,
+                    'phys_locs': FG_STOCK_LOCS if has_fg else None,
+                    'proj_ok': int(round(proj_ok)), 'proj_src': 'phys' if has_fg else 'ama',
                     'med_gap': med_gap, 'avg_qty': avg_qty, 'next_dl': next_dl, 'out_date': out_date,
                     'since': int((end - last_dl).days) if last_dl is not None else None, 'pos_days14': pdays,
                     'others': others, 'supply': p, 'as_of': end.strftime('%Y-%m-%d')})
@@ -22381,6 +22547,9 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         if (x.trend >= 1.15) parts.push('<span style="color:#dc2626">▲추세</span>'); else if (x.trend <= 0.85) parts.push('<span style="color:#2563eb">▼추세</span>');
         if (x.ch_stock != null) parts.push('<span>채널 ' + fmtInt(x.ch_stock) + ' → 포함 <b>' + x.cov_ch_weeks + '주</b></span>'
           + (x.ch_note ? ' <span class="ch-tag' + (x.ch_note === '채널 여유' ? ' on' : '') + '">' + x.ch_note + '</span>' : ''));
+        if (x.phys != null) parts.push('<span title="실물 재고(온라인팀 재고현황) — 자사 창고(랙 적치분)·남양 1P·3P·송림">실물 ' + fmtInt(x.phys)
+          + (x.cov_phys_weeks != null ? ' → <b>' + x.cov_phys_weeks + '주</b>' : '') + '</span>'
+          + (x.phys_note ? ' <span class="ch-tag' + (x.phys_note === '실물 있음' ? ' on' : '') + '" title="아마란스 창고 재고와 실물 재고가 크게 다름 — 전표·실물 확인">' + x.phys_note + '</span>' : ''));
         if (x.plan || x.incoming) parts.push('<span style="color:#0891b2">+계획 ' + fmtInt(x.plan + x.incoming) + ' → ' + x.cov_plan_weeks + '주</span>');
         return { attrs: ' onclick="openPlanDetail(&quot;' + escapeHtml(x.code) + '&quot;)" title="클릭 = 판매 속도 근거·앞으로 12주 재고 예상·생산지시·창고별 재고"',
           name: x.name || x.code, full: '', meta: parts.join(stkSep),
@@ -22578,10 +22747,12 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
         { type: 'line', label: '판매', data: r.map(x => x.pos), borderColor: '#16a34a', backgroundColor: '#16a34a', borderWidth: 1.5, pointRadius: 0, tension: 0.2, spanGaps: false, order: 2 },
         { type: 'line', label: '채널 재고', data: r.map(x => x.stock), yAxisID: 'y2', borderColor: '#f59e0b', backgroundColor: '#f59e0b', borderWidth: 2, pointRadius: 1.5, tension: 0.2, spanGaps: true, order: 1 },
         { type: 'line', label: '예상 재고', data: r.map(x => x.proj), yAxisID: 'y2', borderColor: '#f59e0b', backgroundColor: '#fff', borderDash: [5, 4], borderWidth: 2, pointRadius: 0, order: 1 }]
-        .concat(d.wh_ok > 0 ? [{ type: 'line', label: '우리 창고 포함', data: r.map(x => x.proj_all), yAxisID: 'y2', borderColor: '#2563eb', backgroundColor: '#fff', borderDash: [2, 3], borderWidth: 2, pointRadius: 0, order: 1 }] : []),
+        .concat((d.proj_ok != null ? d.proj_ok : d.wh_ok) > 0 ? [{ type: 'line', label: d.proj_src === 'phys' ? '실물 재고 포함' : '우리 창고 포함', data: r.map(x => x.proj_all), yAxisID: 'y2', borderColor: '#2563eb', backgroundColor: '#fff', borderDash: [2, 3], borderWidth: 2, pointRadius: 0, order: 1 }] : []),
         { titles: r.map(x => x.date + '(' + x.wd + ')' + (x.future ? ' 예상' : '')), y2: '재고',
           note: '최근 60일 + 앞으로 14일 · 이 채널·SKU 단위 · 회색 막대: 납품 · 초록 선: 판매 · 주황 선: 채널 재고 · 주황 점선: 지금 판매 속도(하루 ' + d.item.pos_d + '개)대로 줄어들 때'
-            + (d.wh_ok > 0 ? ' · 파란 점선: 채널 재고 + 우리 창고(3자물류 등, 폐기·장기 제외) ' + fmtInt(d.wh_ok) + '개를 이 채널에 다 보낸다고 볼 때 (다른 채널과 나눠 쓰므로 실제로는 더 빨리 줄어듦)' : '') });
+            + ((d.proj_ok != null ? d.proj_ok : d.wh_ok) > 0 ? ' · 파란 점선: 채널 재고 + '
+               + (d.proj_src === 'phys' ? '실물 재고(온라인팀: 자사 창고·남양·송림) ' : '우리 창고(3자물류 등, 폐기·장기 제외) ')
+               + fmtInt(d.proj_ok != null ? d.proj_ok : d.wh_ok) + '개를 이 채널에 다 보낸다고 볼 때 (다른 채널과 나눠 쓰므로 실제로는 더 빨리 줄어듦)' : '') });
     }
   }
   // 수요 급변
@@ -22708,6 +22879,13 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       + (d.out_plan ? ' (예정대로 들어와도 <b>' + md(d.out_plan) + '</b>쯤 부족)' : ' (12주 이상 버팀)') + '.';
     else why += '<br>잡혀 있는 생산지시·외주 미입고가 <b>없습니다</b>.';
     if (x.ch_stock != null) why += '<br>채널(쿠팡 센터·마트 매장)에 ' + fmtInt(x.ch_stock) + '개가 더 있어 채널 포함 <b>' + x.cov_ch_weeks + '주분</b>' + (x.ch_note ? ' — <b>' + x.ch_note + '</b>' : '') + '.';
+    if (x.phys != null) {   // 실물 재고 (온라인팀 재고현황, 2026-11-26)
+      why += '<br>실물 재고(온라인팀: 자사 창고·남양·송림) <b>' + fmtInt(x.phys) + '개</b>' + (x.cov_phys_weeks != null ? ' = <b>' + x.cov_phys_weeks + '주분</b>' : '');
+      const gap = x.phys - Math.max(x.stock, 0);
+      if (Math.abs(gap) >= Math.max(50, Math.abs(x.stock) * 0.2))
+        why += ' — 아마란스 창고 재고보다 <b>' + fmtInt(Math.abs(gap)) + '개 ' + (gap > 0 ? '많습니다' : '적습니다') + '</b> (실물·전표 기준 차이)';
+      why += '.';
+    }
     if (x.trend >= 1.15 || x.trend <= 0.85) why += '<br>최근 4주 판매가 3개월 평균의 <b>' + Math.round(x.trend * 100) + '%</b> — 판매가 ' + (x.trend > 1 ? '늘고' : '줄고') + ' 있습니다.';
     let act;
     if (x.level === 'out' || x.level === 'critical') {
@@ -22723,11 +22901,13 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     h += '<div class="npd-kpis">' + _ld.kpi('창고 재고', fmtInt(x.stock), x.cov_weeks + '주분') + _ld.kpi('판매 속도', '하루 ' + R(d.weekly / 7), '월 ' + fmtInt(x.monthly))
       + _ld.kpi('바닥 예상', x.stock <= 0 ? '이미 부족' : md(d.out_date), '지금 재고만') + _ld.kpi('생산·입고 예정', fmtInt(pl), pl ? x.cov_plan_weeks + '주분까지' : '없음')
       + _ld.kpi('채널 재고', x.ch_stock != null ? fmtInt(x.ch_stock) : '-', x.cov_ch_weeks != null ? '채널 포함 ' + x.cov_ch_weeks + '주' : '')
+      + (x.phys != null ? _ld.kpi('실물 재고', fmtInt(x.phys), (x.cov_phys_weeks != null ? x.cov_phys_weeks + '주분 · ' : '') + '온라인팀') : '')
       + _ld.kpi('8주분 부족량', need8 ? fmtInt(need8) : '없음', '계획 포함') + '</div>';
     h += _ld.chartBlock('창고 재고 흐름', _ld.modeChips([['f', '앞으로 12주'], ['h', '최근 12주 실적']], _lensdMode));
     if (v) h += '<div class="npd-sec">판매 속도 계산 (하루 납품, 구품번 포함)</div><table class="npd-tbl"><thead><tr><th>최근 14일</th><th>최근 4주</th><th>최근 3개월</th><th>적용 (4주 ' + Math.round(v.w28 * 100) + '% + 3개월 ' + Math.round((1 - v.w28) * 100) + '%)</th></tr></thead><tbody>'
       + '<tr><td>' + R(v.v14) + '</td><td>' + R(v.v28) + '</td><td>' + R(v.v90) + '</td><td><b>' + R(v.v) + '</b></td></tr></tbody></table>';
-    if ((d.warehouses || []).length) h += '<div class="npd-sec">창고별 재고</div><table class="npd-tbl"><thead><tr><th>창고</th><th>위치</th><th>재고</th></tr></thead><tbody>'
+    if (d.phys_locs) h += _fgTable(d.phys, d.phys_locs, null, 1);
+    if ((d.warehouses || []).length) h += '<div class="npd-sec">창고별 재고 (아마란스 현재고)</div><table class="npd-tbl"><thead><tr><th>창고</th><th>위치</th><th>재고</th></tr></thead><tbody>'
       + d.warehouses.map(w => '<tr><td>' + escapeHtml(w.wh) + (w.code ? ' <span style="font-size:10px;color:var(--text-3)">(' + escapeHtml(w.code) + ')</span>' : '') + '</td><td>' + escapeHtml(w.loc) + '</td><td' + (w.qty < 0 ? ' style="color:#dc2626"' : '') + '>' + fmtInt(w.qty) + '</td></tr>').join('') + '</tbody></table>';
     if ((d.wo || []).length) h += '<div class="npd-sec">미마감 생산지시</div><table class="npd-tbl"><thead><tr><th>지시번호</th><th>지시일</th><th>완료예정</th><th>지시</th><th>실적</th><th>남은 수량</th></tr></thead><tbody>'
       + d.wo.map(w => '<tr' + (w.old ? ' class="part"' : '') + '><td>' + escapeHtml(w.no) + '</td><td>' + escapeHtml(w.date) + (w.old ? ' <span style="font-size:10px;color:#b45309">60일↑</span>' : '') + '</td><td>'
@@ -22740,6 +22920,35 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     h += _ld.itemBtn(x.code);
     document.getElementById('lensd-body').innerHTML = h;
     drawLensdChart();
+  }
+  // 실물 재고 표 (온라인팀 재고현황 API, 2026-11-26) — 자사 창고(랙 적치분)·남양 1P·3P·송림, 장소마다 기준 시각.
+  // ch(채널 품절 상세의 항목)가 있으면 이 채널 SKU 단위 + 이 채널 판매로 며칠분, 없으면(수급 플래너) 낱개
+  function _fgTable(rows, locs, ch, f) {
+    const at = v => v ? String(v).slice(5, 16).replace('-', '/') : '-';
+    rows = rows || []; f = f > 1 ? f : 1;
+    const ok = r => !ch || r.same !== false;   // 채널 상세: 같은 묶음(SKU·환산계수)만 이 SKU로 바로 납품 가능
+    const tot = rows.reduce((a, r) => a + (ok(r) ? Math.max(r.ea, 0) : 0), 0);
+    const other = rows.reduce((a, r) => a + (ok(r) ? 0 : Math.max(r.ea, 0)), 0);
+    let h = '<div class="npd-sec">실물 재고 (온라인팀 재고현황) — <b>' + fmtInt(tot) + '개</b>'
+      + (ch && f > 1 ? ' <span style="font-weight:500;color:var(--text-3)">(낱개 · 이 SKU로 ' + fmtInt(Math.floor(tot / f)) + '개)</span>' : '')
+      + (other > 0 ? ' <span style="font-weight:500;color:var(--text-3)">· 묶음이 다른 재고 ' + fmtInt(other) + '개 별도</span>' : '') + '</div>';
+    if (rows.length) {
+      h += '<table class="npd-tbl"><thead><tr><th>장소</th><th>재고</th>' + (ch ? '<th>이 채널 판매로</th>' : '') + '<th>기준 시각</th><th>품목</th></tr></thead><tbody>'
+        + rows.map(r => {
+          const q = ch ? r.sq : r.ea;
+          const raw = r.q !== q ? '<div style="font-size:10px;color:var(--text-3)">' + (r.unit === 'SKU' ? '쿠팡 SKU ' : '') + fmtInt(r.q) + (r.f !== 1 ? ' × ' + r.f : '') + '</div>' : '';
+          const neg = r.q < 0 ? ' style="color:#dc2626" title="센터가 음수로 보낸 값 — 합계에서는 0으로 봄"' : '';
+          return '<tr' + (ok(r) ? '' : ' style="color:var(--text-3)" title="묶음(SKU)이 달라 이 SKU로 바로 납품할 수 없는 재고 — 낱개 환산 참고"') + '><td>' + escapeHtml(r.loc) + '</td><td' + neg + '><b>' + fmtInt(q) + '</b>' + raw + '</td>'
+            + (ch ? '<td>' + (!ok(r) ? '묶음 다름' : (ch.pos_d > 0 && q > 0 ? '약 ' + Math.round(q / ch.pos_d) + '일분' : '-')) + '</td>' : '')
+            + '<td>' + at(r.as_of) + '</td><td style="font-size:11px">' + escapeHtml(String(r.name || '').slice(0, 34))
+            + (r.sku ? ' <span style="color:var(--text-3)">' + escapeHtml(r.sku) + '</span>' : '') + '</td></tr>';
+        }).join('') + '</tbody></table>';
+    } else h += '<div class="npd-note" style="margin:4px 0 0">네 곳(자사 창고·남양 1P·3P·송림) 모두 이 품목 실물 재고가 없습니다.</div>';
+    const none = (locs || []).filter(l => !rows.some(r => r.key === l.key)).map(l => l.name);
+    h += '<div class="npd-note" style="margin:4px 0 0">기준 시각 ' + (locs || []).map(l => escapeHtml(l.name) + ' ' + (l.missing ? '<b style="color:#b45309">자료 없음</b>' : at(l.as_of))).join(' · ')
+      + (none.length && rows.length ? ' · 재고 없음: ' + none.map(escapeHtml).join('·') : '')
+      + '<br>자사 창고는 랙에 적치된 완제품만 · 남양·송림은 하루 2번(아침·저녁) 갱신 · 아마란스 현재고(전표 기준)와 수치가 다를 수 있음</div>';
+    return h;
   }
   // 채널 품절 경보 (2026-10-06: 품번 정보 대신 채널 재고 상세)
   function openChsDetail(ch, sku) { _lensdMode = ''; _openLens('chs', '/api/channel_stock_detail?channel=' + encodeURIComponent(ch) + '&sku=' + encodeURIComponent(sku), '🏬 채널 품절 · ' + sku, '#ea580c', sku); }
@@ -22766,21 +22975,30 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
       }
       why += '.';
     } else why += '<br>최근 납품 기록이 없습니다.';
-    if (s) why += '<br>우리 창고 <b>' + fmtInt(s.stock) + '개</b>' + (s.cov_weeks != null ? '(' + s.cov_weeks + '주분)' : '')
+    if (d.phys_locs) why += '<br>실물 재고(온라인팀: 자사 창고·남양·송림) <b>' + fmtInt(d.phys_ok) + '개</b>'
+      + (d.f > 1 ? ' <span style="color:var(--text-3)">(낱개 · 이 SKU로 ' + fmtInt(Math.floor(d.phys_ok / d.f)) + '개)</span>' : '')
+      + (d.phys_all > d.phys_ok ? ' <span style="color:var(--text-3)">(묶음이 다른 재고 ' + fmtInt(d.phys_all - d.phys_ok) + '개 별도)</span>' : '')
+      + (d.phys_ok <= 0 ? ' — <b style="color:#dc2626">이 SKU로 보낼 실물이 없습니다</b>' : ' — 납품할 물건은 있습니다')
+      + (s ? ' <span style="color:var(--text-3)">· 아마란스 창고 ' + fmtInt(s.stock) + '개</span>' : '') + '.';
+    else if (s) why += '<br>우리 창고 <b>' + fmtInt(s.stock) + '개</b>' + (s.cov_weeks != null ? '(' + s.cov_weeks + '주분)' : '')
       + (s.stock <= 0 ? ' — <b style="color:#dc2626">창고도 비어 있습니다</b>' : ' — 납품할 물건은 있습니다') + (d.f > 1 ? ' <span style="color:var(--text-3)">(창고는 낱개 기준, 이 SKU = 낱개 ' + d.f + '개)</span>' : '') + '.';
     if (x.stale) why += '<br><span style="color:#b45309">⚠ 최근 7일 재고값이 그대로입니다 — 채널 재고 자료가 갱신되지 않았을 수 있어 실제와 다를 수 있습니다.</span>';
     if (d.pos_days14 < 14) why += '<br><span style="color:var(--text-3)">최근 14일 중 판매 자료가 들어온 날은 ' + d.pos_days14 + '일입니다.</span>';
     let act;
-    if (s && s.stock <= 0) act = '우리 창고도 비어 있어 <b>생산·입고가 먼저</b>입니다 — 수급 상세에서 생산 일정을 확인하세요.';
-    else if (late || after || !d.med_gap) act = '<b>채널 발주가 들어왔는지 확인</b>하고, 아직이면 담당 MD에게 발주를 요청하세요' + (s && s.stock > 0 ? ' (우리 창고 재고로 바로 납품 가능)' : '') + '.';
+    const ours = d.phys_locs ? d.phys_ok : (s ? s.stock : null);
+    if (d.phys_locs && ours <= 0 && d.phys_all > 0) act = '이 SKU 묶음의 실물은 없고 <b>묶음이 다른 재고만 ' + fmtInt(d.phys_all) + '개</b> 있습니다 — 재포장해 보낼 수 있는지, 아니면 생산·입고 일정을 확인하세요.';
+    else if (ours != null && ours <= 0) act = '우리 창고' + (d.phys_locs ? '(실물)' : '') + '도 비어 있어 <b>생산·입고가 먼저</b>입니다 — 수급 상세에서 생산 일정을 확인하세요.';
+    else if (late || after || !d.med_gap) act = '<b>채널 발주가 들어왔는지 확인</b>하고, 아직이면 담당 MD에게 발주를 요청하세요' + (ours != null && ours > 0 ? ' (우리 창고 재고로 바로 납품 가능)' : '') + '.';
     else act = '평소 주기대로 납품되면 품절 전에 채워집니다. 발주서가 들어왔는지만 확인하세요.';
     let h = '<div class="npd-why" style="background:#fff7ed;border-color:#fed7aa">' + why + '<br>→ ' + act + '</div>';
     h += '<div class="npd-kpis">' + _ld.kpi('채널 재고', fmtInt(x.stock), md(x.stock_date) + ' 기준') + _ld.kpi('하루 판매', String(x.pos_d), '최근 14일')
       + _ld.kpi('버티는 기간', x.stock <= 0 ? '품절' : (x.cover < 1 ? '1일 미만' : x.cover + '일'), x.stock <= 0 || x.cover < 1 ? '' : md(d.out_date) + ' 품절 예상')
       + _ld.kpi('마지막 납품', md(x.last_delivery), d.since != null ? d.since + '일 전' : '')
       + _ld.kpi('평소 납품', d.med_gap ? d.med_gap + '일마다' : '-', d.med_gap ? fmtInt(d.avg_qty) + '개씩' : '')
-      + _ld.kpi('우리 창고', s ? fmtInt(s.stock) : (x.ours != null ? fmtInt(x.ours) : '-'), s && s.cov_weeks != null ? s.cov_weeks + '주분' : '') + '</div>';
+      + (d.phys_locs ? _ld.kpi('실물 재고', fmtInt(d.phys_ok), '온라인팀 · 아마란스 ' + (s ? fmtInt(s.stock) : '-'))
+                     : _ld.kpi('우리 창고', s ? fmtInt(s.stock) : (x.ours != null ? fmtInt(x.ours) : '-'), s && s.cov_weeks != null ? s.cov_weeks + '주분' : '')) + '</div>';
     h += _ld.chartBlock('채널 재고 · 판매 · 납품', '');
+    if (d.phys_locs) h += _fgTable(d.phys, d.phys_locs, x, d.f);
     // 우리 창고 위치별 재고 (3자물류센터 등) — 채널 재고가 바닥이어도 납품할 물건이 어디 얼마나 있는지
     if ((d.wh || []).length) {
       const ymd = s => s && s.length === 8 ? s.slice(4, 6) + '/' + s.slice(6) : (s || '');
@@ -31689,6 +31907,26 @@ def api_data_health():
             worst = max(worst, 1 if um else 0)
     except Exception:
         pass
+    # 완제품 실물 재고 (온라인팀 API, 2026-11-26): 장소별 기준 시각 중 가장 오래된 것 + 우리 수집 시각.
+    # 남양·송림은 하루 2번 갱신 — 주말 감안 3일 주의·7일 이상. 장소 자료가 아예 빠지면(missing) 주의.
+    try:
+        if FG_STOCK_LOCS:
+            ts = []
+            for l in FG_STOCK_LOCS:
+                for v in (l.get('as_of'), l.get('checked_at')):
+                    try:
+                        ts.append(_dt.strptime(str(v)[:19], '%Y-%m-%d %H:%M:%S'))
+                    except (TypeError, ValueError):
+                        pass
+            miss = [l['name'] for l in FG_STOCK_LOCS if l.get('missing')]
+            note = ' · '.join(l['name'] + ' ' + (str(l['as_of'])[5:16].replace('-', '/') if l.get('as_of') else '-') for l in FG_STOCK_LOCS)
+            r_ = _aux('완제품 재고(온라인팀)', min(ts) if ts else None, 3, 7, ('자료 없음: ' + ', '.join(miss) + ' · ' if miss else '') + note)
+            if miss and r_ == 0:
+                items[-1]['status'] = 'warn'
+                r_ = 1
+            worst = max(worst, r_)
+    except Exception:
+        pass
     # 판매단가 CSV(아마란스 기준단가, 시간별 수집)
     _spf = sorted(glob.glob(f'{DATA_DIR}/*_판매단가.csv'))
     worst = max(worst, _aux('판매단가', _mtime(_spf[-1]) if _spf else None, 3, 14, '아마란스 기준단가'))
@@ -31796,6 +32034,7 @@ if __name__ == '__main__':
         _start_notify_scheduler()
         _start_sales_drop_watcher()   # 판매 CSV 드롭폴더 (2026-09-17)
         _start_partner_sales_loop()   # 판매 일자별 API (2026-09-23)
+        _start_fg_stock_loop()        # 완제품 실물 재고 API — 1시간마다 (2026-11-26)
         _start_closing_auto()         # 마감 자동 반영 (2026-09-17)
     else:
         print('[자동수집] ENABLE_AUTO_FETCH=0 → 스케줄러/워처 비활성화 (데이터는 /upload 또는 수동 리로드)')
