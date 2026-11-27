@@ -69,6 +69,18 @@ try {
   # ① 타입별 최신 CSV 추림 → _seed_data/
   & $PY "$DIR\seed_latest.py" *> "$DIR\_last_seed.log"
 
+  # ①-1 PC 앱이 아마란스를 수집 중이면 아마란스 자료는 업로드 보류 (2026-11-27 사용자 "동기화 미루게")
+  #      PC 앱은 수집(fetch_all·fetch_bom·fetch_stock·fetch_sale_price)이 모두 끝나야 새 파일을 한꺼번에 다시 읽는데,
+  #      수집 중에 생긴 파일을 여기서 하나씩 올리면 GCP만 먼저 바뀌어 아침 30분쯤 두 서버 숫자가 달랐음.
+  #      수집이 끝나면 앱이 이 스크립트를 바로 다시 부르므로(_cloud_sync_now) 그때 함께 올라감. 앱 상태를 못 읽으면 보류 안 함.
+  $AMA_TYPES = @('발주정보', '외주발주정보', '생산지시', '생산실적', '출하정보', '입고정보', '출고정보', 'BOM', '현재고', '판매단가')
+  $holdAma = $false
+  try {
+    $st = (Invoke-WebRequest -Uri "http://localhost:5000/api/refresh_aramanth/status" -TimeoutSec 15 -UseBasicParsing).Content | ConvertFrom-Json
+    if ($st.running) { $holdAma = $true }
+  } catch {}
+  $held = @()
+
   $uploaded = 0
 
   # ② 클라우드 현재 파일 md5 조회 (변경분 판별용 — 크기 아닌 내용 비교)
@@ -85,12 +97,15 @@ try {
       $cloudHash = $cloudMap[$_.Name]
       $localHash = (Get-FileHash -Path $_.FullName -Algorithm MD5).Hash.ToLower()
       if (($null -eq $cloudHash) -or ($cloudHash -ne $localHash)) {
+        $typ = [regex]::Match($_.Name, '^\d{8}_(.+)\.csv$').Groups[1].Value
+        if ($holdAma -and ($AMA_TYPES -contains $typ)) { $script:held += $typ; return }   # ForEach-Object 안의 return = 다음 파일로
         $u = Invoke-Remote 'scp' "-i `"$KEY`" $SSHOPT `"$($_.FullName)`" jgkim@${IP}:/opt/maehong/data/" 300
         if ($u.ok) { $uploaded++ } else { Log "  ⚠ 업로드 실패: $($_.Name) (시간 초과=$($u.timeout))" }
       }
     }
   }
   Log "  업로드 $uploaded 파일 (내용 변경분)"
+  if ($held.Count -gt 0) { Log "  아마란스 수집 중 → $($held.Count) 파일 보류: $($held -join ', ') (수집 끝나면 바로 다음 동기화에 올림)" }
 
   # ③-1 알림 기록(🔔 알림 센터) — 점검 엔진은 PC에서만 돌므로 기록을 GCP로 복사 (2026-10-23, GCP는 9/2 기록에 멈춰 있었음)
   #     앱이 요청 때마다 파일을 읽으므로 리로드 불필요
