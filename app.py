@@ -12424,6 +12424,20 @@ def _material_stock_map():
     return out
 
 
+def _dormant_recent_po(po_cut, _al):
+    """최근 발주(외주발주·구매발주) 품번 → 마지막 발주일(YYYYMMDD). po_cut 이후만. 판매 중단 의심 목록·상세가 같이 씀."""
+    recent_po = {}
+    for src in (WP_ORDER_DF, ORDER_DF):
+        if src is None or src.empty or '품번' not in src.columns or '발주일자' not in src.columns:
+            continue
+        ds = src['발주일자'].astype(str).str.replace('-', '').str[:8]
+        s = src[ds >= po_cut]
+        for c, dt_ in zip(s['품번'].astype(str).str.strip().str.upper(), ds[ds >= po_cut]):
+            c = _al.get(c, c)
+            recent_po[c] = max(recent_po.get(c, ''), dt_)
+    return recent_po
+
+
 @app.route('/api/dormant_items', methods=['GET'])
 @cached_api()
 def api_dormant_items():
@@ -12447,42 +12461,53 @@ def api_dormant_items():
     active = set(last_act[last_act >= cut].index)
     dormant = set(last_dl.index) - active
     # 최근 발주(외주발주·구매발주) — 있으면 재개 가능성이 있어 '전용 자재' 판정에서 활성으로 취급
-    po_cut = cut.replace('-', '')
-    recent_po = {}
-    for src in (WP_ORDER_DF, ORDER_DF):
-        if src is None or src.empty or '품번' not in src.columns or '발주일자' not in src.columns:
-            continue
-        ds = src['발주일자'].astype(str).str.replace('-', '').str[:8]
-        s = src[ds >= po_cut]
-        for c, dt_ in zip(s['품번'].astype(str).str.strip().str.upper(), ds[ds >= po_cut]):
-            c = _al.get(c, c)
-            recent_po[c] = max(recent_po.get(c, ''), dt_)
+    recent_po = _dormant_recent_po(cut.replace('-', ''), _al)
     live = active | set(recent_po)
-    # 자재 → 쓰는 완제품
-    users = {}
+    # 자재 → 쓰는 완제품 + 완제품별 BOM 전개 (구품번 BOM은 신품번으로 합침, 신품번 자기 BOM이 우선)
+    users, exp_by = {}, {}
     for p in _get_bom_index():
         if p[:1] not in ('G', 'H', 'I'):
             continue
-        for m in _explode_bom(p):
+        pc = _al.get(p, p)
+        e = exp_by.setdefault(pc, {})
+        for m, q in _explode_bom(p).items():
             if m[:1] in ('A', 'B', 'C', 'D'):
-                users.setdefault(m, set()).add(_al.get(p, p))
+                users.setdefault(m, set()).add(pc)
+                if p == pc or m not in e:
+                    e[m] = q
     mats = _material_stock_map()
     seen_codes = set(d['code'])        # 판매자료에 한 번이라도 나온 품번 (납품 없이 POS·재고만 있어도)
-    by_prod = {}
-    for m, ps in users.items():
-        if ps & live or not (ps & dormant):
-            continue
-        st = mats.get(m)
-        if not st:
-            continue
-        qty = st['jasa'] + st['os']
-        if qty <= 0:
-            continue
-        rec = {'code': m, 'name': st['name'], 'qty': int(qty), 'jasa': int(st['jasa']), 'os': int(st['os']),
-               'value': int(qty * st['price']), 'shared': sorted(ps & dormant),
-               'unknown_users': len(ps - seen_codes)}   # 판매자료에 안 나오는 다른 완제품도 쓰는 자재
-        for p in ps & dormant:
-            by_prod.setdefault(p, []).append(rec)
+    mnames = _mat_names()
+    units = {}
+    if BOM_DF is not None and not BOM_DF.empty and '자품단위' in BOM_DF.columns:
+        for c_, u_ in zip(BOM_DF['자품번'].astype(str).str.strip().str.upper(), BOM_DF['자품단위'].astype(str).str.strip()):
+            if u_ and u_ != 'nan' and c_ not in units:
+                units[c_] = u_
+
+    def _bom_rows(c):
+        """이 품번 BOM의 원료·부재료(A~D) 전부 — 재고 0·공용 자재 포함 (2026-11-27 사용자 "나머지 항목도 전용 자재·부재료 수량·금액이 다 나오게").
+        kind: sole = 이 품번(또는 함께 멈춘 품번)만 씀 / maybe = 판매 중 제품은 안 쓰지만 판매자료에 없는 완제품도 씀 /
+              shared = 판매 중(또는 최근 발주) 다른 제품도 씀 → 계속 소진됨. 단가 = 단가표(없으면 발주›단가표›BOM 자재단가)."""
+        rows = []
+        for m, per in (exp_by.get(c) or {}).items():
+            ps = users.get(m, set())
+            st = mats.get(m) or {}
+            jasa, os_ = st.get('jasa', 0) or 0, st.get('os', 0) or 0
+            qty = jasa + os_
+            price = st.get('price') or _mat_price(m)[0]
+            kind = 'shared' if (ps - {c}) & live else ('maybe' if ps - seen_codes else 'sole')
+            rows.append({'code': m, 'name': st.get('name') or mnames.get(m, ''), 'kind': kind, 'unit': units.get(m, ''),
+                         'per': round(float(per), 6), 'qty': int(qty), 'jasa': int(jasa), 'os': int(os_), 'price': round(float(price), 2),
+                         'value': int(max(qty, 0) * price), 'shared': sorted(ps & dormant),
+                         'unknown_users': len(ps - seen_codes),   # 판매자료에 안 나오는 다른 완제품도 쓰는 자재
+                         'live_users': len((ps - {c}) & live),
+                         'excl': not (ps & live)})                # 기존 '전용 자재' 기준 (최근 발주 있는 이 품번 자신도 활성)
+        rows.sort(key=lambda x: ({'sole': 0, 'maybe': 1, 'shared': 2}[x['kind']], -x['value'], x['code']))
+        return rows
+    by_prod, bom_by = {}, {}
+    for c in dormant:
+        rows = bom_by[c] = _bom_rows(c)
+        by_prod[c] = [r for r in rows if r['excl'] and r['qty'] > 0]
     ours = _our_fg_stock()
     chs = _channel_stock_by_code()
     w14 = d[pd.to_datetime(d['date']) >= end - pd.Timedelta(days=13)]
@@ -12511,13 +12536,18 @@ def api_dormant_items():
         status = ('po' if c in recent_po else ('selling' if p14 > 0 else 'stopped'))
         if o <= 0 and not ml and status == 'po':
             continue
+        bm = bom_by.get(c, [])
+        sh = [x for x in bm if x['kind'] == 'shared']
         items.append({'code': c, 'name': names.get(c, '') or str(dl[dl['code'] == c]['name'].iloc[-1]),
                       'last_delivery': last_dl[c], 'days_since': int((end - pd.to_datetime(last_dl[c])).days),
                       'last_sale': str(last_sale.get(c, '')),
                       'total_delivery': int(tot_dl.get(c, 0)), 'ours': o, 'ours_value': o_val, 'ours_value_src': o_src,
                       'pos14': int(p14), 'ch_stock': chq, 'recent_po': recent_po.get(c, ''), 'status': status,
                       'materials': ml, 'mat_value': sum(x['value'] for x in ml if not x['unknown_users']),
-                      'mat_maybe_value': sum(x['value'] for x in ml if x['unknown_users'])})
+                      'mat_maybe_value': sum(x['value'] for x in ml if x['unknown_users']),
+                      # BOM 자재 전부 (2026-11-27) — 상세 창 표 + 목록의 '공용 N종' 요약
+                      'has_bom': c in exp_by, 'bom_mats': bm, 'bom_n': len(bm),
+                      'shared_n': len(sh), 'shared_value': sum(x['value'] for x in sh)})
     items.sort(key=lambda x: (x['status'] == 'po', -(x['mat_value'] + x['ours_value']), -x['mat_maybe_value'], -x['ours']))
     uniq = {}
     for it in items:
@@ -13989,27 +14019,30 @@ def api_dormant_detail():
                         'stock': int((sc['stock'].clip(lower=0) * sc['f']).sum()) if len(sc) and c not in CH_STOCK_SKIP else None,
                         'stock_date': str(sc['date'].max()) if len(sc) else ''})
     ch_rows.sort(key=lambda x: x['last_dl'] or x['last_sale'], reverse=True)
-    # 전용 자재 → 그 자재를 쓰는 완제품과 상태
+    # BOM 자재 전부(전용·공용, 재고 0 포함) → 그 자재를 쓰는 완제품과 상태 (2026-11-27: 전용 자재 없는 항목도 자재 수량·금액이 다 나오게)
     _al = _goods_aliases()
     cut = (end - pd.Timedelta(days=59)).strftime('%Y-%m-%d')
     last_act = d[(d['ea'] > 0) | (d['pos'].fillna(0) > 0)].groupby('code')['date'].max()
     seen = set(d['code'])
     names = _sales_name_map()
+    rpo = _dormant_recent_po(cut.replace('-', ''), _al)   # 목록의 '전용' 판정과 같은 기준 — 판매 없어도 최근 발주 있으면 활성
     mats = []
-    want = {m['code'] for m in it.get('materials', [])}
-    users = {m: set() for m in want}
-    if want:
+    bm = it.get('bom_mats') or []
+    users = {m['code']: set() for m in bm}
+    if users:
         for p in _get_bom_index():
             if p[:1] in ('G', 'H', 'I'):
                 for m in _explode_bom(p):
                     if m in users:
                         users[m].add(_al.get(p, p))
-    for m in it.get('materials', []):
+    _ord = {'self': 0, 'dormant': 1, 'nodata': 2, 'active': 3, 'po': 4}   # 공용 자재는 화면에 판매 중 제품부터 3개만
+    for m in bm:
         ul = []
-        for u in sorted(users.get(m['code'], ())):
+        for u in users.get(m['code'], ()):
             la = str(last_act.get(u, ''))
-            ul.append({'code': u, 'name': names.get(u, ''), 'status': 'self' if u == code else ('active' if la >= cut else ('dormant' if u in seen else 'nodata')),
-                       'last': la})
+            stt = 'self' if u == code else ('active' if la >= cut else ('po' if u in rpo else ('dormant' if u in seen else 'nodata')))
+            ul.append({'code': u, 'name': names.get(u, ''), 'status': stt, 'last': la})
+        ul.sort(key=lambda x: (_ord[x['status']], x['code']))
         mats.append({**m, 'users': ul})
     # 최근 120일 발주
     pos_rows = []
@@ -14024,7 +14057,8 @@ def api_dormant_detail():
             pos_rows.append({'kind': label, 'date': str(r.get('발주일자', ''))[:10], 'vendor': str(r.get('거래처명', '') or ''),
                              'qty': int(_num(r.get('발주수량', 0))), 'rcv': int(_num(r.get('입고수량', 0)))})
     pos_rows.sort(key=lambda x: x['date'], reverse=True)
-    return jsonify({'item': it, 'months': mrows, 'channels': ch_rows, 'materials': mats, 'orders': pos_rows[:20],
+    return jsonify({'item': {k: v for k, v in it.items() if k != 'bom_mats'}, 'months': mrows, 'channels': ch_rows,
+                    'materials': mats, 'has_bom': it.get('has_bom', True), 'orders': pos_rows[:20],
                     'as_of': end.strftime('%Y-%m-%d')})
 
 
@@ -22798,11 +22832,15 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     let why = '마지막 납품 <b>' + md(x.last_delivery) + '</b>(' + x.days_since + '일 전)' + (x.last_sale ? ', 마지막 매장 판매 <b>' + md(x.last_sale) + '</b>' : ', 매장 판매 기록 없음')
       + ' — 최근 ' + 60 + '일 동안 납품도 매장 판매도 없어 <b>' + (ST[x.status] || '') + '</b>으로 봤습니다.';
     why += '<br>우리 창고에 <b>' + fmtInt(x.ours) + '개</b>' + (x.ours_value ? '(' + won(x.ours_value) + '원' + (x.ours_value_src === 'BOM원가' ? ', BOM 원가' : '') + ')' : '') + ' 남아 있습니다.';
-    const sure = (d.materials || []).filter(m => !m.unknown_users), maybe = (d.materials || []).filter(m => m.unknown_users);
+    // x.materials = 전용 자재(재고 있는 것만, 합계 기준) · d.materials = BOM 자재 전부(공용·재고 0 포함, 2026-11-27)
+    const sure = (x.materials || []).filter(m => !m.unknown_users), maybe = (x.materials || []).filter(m => m.unknown_users);
+    const all = d.materials || [], shared = all.filter(m => m.kind === 'shared');
     const sureVal = sure.reduce((a, m) => a + m.value, 0);
     if (sure.length) why += '<br>이 품번에만 쓰는 자재 <b>' + sure.length + '종' + (sureVal ? ' ' + won(sureVal) + '원' : '') + '</b>'
       + (sure.some(m => !m.value) ? ' <span style="color:var(--text-3)">(단가 없는 자재는 금액 미상)</span>' : '') + ' — 추가 발주를 멈추고 남은 재고 처리를 검토하세요.';
     if (maybe.length) why += '<br><span style="color:#b45309">⚠ 자재 ' + maybe.map(m => escapeHtml(m.code)).join('·') + '은 판매자료에 없는 다른 완제품도 써서 아래 표에서 쓰는 곳을 확인하세요.</span>';
+    if (!sure.length && !maybe.length && x.status !== 'po') why += '<br>' + (d.has_bom === false ? '아마란스에 BOM이 없는 품번이라 쓰는 원료·부재료를 알 수 없습니다.'
+      : '이 품번에만 쓰는 자재 재고는 없습니다' + (shared.length ? ' — BOM 자재 ' + all.length + '종 중 <b>' + shared.length + '종</b>은 판매 중인 다른 제품도 써서 계속 소진됩니다' : '') + '.');
     if (x.status === 'po') why += '<br><b style="color:#1d4ed8">최근 발주(' + md(x.recent_po.slice(0, 4) + '-' + x.recent_po.slice(4, 6) + '-' + x.recent_po.slice(6, 8)) + ')가 있어 다시 생산·판매할 가능성이 있습니다.</b>';
     why += '<br><span style="color:var(--text-3)">※ 온라인팀 판매자료 채널 기준 — 홀세일·B2B로만 나가는 품목이면 실제로는 판매 중일 수 있습니다.</span>';
     let h = '<div class="npd-why" style="background:#fefce8;border-color:#fde68a">' + why + '</div>';
@@ -22813,12 +22851,47 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
     h += '<div class="npd-sec">채널별</div><table class="npd-tbl"><thead><tr><th>채널</th><th>올해 납품</th><th>마지막 납품</th><th>매장 판매</th><th>마지막 판매</th><th>채널 재고</th></tr></thead><tbody>'
       + d.channels.map(c => '<tr><td>' + escapeHtml(c.name) + '</td><td>' + fmtInt(c.dl) + '</td><td>' + md(c.last_dl) + '</td><td>' + fmtInt(c.pos) + '</td><td>' + md(c.last_sale) + '</td><td>'
           + (c.stock != null ? fmtInt(c.stock) + ' <span style="font-size:10px;color:var(--text-3)">(' + md(c.stock_date) + ')</span>' : '-') + '</td></tr>').join('') + '</tbody></table>';
-    if ((d.materials || []).length) {
-      const USt = { self: ['이 품번', '#64748b'], active: ['판매 중', '#15803d'], dormant: ['판매 멈춤', '#b91c1c'], nodata: ['판매자료 없음', '#b45309'] };
-      h += '<div class="npd-sec">전용 자재와 쓰는 완제품</div><table class="npd-tbl"><thead><tr><th>자재</th><th>재고</th><th>금액</th><th>이 자재를 쓰는 완제품</th></tr></thead><tbody>'
-        + d.materials.map(m => '<tr><td>' + escapeHtml(m.code) + ' ' + escapeHtml((m.name || '').slice(0, 26)) + '</td><td>' + fmtInt(m.qty) + '</td><td>' + (m.value ? won(m.value) + '원' : '-') + '</td><td style="text-align:left">'
-            + (m.users || []).map(u => '<span style="white-space:nowrap;margin-right:8px">' + escapeHtml(u.code) + ' <span style="color:' + USt[u.status][1] + '">' + USt[u.status][0] + '</span>' + (u.name && u.status !== 'self' ? ' <span style="color:var(--text-3)">' + escapeHtml(u.name.slice(0, 16)) + '</span>' : '') + '</span>').join('') + '</td></tr>').join('')
-        + '</tbody></table>';
+    if (d.has_bom === false) {
+      h += '<div class="npd-sec">BOM 자재</div><div class="npd-note">아마란스에 BOM이 등록되지 않은 품번이라 쓰는 원료·부재료를 알 수 없습니다 (상품 매입 품목 등).</div>';
+    } else if (all.length) {
+      // BOM 자재 전부 — 전용(처리 검토) › 공용 가능(쓰는 곳 확인) › 공용(판매 중 제품도 씀). 2026-11-27 사용자 "나머지 항목도 전용 자재·부재료 수량·금액이 다 나오게"
+      const USt = { self: ['이 품번', '#64748b'], active: ['판매 중', '#15803d'], po: ['최근 발주', '#1d4ed8'], dormant: ['판매 멈춤', '#b91c1c'], nodata: ['판매자료 없음', '#b45309'] };
+      const KIND = { sole: ['전용', 'background:#fee2e2;color:#b91c1c', '이 품번(또는 함께 판매가 멈춘 품번)에만 쓰는 자재 — 추가 발주 멈추고 처리 검토'],
+                     maybe: ['공용 가능', 'background:#ffedd5;color:#c2410c', '판매 중인 제품은 안 쓰지만 판매자료에 없는 다른 완제품도 씀 — 쓰는 곳 확인'],
+                     shared: ['공용', 'background:#e0f2fe;color:#0369a1', '판매 중(또는 최근 발주)인 다른 제품도 써서 계속 소진됨'] };
+      const perTxt = m => {
+        const u = String(m.unit || '').toUpperCase(), v = m.per || 0;
+        if (u === 'KG' || u === 'G' || u === 'L' || u === 'M') return (Math.round(v * 1000) / 1000) + u.toLowerCase();
+        if (v >= 1) return (Math.round(v * 100) / 100) + '개';
+        const n = v > 0 ? Math.round(1 / v) : 0;
+        return n > 1 && Math.abs(n * v - 1) < 0.02 ? n + '개당 1' : (Math.round(v * 1000) / 1000) + '개';
+      };
+      const chip = u => '<span style="white-space:nowrap;margin-right:8px">' + escapeHtml(u.code) + ' <span style="color:' + USt[u.status][1] + '">' + USt[u.status][0] + '</span>'
+        + (u.name && u.status !== 'self' ? ' <span style="color:var(--text-3)">' + escapeHtml(u.name.slice(0, 16)) + '</span>' : '') + '</span>';
+      const sum = k => all.filter(m => m.kind === k).reduce((a, m) => a + m.value, 0);
+      const parts = [['sole', '전용'], ['maybe', '공용 가능'], ['shared', '공용']].filter(p => p[0] === 'sole' || sum(p[0]) > 0)
+        .map(p => p[1] + ' ' + (p[0] === 'sole' ? '<b style="color:#b91c1c">' + won(sum('sole')) + '원</b>' : won(sum(p[0])) + '원'));
+      h += '<div class="npd-sec">BOM 자재 (원료·부재료) ' + all.length + '종 — 재고와 금액'
+        + ' <span style="font-weight:500;font-size:11px;color:var(--text-3)">' + parts.join(' · ') + '</span></div>'
+        + '<table class="npd-tbl"><thead><tr><th>자재</th><th>구분</th><th title="완제품 1개에 드는 양 (BOM)" style="white-space:nowrap">1개당</th><th>재고</th><th>금액</th><th style="text-align:left">이 자재를 쓰는 완제품</th></tr></thead><tbody>'
+        + all.map(m => {
+          const k = KIND[m.kind] || KIND.shared, us = m.users || [];
+          // 공용 자재는 쓰는 제품이 수십 개라 이 품번 + 판매 중 3개만, 나머지는 개수로
+          const act = us.filter(u => u.status === 'active' || u.status === 'po');
+          const show = m.kind === 'shared' ? us.filter(u => u.status === 'self').concat(act.slice(0, 3)) : us.slice(0, 8);
+          const rest = us.length - show.length;
+          const nAct = us.filter(u => u.status === 'active').length;
+          const uh = show.map(chip).join(' ') + (rest > 0 ? '<span style="white-space:nowrap;color:var(--text-3)">외 ' + rest + '개' + (m.kind === 'shared' && nAct ? ' (판매 중 ' + nAct + '개)' : '') + '</span>' : '');
+          const split = m.os > 0 ? '<div style="font-size:10px;color:var(--text-3)">' + (m.jasa > 0 ? '자사 ' + fmtInt(m.jasa) + ' · ' : '') + '외주처 ' + fmtInt(m.os) + '</div>' : '';
+          return '<tr' + (m.qty <= 0 ? ' class="part"' : '') + '><td style="min-width:150px">' + escapeHtml(m.code) + ' ' + escapeHtml((m.name || '').slice(0, 26)) + '</td>'
+            + '<td><span style="' + k[1] + ';padding:1px 6px;border-radius:4px;font-size:10.5px;font-weight:700;white-space:nowrap" title="' + k[2] + '">' + k[0] + '</span></td>'
+            + '<td style="white-space:nowrap">' + perTxt(m) + '</td><td style="white-space:nowrap">' + (m.qty <= 0 ? '0' : fmtInt(m.qty)) + split + '</td>'
+            + '<td style="white-space:nowrap">' + (m.value ? won(m.value) + '원' : (m.qty > 0 ? '<span title="단가 없음">금액 미상</span>' : '-')) + '</td><td style="text-align:left">' + uh + '</td></tr>';
+        }).join('') + '</tbody></table>'
+        + '<div class="npd-note">전용 = 이 품번(또는 함께 판매가 멈춘 품번)에만 쓰는 자재 → 추가 발주 멈추고 처리 검토 · 공용 가능 = 판매자료에 없는 다른 완제품(홀세일·B2B 등)도 씀 → 쓰는 곳 확인 · '
+        + '공용 = 판매 중인 다른 제품도 써서 계속 소진됨 · 재고 = 자사 + 외주처 · 금액 = 재고 × 단가</div>';
+    } else if (d.has_bom) {
+      h += '<div class="npd-sec">BOM 자재</div><div class="npd-note">BOM에 원료·부재료(A~D) 품번이 없습니다.</div>';
     }
     if ((d.orders || []).length) {
       h += '<div class="npd-sec">최근 120일 발주</div><table class="npd-tbl"><thead><tr><th>구분</th><th>발주일</th><th>거래처</th><th>발주</th><th>입고</th></tr></thead><tbody>'
@@ -23336,7 +23409,11 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
           + ' · 창고 <b>' + fmtInt(x.ours) + '</b>개' + (x.ours_value ? ' (' + won(x.ours_value) + (x.ours_value_src === 'BOM원가' ? ', BOM 원가' : '') + ')' : (x.ours > 0 ? ' (금액 미상)' : ''))
           + (x.pos14 ? ' · 최근 2주 매장 판매 ' + fmtInt(x.pos14) + ' (채널재고 ' + fmtInt(x.ch_stock) + ')' : '')
           + (x.recent_po ? ' · 발주 ' + x.recent_po.slice(4, 6) + '/' + x.recent_po.slice(6, 8) : '') + '</div>'
-          + (mats ? '<div class="dorm-mats">전용 자재 · ' + mats + '</div>' : '') + '</div>'
+          + (mats ? '<div class="dorm-mats">전용 자재 · ' + mats
+               + (x.shared_n ? '<span class="m" style="color:var(--text-3)">+ 공용 ' + x.shared_n + '종 (판매 중 제품도 씀)</span>' : '') + '</div>'
+             : '<div class="dorm-mats" style="color:var(--text-3)">' + (x.has_bom === false ? '자재 · BOM 없음 (아마란스에 BOM 미등록)'
+               : (x.status === 'po' ? '자재 · 최근 발주가 있어 전용 자재 판정 제외 — BOM ' + x.bom_n + '종'
+               : '자재 · 전용 재고 없음' + (x.bom_n ? ' — BOM ' + x.bom_n + '종' + (x.shared_n ? ' 중 ' + x.shared_n + '종은 판매 중 제품과 공용' : '') : '')) + ' · 클릭하면 자재별 재고·금액') + '</div>') + '</div>'
           + '<div class="alert-qty"></div>'
           + '<div class="alert-days" style="text-align:right;line-height:1.25;color:#92400e"><div>' + (tot ? won(tot) : '-') + '</div><div style="font-size:10px;font-weight:600;color:var(--text-3);white-space:nowrap">전용 자재+창고</div>'
           + (x.mat_maybe_value ? '<div style="font-size:10px;font-weight:600;color:#b45309;white-space:nowrap">⚠ 공용 가능 ' + won(x.mat_maybe_value) + '</div>' : '') + '</div></div>';
