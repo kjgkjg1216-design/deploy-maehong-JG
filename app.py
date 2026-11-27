@@ -6909,7 +6909,7 @@ def index():
             _log_visit('visit')
     import json as _json
     return render_template_string(DASHBOARD_TEMPLATE, public_mode=public_mode, panels_locked=_HOST_ONLY_LOCK,
-                                  user_json=_json.dumps(current_user()))
+                                  user_json=_json.dumps(current_user()), app_ver=_APP_VERSION)
 
 
 @app.route('/chat')
@@ -21104,30 +21104,48 @@ DASHBOARD_TEMPLATE = '''<!DOCTYPE html>
   })();
 
   // ── 데이터 자동 새로고침 (Monday 실시간 반영) — 45초마다 버전 확인 ──
+  // 2026-11-27: 프로그램(app.py) 버전도 확인 — 배포되면 열린 화면도 새로고침 (사용자 요청: 배포 전에 열어 둔 화면이 새 자료를 못 그려 오류).
+  //   다른 탭을 보고 있거나 열린 창·입력 중인 칸이 없으면 바로, 쓰는 중이면 배너를 띄우고 다 닫으면 새로고침.
   (function dataAutoRefresh(){
-    let _ver = null;
+    let _ver = null, _stale = false;
+    const _app = '{{ app_ver }}' || null;   // 이 화면을 그린 프로그램 버전
+    function busy(){
+      if (document.querySelector('.modal-overlay.show, .ck-overlay.show, .ipsu-zoom-overlay.show')) return true;
+      const a = document.activeElement;
+      return !!(a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT' || a.isContentEditable));
+    }
+    function appReload(){
+      if (document.hidden || !busy()) { location.reload(); return; }
+      showBanner('🔄 새 버전이 배포됐습니다 — 클릭하면 새로고침 (열린 창을 닫으면 자동으로)', '프로그램이 바뀌어 새로고침해야 최신 화면이 나옵니다');
+      setTimeout(appReload, 3000);
+    }
     async function check(){
+      if (_stale) return;
       try {
         const r = await fetch('/api/data_version', {cache:'no-store'});
         const d = await r.json();
+        if (_app && d.app && d.app !== _app) { _stale = true; appReload(); return; }
         if (_ver === null) { _ver = d.version; return; }
         if (d.version !== _ver) {
           _ver = d.version;
-          // 2026-09-23: 자동 새로고침 제거 — 보던 화면이 갑자기 바뀌는 불편(사용자 요청). 항상 배너만 띄우고 클릭 시 새로고침.
-          showBanner();
+          // 2026-09-23: 자동 새로고침 제거 — 보던 화면이 갑자기 바뀌는 불편(사용자 요청). 데이터는 배너만 띄우고 클릭 시 새로고침.
+          showBanner('🔄 새 데이터 도착 — 클릭하여 새로고침', '클릭하면 최신 데이터로 새로고침됩니다');
         }
       } catch(e){}
     }
-    function showBanner(){
-      if (document.getElementById('data-reload-banner')) return;
-      const b = document.createElement('div');
-      b.id = 'data-reload-banner';
-      b.textContent = '🔄 새 데이터 도착 — 클릭하여 새로고침';
-      b.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#4f46e5;color:#fff;padding:10px 18px;border-radius:10px;font-size:13px;font-weight:700;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.25);z-index:9999';
-      b.onclick = () => location.reload();
-      b.title = '클릭하면 최신 데이터로 새로고침됩니다';
-      document.body.appendChild(b);
+    function showBanner(txt, tip){
+      let b = document.getElementById('data-reload-banner');
+      if (!b) {
+        b = document.createElement('div');
+        b.id = 'data-reload-banner';
+        b.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#4f46e5;color:#fff;padding:10px 18px;border-radius:10px;font-size:13px;font-weight:700;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.25);z-index:9999';
+        b.onclick = () => location.reload();
+        document.body.appendChild(b);
+      }
+      b.textContent = txt;
+      b.title = tip;
     }
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) check(); });   // 다른 탭에 있다 돌아오면 바로 확인
     setInterval(check, 45000);
     check();
   })();
@@ -31829,6 +31847,20 @@ def _compute_data_version():
 _DATA_VERSION = _compute_data_version()   # 데이터 버전 — 내용 해시(내용 동일=동일 버전)
 
 
+def _app_code_version():
+    """프로그램 버전 = 실행 중인 app.py 내용 md5 앞 12자리 (2026-11-27 사용자 "배포하면 열린 화면도 새로고침").
+    배포로 코드가 바뀌어 재시작하면 값이 바뀜 → 열린 대시보드가 새로고침. 코드가 같은 재시작은 같은 값이라 그대로.
+    (배포 전에 열어 둔 화면이 새 API 자료를 옛 화면 코드로 그리다 오류 — 판매 중단 의심 상세 '최근 발주' 상태)"""
+    try:
+        with open(os.path.abspath(__file__), 'rb') as f:
+            return _hashlib_dv.md5(f.read()).hexdigest()[:12]
+    except OSError:
+        return ''
+
+
+_APP_VERSION = _app_code_version()
+
+
 @app.route('/api/monday_webhook', methods=['POST'])
 def monday_webhook():
     """Monday.com 웹훅 수신. 변경 시 dirty 표시 → 로컬 PC가 폴링해 즉시 수집."""
@@ -32032,8 +32064,8 @@ def api_data_health():
 
 @app.route('/api/data_version', methods=['GET'])
 def data_version():
-    """데이터 버전 — 클라이언트가 폴링해 바뀌면 자동 새로고침."""
-    return jsonify({'version': _DATA_VERSION})
+    """데이터 버전 — 클라이언트가 폴링해 바뀌면 새로고침 배너. app = 프로그램 버전(바뀌면 화면 새로고침)."""
+    return jsonify({'version': _DATA_VERSION, 'app': _APP_VERSION})
 
 
 @app.route('/api/export_source_csv', methods=['POST', 'GET'])
